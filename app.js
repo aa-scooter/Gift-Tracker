@@ -2218,10 +2218,12 @@ function computeHomeInsights() {
 
     // Presentation-only grouping — "currently renting" + already Long-Term/VIP by the
     // existing (unchanged) computeCustomerStatus logic. No new eligibility rule.
+    // Current Bike = the raw bike name from THIS specific active rental row only —
+    // never the standardized/loyalty-tier category, never a fallback from another field.
     if (stats.current) {
       const custStatus = computeCustomerStatus(c, stats);
       if (custStatus.label === "Long-Term Customer" || custStatus.label === "VIP Customer") {
-        activeLongTermRiders.push({ customer: c, detail: custStatus.label, bike: stats.current.bikeModel });
+        activeLongTermRiders.push({ customer: c, detail: custStatus.label, bike: stats.current.bikeNameRaw || stats.current.bikeModel });
       }
     }
   });
@@ -2327,7 +2329,7 @@ function renderCustomersHome() {
           const sugg = getSuggestions(c, stats);
           const hasRewardAttention = sugg.some((s) => s.eligible && !(s.reward && s.reward.given));
           const hasUpgrade = sugg.some((s) => s.type === "return_privilege" && s.eligible && !(s.reward && s.reward.given));
-          const latestBike = stats.current ? stats.current.bikeModel : (stats.rentals[0] ? stats.rentals[0].bikeModel : null);
+          const latestBike = stats.current ? (stats.current.bikeNameRaw || stats.current.bikeModel) : (stats.rentals[0] ? (stats.rentals[0].bikeNameRaw || stats.rentals[0].bikeModel) : null);
           let indicator = "";
           if (stats.current) indicator = `<span class="compact-row-indicator">● Ongoing</span>`;
           else if (hasUpgrade) indicator = `<span class="compact-row-indicator">⭐ Ride Upgrade</span>`;
@@ -2767,9 +2769,11 @@ function renderCustomerDetail() {
   if (!c) { navigate("customers"); return ""; }
   const stats = customerStats(c);
   const suggestions = getSuggestions(c, stats);
-  // "Current Bike" uses the loyalty-tier bucket (matches how the reward rules themselves
-  // are framed); the exact historical bike name is preserved per-rental in View Details.
-  const latestBike = stats.current ? stats.current.bikeModel : (stats.rentals[0] ? stats.rentals[0].bikeModel : null);
+  // Current Bike = the raw bike name from the customer's latest active/ongoing rental row
+  // only — never the standardized loyalty-tier category, never a fallback from Ride
+  // Upgrade or any other field. If there's no active rental, this is the raw name from
+  // their most recent past rental (still the actual bike, never a derived category).
+  const latestBike = stats.current ? (stats.current.bikeNameRaw || stats.current.bikeModel) : (stats.rentals[0] ? (stats.rentals[0].bikeNameRaw || stats.rentals[0].bikeModel) : null);
   const custStatus = computeCustomerStatus(c, stats);
   const pendingBoundaries = DB.data.needsReview.filter((r) => !r.resolved && r.type === "rental_boundary" && r.customerId === c.id).length;
 
