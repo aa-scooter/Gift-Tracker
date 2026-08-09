@@ -1464,6 +1464,35 @@ function daysFromToday(iso) { return daysBetween(todayISO(), iso); }
 function initials(name) {
   return (name || "?").trim().split(/\s+/).slice(0, 2).map((s) => s[0]?.toUpperCase() || "").join("");
 }
+// First name for personalized messages — strips common titles (Mr./Mrs./Ms./Miss/Dr.)
+// since several imported names carry them (e.g. "Mr.Benjamin Andrew Van Herten").
+function firstNameOf(name) {
+  let s = String(name || "").trim();
+  s = s.replace(/^(mr|mrs|ms|miss|dr)\.?\s*/i, "").trim();
+  return s.split(/\s+/)[0] || s;
+}
+// Customer-facing bike name only — drops internal trim/spec detail (Standard Key,
+// Keyless, ABS) that means nothing to a customer and could set the wrong expectation,
+// since the actual bike/version provided depends on what's available on the day.
+// Internal fields (Experience Bike shown to staff, Mark Used options, eligibility) are
+// untouched — this simplification applies only inside the customer-facing message text.
+function simplifyBikeNameForCustomer(bike) {
+  if (!bike) return bike;
+  if (bike.includes("Aerox")) return "Aerox 155cc";
+  if (bike.includes("NMAX")) return "NMAX 155cc";
+  return bike; // "Forza 300" / "XMAX 300" are already customer-facing as-is
+}
+
+// The warm, natural Premium Ride Experience invite message — exact approved wording and
+// structure, personalized only with first name and Experience Bike. Deliberately does NOT
+// mention the customer's current bike (this should feel like a gift, not a bike swap) and
+// deliberately does NOT explain internal fleet/availability/priority rules to the customer
+// — "subject to availability, confirmed the day before" is all they need to know.
+function premiumInviteMessage(customer, currentBikeRaw, experienceBike) {
+  const first = firstNameOf(customer.name);
+  const bike = simplifyBikeNameForCustomer(experienceBike) || "premium bike";
+  return `Hi ${first}! 😊 We've got a little thank-you for you for being such a loyal rider with us.\n\nWe'd love to treat you to a complimentary Premium Ride Experience — enjoy a${/^[aeiou]/i.test(bike) ? "n" : ""} ${bike} for 2 days / 1 night, on us! 🛵✨\n\nWhenever you have a little trip in mind, just let us know your preferred dates. As this experience is subject to availability, we'll check the bike and confirm with you the day before.\n\nJust our little way of saying thank you for being with AA for so long. Enjoy the ride! 😊`;
+}
 function toast(msg) {
   const el = document.getElementById("toast");
   el.textContent = msg;
@@ -1545,6 +1574,23 @@ const RIDE_UPGRADE_NEXT = {
   "NMAX Keyless/ABS 155cc": null, // top of the normal ladder
 };
 const RIDE_UPGRADE_LADDER_VISUAL = ["125cc", "Aerox Standard Key 155cc", "Aerox Keyless/ABS 155cc", "NMAX Keyless/ABS 155cc"];
+
+// Premium Ride Experience: a complimentary 2-day/1-night TASTE of a nicer bike — separate
+// from Ride Upgrade (which is a permanent rate change). The Experience Bike is always
+// relative to the customer's ACTUAL current bike, never a blanket jump to 300cc:
+//   110/125cc               -> a 155cc Keyless/ABS experience (Aerox or NMAX family)
+//   155cc Standard Key      -> the matching family's 155cc Keyless/ABS experience
+//   155cc Keyless/ABS       -> Forza 300 (staff can pick XMAX 300 instead when marking used)
+//   Forza 300 / XMAX 300    -> not applicable; these riders' equivalent reward is VIP Extra Day
+function premiumExperienceBike(rental) {
+  const tier = rentalCategory(rental);
+  if (tier === "Forza 300" || tier === "XMAX 300") return null;
+  if (tier === "125cc" || tier === "155cc Standard Key") {
+    return bikeFamily(rental.bikeNameRaw || "") === "nmax" ? "NMAX Keyless/ABS 155cc" : "Aerox Keyless/ABS 155cc";
+  }
+  if (tier === "155cc Keyless/ABS") return "Forza 300";
+  return null;
+}
 
 // Ride Upgrade pricing — ONLY the specific transitions that have actually been priced.
 // A Ride Upgrade is never assumed to carry the customer's old rate forward; if a transition
@@ -1908,14 +1954,13 @@ function getSuggestions(customer, stats) {
   }
 
   // 4. Premium Ride Experience — a SEPARATE reward from Ride Upgrade AND from Journey Gift.
-  //    NOT gated on the bike being returned — an active rental counts fully. Requires BOTH,
-  //    as two independent dimensions:
-  //      (a) loyalty/time — 180+ cumulative paid days since this reward was last used
-  //          (lifetime paid days never reset; this cycle counter does, on Used), AND
-  //      (b) vehicle progression — genuine rental history (an ACTUAL rental record, never
-  //          just a Ride Upgrade offer being accepted/used) at 155cc Keyless/ABS or above.
-  //          Many loyal lifetime days on 125cc alone is loyalty, not vehicle experience, and
-  //          is never sufficient by itself to jump straight to a 300cc experience.
+  //    NOT gated on the bike being returned — an active rental counts fully. A dynamic
+  //    benefit engine for every customer: the Experience Bike is always relative to the
+  //    customer's ACTUAL current bike (never a blanket jump to 300cc) — see
+  //    premiumExperienceBike() for the tier progression. Eligibility itself is purely the
+  //    180+ cumulative paid days (since this reward was last used) loyalty/time dimension;
+  //    tier-appropriateness is handled by WHICH bike gets recommended, not by gating
+  //    eligibility on having already experienced a specific tier.
   //    Supports Locked / Ready / Reserved / Used; an unused Ready/Reserved reward is never
   //    deleted just because the customer's current rental happens to end.
   {
@@ -1926,10 +1971,13 @@ function getSuggestions(customer, stats) {
     const cycleBaseline = lastUsed && lastUsed.cycleBaselinePaidDays !== undefined ? lastUsed.cycleBaselinePaidDays : 0;
     const paidDaysSinceLast = Math.max(stats.paidRentalDays - cycleBaseline, 0);
     const enoughLoyaltyDays = paidDaysSinceLast >= PREMIUM_RIDE_MIN_PAID_DAYS;
-    // "Highest Experienced Tier" — from actual rental records only, anywhere in their
-    // history, never from a Ride Upgrade being accepted/used without a real rental logged.
-    const hasExperienced155Keyless = stats.rentals.some((r) => rentalCategory(r) === "155cc Keyless/ABS");
-    const calculatedEligible = enoughLoyaltyDays && hasExperienced155Keyless;
+
+    const lastRental = stats.current || stats.rentals[0] || null;
+    const currentBikeRaw = lastRental ? (lastRental.bikeNameRaw || lastRental.bikeModel) : null;
+    const experienceBike = lastRental ? premiumExperienceBike(lastRental) : null;
+    // 300cc riders have no Premium Ride Experience target — their equivalent reward is
+    // VIP Extra Day on Us (below), never a downgrade or an invented target here.
+    const calculatedEligible = enoughLoyaltyDays && !!experienceBike;
 
     givenPremium.forEach((rw, idx) => {
       const isLatest = idx === givenPremium.length - 1;
@@ -1952,22 +2000,22 @@ function getSuggestions(customer, stats) {
 
     let reason;
     if (calculatedEligible) {
-      reason = `${paidDaysSinceLast} paid day(s) since last Premium Ride (${PREMIUM_RIDE_MIN_PAID_DAYS} needed), with genuine 155cc Keyless/ABS rental experience — does not require the bike to be returned.`;
-    } else if (enoughLoyaltyDays && !hasExperienced155Keyless) {
-      reason = "Long-term loyalty requirement achieved, but 155cc rental progression has not yet been completed.";
+      reason = `${paidDaysSinceLast} paid day(s) since last Premium Ride (${PREMIUM_RIDE_MIN_PAID_DAYS} needed) — does not require the bike to be returned.`;
+    } else if (enoughLoyaltyDays && !experienceBike) {
+      reason = "Long-term loyalty requirement achieved, but this customer's current bike is already 300cc — see VIP Extra Day on Us instead.";
     } else {
-      reason = `${paidDaysSinceLast} of ${PREMIUM_RIDE_MIN_PAID_DAYS} paid days since last Premium Ride.`;
+      reason = `${paidDaysSinceLast} of ${PREMIUM_RIDE_MIN_PAID_DAYS} paid days since last Premium Ride.` + (experienceBike ? ` Would offer: ${experienceBike}.` : "");
     }
 
     out.push({
       key, type: "premium_ride",
       title: REWARD_LABELS.premium_ride,
-      desc: "Complimentary Forza 300 or XMAX 300, 2 days / 1 night, subject to vehicle availability. Recommended booking notice: 3–5 days ahead. The customer can temporarily swap from their current rental, use this, then return to their original bike — this never closes, splits, or restarts their ongoing rental.",
+      desc: "A complimentary standby perk, not a guaranteed reservation — the customer can share preferred dates 3–5 days ahead, but final availability is only confirmed the day before, after paid rentals are settled first. Swaps to the Experience Bike for 2 days / 1 night, then back to their original bike — this never closes, splits, or restarts their ongoing rental.",
       eligible, calculatedEligible, overridden: isOverridden(rewardRec), cycleStatus,
       reason,
       reward: rewardRec, repeatable: true,
       savedForNextVisit: eligible && !stats.current,
-      paidDaysSinceLast,
+      paidDaysSinceLast, currentBikeRaw, experienceBike,
     });
   }
 
@@ -2500,10 +2548,14 @@ function renderLadder(customer, stats) {
 
 // Simple emoji-forward status, per the "what do I need to know right now" design.
 function loyaltyStatusDisplay(s) {
-  // Premium Ride Experience / VIP Extra Day run on their own Locked/Ready/Reserved/Used
-  // cycle rather than the simpler given/eligible states everything else uses.
+  // Premium Ride Experience / VIP Extra Day run on their own Locked/Ready/Standby/Used
+  // cycle rather than the simpler given/eligible states everything else uses. Premium Ride
+  // is a standby perk, never a guaranteed booking, so its "reserved" state is worded as a
+  // noted preference, not a confirmation — VIP Extra Day keeps its own separate wording.
   if (s.cycleStatus === "used") return { emoji: "✅", text: "Used", cls: "given" };
-  if (s.cycleStatus === "reserved") return { emoji: "📅", text: "Reserved", cls: "eligible" };
+  if (s.cycleStatus === "reserved") return s.type === "premium_ride"
+    ? { emoji: "🕒", text: "Standby — Date Noted", cls: "eligible" }
+    : { emoji: "📅", text: "Reserved", cls: "eligible" };
   if (s.cycleStatus === "ready") return { emoji: "🎁", text: s.savedForNextVisit ? "Ready — Saved for Next Visit" : "Ready", cls: "eligible" };
   if (s.cycleStatus === "locked") return { emoji: "—", text: "Locked", cls: "not-yet" };
 
@@ -2580,11 +2632,14 @@ function renderRewardCardV2(customer, s) {
 
   let actionHtml = "";
   if (s.type === "premium_ride" || s.type === "vip_extra_day") {
-    if (s.cycleStatus === "ready") actionHtml = `<button class="btn btn-outline btn-sm" data-action="reserve-reward" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}">Reserve</button>`;
+    if (s.cycleStatus === "ready") actionHtml = `<button class="btn btn-outline btn-sm" data-action="reserve-reward" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}">${s.type === "premium_ride" ? "Note Preferred Date" : "Reserve"}</button>`;
     if (s.cycleStatus === "ready" || s.cycleStatus === "reserved") {
       actionHtml += s.type === "premium_ride"
         ? `<button class="btn btn-orange btn-sm" data-action="mark-premium-used" data-key="${s.key}" data-customer="${customer.id}" data-rental="${s.rentalId || ""}">Mark used</button>`
         : `<button class="btn btn-orange btn-sm" data-action="quick-give-use" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}">Mark used</button>`;
+    }
+    if (s.type === "premium_ride" && (s.cycleStatus === "ready" || s.cycleStatus === "reserved") && s.experienceBike) {
+      actionHtml += `<button class="btn btn-ghost btn-sm" data-action="send-premium-invite" data-customer="${customer.id}" data-current-bike="${escapeHtml(s.currentBikeRaw || "")}" data-experience-bike="${escapeHtml(s.experienceBike)}">Send Invite</button>`;
     }
   } else if (s.type === "return_privilege" && s.rideUpgradeStatus && s.rideUpgradeStatus !== "used" && s.eligible) {
     if (s.rideUpgradeStatus === "available") actionHtml += `<button class="btn btn-outline btn-sm" data-action="accept-upgrade" data-key="${s.key}" data-customer="${customer.id}" data-rental="${s.rentalId || ""}">Accept Upgrade</button>`;
@@ -2604,6 +2659,10 @@ function renderRewardCardV2(customer, s) {
             <span class="pill ${pillClass}">${escapeHtml(status.text)}</span>
           </div>
           ${s.type === "return_privilege" && s.upgradeTarget ? `<div class="reward-row-v2-upgrade-path">${escapeHtml(s.fromCategory || "")} → <b>${escapeHtml(s.upgradeTarget)}</b></div>` : ""}
+          ${s.type === "premium_ride" && s.experienceBike ? `
+            <div class="reward-row-v2-upgrade-path">Current Bike: <b>${escapeHtml(s.currentBikeRaw || "—")}</b> → Experience Bike: <b>${escapeHtml(s.experienceBike)}</b></div>
+            <div class="reward-row-v2-reason">Duration: 2 Days / 1 Night</div>
+          ` : ""}
           <div class="reward-row-v2-reason">${escapeHtml(s.reason)}</div>
           ${s.type === "return_privilege" && s.normalRate ? `
             <div class="reward-row-v2-rate">Loyalty Rate: <b>${fmtMoney(s.loyaltyRate)}/${escapeHtml(s.rateUnit || "month")}</b> <span class="muted">(regular ${fmtMoney(s.normalRate)})</span></div>
@@ -2655,7 +2714,7 @@ function renderRewardDetailRow(customer, s) {
       ` : ""}
       <div class="reward-actions">
         ${s.type === "premium_ride" || s.type === "vip_extra_day" ? `
-          ${s.cycleStatus === "ready" ? `<button class="btn btn-outline btn-sm" data-action="reserve-reward" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}">Reserve</button>` : ""}
+          ${s.cycleStatus === "ready" ? `<button class="btn btn-outline btn-sm" data-action="reserve-reward" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}">${s.type === "premium_ride" ? "Note Preferred Date" : "Reserve"}</button>` : ""}
           ${s.cycleStatus === "ready" || s.cycleStatus === "reserved" ? (
             s.type === "premium_ride"
               ? `<button class="btn btn-orange btn-sm" data-action="mark-premium-used" data-key="${s.key}" data-customer="${customer.id}" data-rental="${s.rentalId || ""}">Mark used</button>`
@@ -3789,9 +3848,11 @@ function quickGiveOrUse(key, customerId, type, rentalId, upgradeTarget) {
   render();
 }
 
-// Reserve (booked, not yet actually used) — an intermediate state between Ready and Used
-// for Premium Ride Experience / VIP Extra Day, so staff can note "this is booked" without
-// finalizing the reward (and its new cycle) until the experience actually happens.
+// An intermediate state between Ready and Used, so staff can note a customer's
+// preference without finalizing the reward (and its new cycle) until the experience
+// actually happens. For Premium Ride Experience specifically, this is a noted preferred
+// date only — never a guaranteed booking; final availability is confirmed 1 day before,
+// after paid rentals. VIP Extra Day keeps its own separate "Reserved" wording.
 function reserveReward(key, customerId, type, rentalId) {
   let rw = findReward(key);
   if (!rw) {
@@ -3801,9 +3862,15 @@ function reserveReward(key, customerId, type, rentalId) {
   if (!rw.history) rw.history = [];
   rw.reserved = true;
   rw.reservedDate = todayISO();
-  rw.history.push({ field: "Reserved", previous: "Not reserved", new: "Reserved " + fmtDate(todayISO()), changedOn: todayISO() });
+  const isPremium = type === "premium_ride";
+  rw.history.push({
+    field: isPremium ? "Standby" : "Reserved",
+    previous: isPremium ? "No date noted" : "Not reserved",
+    new: (isPremium ? "Preferred date noted " : "Reserved ") + fmtDate(todayISO()),
+    changedOn: todayISO(),
+  });
   DB.save();
-  toast(`${REWARD_LABELS[type] || "Reward"} reserved`);
+  toast(isPremium ? "Preferred date noted — standby, not guaranteed" : `${REWARD_LABELS[type] || "Reward"} reserved`);
   render();
 }
 
@@ -3843,13 +3910,20 @@ function declineRideUpgrade(key, customerId, rentalId) {
 // (Forza 300 or XMAX 300), so "Mark Used" is a short dedicated sheet rather than one tap.
 function sheetMarkPremiumRideUsed(key, customerId, rentalId) {
   const existing = findReward(key);
+  const customer0 = DB.data.customers.find((c) => c.id === customerId);
+  let recommended = "Forza 300";
+  if (customer0) {
+    const stats0 = customerStats(customer0);
+    const sugg0 = getSuggestions(customer0, stats0).find((s) => s.type === "premium_ride" && s.key === key);
+    if (sugg0 && sugg0.experienceBike) recommended = sugg0.experienceBike;
+  }
+  const bikeOptions = ["Aerox Keyless/ABS 155cc", "NMAX Keyless/ABS 155cc", "Forza 300", "XMAX 300"];
   openSheet(`
     <div class="sheet-title">Mark Premium Ride Experience used</div>
-    <div class="sheet-sub">Records today's date automatically.</div>
+    <div class="sheet-sub">Records today's date automatically. Defaults to the system-recommended Experience Bike — change if the customer actually took a different one.</div>
     <div class="field"><label>Bike used</label>
       <select id="f-bike-used">
-        <option value="Forza 300">Forza 300</option>
-        <option value="XMAX 300">XMAX 300</option>
+        ${bikeOptions.map((b) => `<option value="${escapeHtml(b)}" ${b === recommended ? "selected" : ""}>${escapeHtml(b)}</option>`).join("")}
       </select>
     </div>
     <div class="field"><label>Notes (optional)</label><input id="f-notes" type="text" placeholder="e.g. overnight trip to Doi Suthep" /></div>
@@ -3882,6 +3956,39 @@ function sheetMarkPremiumRideUsed(key, customerId, rentalId) {
   });
 }
 
+// "Send Invite" — generates the warm, natural Premium Ride Experience message with the
+// customer's real first name, current bike, and recommended Experience Bike, ready to copy
+// or (only if a phone number is actually on file) open directly in WhatsApp.
+function sheetSendPremiumInvite(customerId, currentBikeRaw, experienceBike) {
+  const customer = DB.data.customers.find((c) => c.id === customerId);
+  if (!customer) return;
+  const message = premiumInviteMessage(customer, currentBikeRaw, experienceBike);
+  const hasPhone = !!(customer.phone && customer.phone.trim());
+  openSheet(`
+    <div class="sheet-title">Send Premium Ride Experience invite</div>
+    <div class="sheet-sub">To ${escapeHtml(customer.name)}${hasPhone ? "" : " — no phone number on file, so WhatsApp isn't available; copy the message instead"}</div>
+    <div class="field"><textarea id="f-invite-message" rows="9" style="font-size:13.5px;">${escapeHtml(message)}</textarea></div>
+    <div class="btn-row">
+      <button class="btn btn-primary btn-block" id="copy-invite-message">Copy Message</button>
+    </div>
+    ${hasPhone ? `<div class="btn-row" style="margin-top:8px;"><button class="btn btn-outline btn-block" id="open-whatsapp-invite">Open WhatsApp</button></div>` : ""}
+  `);
+  document.getElementById("copy-invite-message").addEventListener("click", () => {
+    const text = document.getElementById("f-invite-message").value;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => toast("Message copied")).catch(() => toast("Couldn't copy — select and copy manually"));
+    } else {
+      toast("Couldn't copy — select and copy manually");
+    }
+  });
+  const waBtn = document.getElementById("open-whatsapp-invite");
+  if (waBtn) waBtn.addEventListener("click", () => {
+    const text = document.getElementById("f-invite-message").value;
+    const digits = customer.phone.replace(/[^\d]/g, "");
+    window.open(`https://wa.me/${digits}?text=${encodeURIComponent(text)}`, "_blank");
+  });
+}
+
 function sheetEditRewardFull(key, customerId, type, rentalId) {
   const existing = findReward(key);
   const customer = DB.data.customers.find((c) => c.id === customerId);
@@ -3895,7 +4002,7 @@ function sheetEditRewardFull(key, customerId, type, rentalId) {
     <div class="sheet-title">${escapeHtml(REWARD_LABELS[type] || "Reward")}</div>
     <div class="sheet-sub">Internal record only — confirm before offering anything to the customer.</div>
     <div class="checkbox-row"><input type="checkbox" id="f-given" ${existing && existing.given ? "checked" : ""} /><label style="margin:0;text-transform:none;font-weight:500;">Given / Used</label></div>
-    ${type === "premium_ride" || type === "vip_extra_day" ? `<div class="checkbox-row"><input type="checkbox" id="f-reserved" ${existing && existing.reserved ? "checked" : ""} /><label style="margin:0;text-transform:none;font-weight:500;">Reserved (booked, not yet used)</label></div>` : ""}
+    ${type === "premium_ride" || type === "vip_extra_day" ? `<div class="checkbox-row"><input type="checkbox" id="f-reserved" ${existing && existing.reserved ? "checked" : ""} /><label style="margin:0;text-transform:none;font-weight:500;">${type === "premium_ride" ? "Preferred date noted (standby — not guaranteed, not yet used)" : "Reserved (booked, not yet used)"}</label></div>` : ""}
     <div class="field"><label>Date given</label><input id="f-date" type="date" value="${existing?.dateGiven || todayISO()}" /></div>
     ${type === "premium_ride" ? `
     <div class="field"><label>Bike used</label>
@@ -4225,6 +4332,9 @@ function wireScreenEvents() {
   });
   document.querySelectorAll('[data-action="mark-premium-used"]').forEach((el) => {
     el.addEventListener("click", () => sheetMarkPremiumRideUsed(el.dataset.key, el.dataset.customer, el.dataset.rental));
+  });
+  document.querySelectorAll('[data-action="send-premium-invite"]').forEach((el) => {
+    el.addEventListener("click", () => sheetSendPremiumInvite(el.dataset.customer, el.dataset.currentBike, el.dataset.experienceBike));
   });
   document.querySelectorAll('[data-action="accept-upgrade"]').forEach((el) => {
     el.addEventListener("click", () => acceptRideUpgrade(el.dataset.key, el.dataset.customer, el.dataset.rental));
