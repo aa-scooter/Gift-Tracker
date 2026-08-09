@@ -1274,6 +1274,12 @@ const ICONS = {
   gear: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.9 2.9l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V20a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.9-2.9l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H4a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.6-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.9-2.9l.1.1a1.7 1.7 0 0 0 1.9.3H10.5a1.7 1.7 0 0 0 1-1.6V4a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.9 2.9l-.1.1a1.7 1.7 0 0 0-.3 1.9V10.5a1.7 1.7 0 0 0 1.6 1H20a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.6 1z"/></svg>`,
   logoMark: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="17" r="3"/><circle cx="7" cy="17" r="3"/><path d="M7 17V12l3.5-3.5h4L18 17"/><path d="M9 8.5h5"/></svg>`,
   scooterBig: `<svg viewBox="0 0 200 200" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="150" cy="150" r="26" stroke="currentColor" stroke-width="7"/><circle cx="55" cy="150" r="26" stroke="currentColor" stroke-width="7"/><path d="M55 150V105l30-30h35l30 55h30" stroke="currentColor" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/><path d="M75 75h42" stroke="currentColor" stroke-width="7" stroke-linecap="round"/><circle cx="128" cy="55" r="15" stroke="currentColor" stroke-width="7"/></svg>`,
+
+  // Elegant, non-cartoon module icons for the App Home launcher cards — moderate
+  // weight, geometric, single-color. Deliberately restrained vs. the illustrated
+  // "BOLD" mascot-style set used elsewhere in the app.
+  loyaltyMark: `<svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="3" y="10" width="22" height="14" rx="2.2" stroke="currentColor" stroke-width="2"/><path d="M3 15h22" stroke="currentColor" stroke-width="2"/><path d="M14 10V6.8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M14 6.8c-1.4-3-6-2.6-6 .3 0 1.8 2.5 2.9 6 2.9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 6.8c1.4-3 6-2.6 6 .3 0 1.8-2.5 2.9-6 2.9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+  renewalMark: `<svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="5" y="5" width="18" height="19" rx="2.2" stroke="currentColor" stroke-width="2"/><path d="M9.5 3v4.4M18.5 3v4.4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M5 11h18" stroke="currentColor" stroke-width="2"/><path d="M10 16.2l2.4 2.4 5.6-5.6" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
 };
 
 /* -- Bold / filled "chunky" icon set — brand mascot + illustrated badges,   */
@@ -2122,7 +2128,7 @@ function navigate(route, params = {}) {
   window.scrollTo(0, 0);
 }
 function topLevel(route) {
-  if (route.startsWith("customer") || route === "needs-review") return "customers";
+  if (route.startsWith("customer") || route === "needs-review" || route === "rewards-ready" || route === "active-riders") return "customers";
   if (route.startsWith("vehicle")) return "vehicles";
   return "settings"; // settings/import — no bottom tab, reached via gear icon
 }
@@ -2139,22 +2145,24 @@ function renderAppHome() {
   }).length;
 
   return `
-    <div class="launcher-wrap dark-bg">
-      <div class="launcher-brand">
-        <div class="launcher-wordmark">${BOLD.wordmark}</div>
-        <div class="launcher-brand-title light">RIDE FREELY</div>
-        <div class="launcher-brand-sub">Chiang Mai · Internal Operations</div>
+    <div class="launcher-wrap dark-bg compact">
+      <div class="launcher-compact-brand">
+        <div class="launcher-compact-mark">AA</div>
+        <div class="launcher-compact-text">
+          <div class="launcher-compact-title">AA SCOOTER RENTAL</div>
+          <div class="launcher-compact-sub">Chiang Mai · Internal Operations</div>
+        </div>
       </div>
-      <div class="launcher-cards">
-        <button class="module-card dark" data-goto="customers">
+      <div class="launcher-cards compact">
+        <button class="module-card dark compact" data-goto="customers">
           <div class="module-card-arrow">${ICONS.chevronRight}</div>
-          <div class="module-card-icon">${boldIcon("rider")}</div>
+          <div class="module-card-icon compact">${ICONS.loyaltyMark}</div>
           <div class="module-card-title">Customer Loyalty</div>
           <div class="module-card-sub">Customers · Rewards · Ride Benefits${pendingReviewCount ? ` · ${pendingReviewCount} to review` : ""}</div>
         </button>
-        <button class="module-card light" data-goto="vehicles">
+        <button class="module-card light compact" data-goto="vehicles">
           <div class="module-card-arrow">${ICONS.chevronRight}</div>
-          <div class="module-card-icon">${boldIcon("scooterDoc")}</div>
+          <div class="module-card-icon compact">${ICONS.renewalMark}</div>
           <div class="module-card-title">Vehicle Renewal</div>
           <div class="module-card-sub">Por Ror Bor · Tax · Due Dates${needsAttentionCount ? ` · ${needsAttentionCount} need attention` : ""}</div>
         </button>
@@ -2169,8 +2177,24 @@ function renderAppHome() {
 
 // "What do I need to know or do right now?" — computed fresh each render from the
 // same underlying getSuggestions()/customerStats() logic used everywhere else.
+// A concise, specific detail string for a reward-ready line item — e.g. the actual
+// upgrade target, or paid-day count — never just repeating the reward type name.
+function shortRewardDetail(s) {
+  if (s.type === "return_privilege" && s.upgradeTarget) return s.upgradeTarget;
+  if (s.type === "welcome_kit") {
+    const m = /Paid booking of (\d+) day/.exec(s.reason || "");
+    return m ? `${m[1]}-day paid booking` : "";
+  }
+  if (s.type === "journey_gift") {
+    const category = (s.title || "").split(" — ")[1] || "";
+    const m = /(\d+) paid day/.exec(s.reason || "");
+    return [category, m ? `${m[1]} days` : ""].filter(Boolean).join(" · ");
+  }
+  return "";
+}
+
 function computeHomeInsights() {
-  const rewardsDueMap = new Map(); // customerId -> { customer, items: [labels] }
+  const rewardsDueMap = new Map(); // customerId -> { customer, items: [{type, detail}] }
   const journeyGiftsDueMap = new Map();
   const returningVip = [];
   const activeLongTermRiders = [];
@@ -2183,7 +2207,7 @@ function computeHomeInsights() {
       if (s.eligible && !(s.reward && s.reward.given)) {
         const target = s.type === "journey_gift" ? journeyGiftsDueMap : rewardsDueMap;
         if (!target.has(c.id)) target.set(c.id, { customer: c, items: [] });
-        target.get(c.id).items.push(s.title);
+        target.get(c.id).items.push({ type: s.type, title: s.title, detail: shortRewardDetail(s) });
       }
     });
 
@@ -2197,7 +2221,7 @@ function computeHomeInsights() {
     if (stats.current) {
       const custStatus = computeCustomerStatus(c, stats);
       if (custStatus.label === "Long-Term Customer" || custStatus.label === "VIP Customer") {
-        activeLongTermRiders.push({ customer: c, detail: custStatus.label });
+        activeLongTermRiders.push({ customer: c, detail: custStatus.label, bike: stats.current.bikeModel });
       }
     }
   });
@@ -2333,26 +2357,17 @@ function renderCustomersHome() {
         <div class="brand-hero-content">
           <div class="brand-hero-title">LOYAL<br/><span>RIDER</span></div>
           <div class="brand-hero-sub">Rewarding every<br/>journey with AA</div>
-          <button class="hero-banner-v2-cta" data-insight-toggle="rewards-ready">View Rewards</button>
+          <button class="hero-banner-v2-cta" data-goto="rewards-ready">View Rewards</button>
         </div>
         <div class="brand-hero-mascot">${BOLD.mascot}</div>
       </div>
     </div>
     <div class="screen-body" style="margin-top:-14px;">
       <div class="status-card-row">
-        ${renderStatusCard("rewards-ready", "gift", "Rewards Ready", insights.rewardsReady.length, "Tap to view")}
-        ${renderStatusCard("active-long-term", "helmet", "Active Riders", insights.activeLongTermRiders.length, "Tap to view")}
-        ${renderStatusCard("needs-review-card", "clipSearch", "Needs Review", pendingReviewCount, "Tap to review")}
+        ${renderStatusCard("rewards-ready", "gift", "Rewards Ready", insights.rewardsReady.length, insights.rewardsReady.length === 1 ? "1 customer has a reward available" : `${insights.rewardsReady.length} customers have rewards available`)}
+        ${renderStatusCard("active-riders", "helmet", "Active Riders", insights.activeLongTermRiders.length, insights.activeLongTermRiders.length === 1 ? "1 rider currently active" : `${insights.activeLongTermRiders.length} riders currently active`)}
+        ${renderStatusCard("needs-review", "clipSearch", "Needs Review", pendingReviewCount, pendingReviewCount === 1 ? "1 record needs review" : `${pendingReviewCount} records need review`)}
       </div>
-      ${["rewards-ready", "active-long-term", "needs-review-card"].map((id) => {
-        if (state.expandedCard !== id) return "";
-        if (id === "needs-review-card") return pendingReviewCount > 0 ? `<div class="card" data-goto="needs-review" style="cursor:pointer; margin-bottom:14px;"><p class="muted">Tap here to open Needs Review (${pendingReviewCount} pending).</p></div>` : "";
-        const items = id === "rewards-ready" ? insights.rewardsReady : insights.activeLongTermRiders;
-        const renderRow = id === "rewards-ready"
-          ? (x) => `<div class="insight-row" data-goto="customer" data-id="${x.customer.id}"><span class="insight-row-name">${escapeHtml(x.customer.name)}</span><span class="insight-row-detail">${escapeHtml(x.items.join(" · "))}</span></div>`
-          : (x) => `<div class="insight-row" data-goto="customer" data-id="${x.customer.id}"><span class="insight-row-name">${escapeHtml(x.customer.name)}</span><span class="insight-row-detail">${escapeHtml(x.detail)}</span></div>`;
-        return items.length ? `<div class="card" style="margin-bottom:14px;">${items.slice(0, 8).map(renderRow).join("")}</div>` : `<div class="card" style="margin-bottom:14px;"><p class="muted">Nothing here right now.</p></div>`;
-      }).join("")}
 
       <div class="quick-actions-panel">
         <div class="quick-actions-title">Quick Actions</div>
@@ -2368,18 +2383,84 @@ function renderCustomersHome() {
   `;
 }
 
-// Reference-style status card: icon top-left, title, big number, small hint, circular
-// arrow button — tapping the whole card expands the matching list below (same
-// underlying data as before, just a different visual container).
+// Reference-style status card: icon top-left, title, big number, one concise hint line,
+// circular arrow button — the whole card navigates straight to its own dedicated list
+// screen (never expands inline), so a long customer list can never take over the dashboard.
 function renderStatusCard(id, iconName, title, count, hint) {
-  const expanded = state.expandedCard === id;
   return `
-    <div class="status-card" data-insight-toggle="${id}">
+    <div class="status-card" data-goto="${id}">
       ${boldIcon(iconName)}
       <div class="status-card-title">${escapeHtml(title)}</div>
       <div class="status-card-count">${count}</div>
       <div class="status-card-hint">${escapeHtml(hint)}</div>
-      <span class="status-card-arrow ${expanded ? "is-expanded" : ""}">${ICONS.chevronRight}</span>
+      <span class="status-card-arrow">${ICONS.chevronRight}</span>
+    </div>
+  `;
+}
+
+// Stacked customer-reward rows — one clearly separated card per customer, each of
+// their ready rewards on its own line (icon + gold type + grey detail), never a
+// two-column name/reward layout. Reused by the Rewards Ready dedicated screen.
+function renderCustomerRewardRow(entry) {
+  return `
+    <div class="cust-row" data-goto="customer" data-id="${entry.customer.id}">
+      <div class="cust-row-main">
+        <div class="cust-row-name">${escapeHtml(entry.customer.name)}</div>
+        ${entry.items.map((it) => `
+          <div class="cust-row-reward">
+            ${boldIcon(REWARD_ICON[it.type] || "gift", "row")}
+            <span class="cust-row-reward-type">${escapeHtml(REWARD_LABELS[it.type] || it.title)}</span>
+            ${it.detail ? `<span class="cust-row-reward-detail"> · ${escapeHtml(it.detail)}</span>` : ""}
+          </div>
+        `).join("")}
+      </div>
+      <span class="cust-row-chevron">${ICONS.chevronRight}</span>
+    </div>
+  `;
+}
+
+function renderRewardsReadyScreen() {
+  const insights = computeHomeInsights();
+  const list = insights.rewardsReady.slice().sort((a, b) => a.customer.name.localeCompare(b.customer.name));
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="customers">‹ Customer Loyalty</button>
+      <h1 class="screen-title" style="margin-top:8px;">Rewards Ready</h1>
+      <p class="screen-sub">${list.length} customer${list.length === 1 ? "" : "s"} have a reward available</p>
+    </header>
+    <div class="screen-body">
+      ${list.length === 0 ? `
+        <div class="empty"><div class="empty-icon">${boldIcon("gift")}</div><h3>Nothing waiting</h3><p>No customer currently has an unclaimed reward.</p></div>
+      ` : `<div class="cust-row-list">${list.map(renderCustomerRewardRow).join("")}</div>`}
+    </div>
+  `;
+}
+
+function renderActiveRidersScreen() {
+  const insights = computeHomeInsights();
+  const list = insights.activeLongTermRiders.slice().sort((a, b) => a.customer.name.localeCompare(b.customer.name));
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="customers">‹ Customer Loyalty</button>
+      <h1 class="screen-title" style="margin-top:8px;">Active Riders</h1>
+      <p class="screen-sub">${list.length} long-term rider${list.length === 1 ? "" : "s"} currently renting</p>
+    </header>
+    <div class="screen-body">
+      ${list.length === 0 ? `
+        <div class="empty"><div class="empty-icon">${boldIcon("helmet")}</div><h3>No active long-term riders</h3><p>Nobody currently renting is Long-Term or VIP status yet.</p></div>
+      ` : `<div class="cust-row-list">${list.map((entry) => `
+        <div class="cust-row" data-goto="customer" data-id="${entry.customer.id}">
+          <div class="cust-row-main">
+            <div class="cust-row-name">${escapeHtml(entry.customer.name)}</div>
+            <div class="cust-row-reward">
+              ${boldIcon("helmet", "row")}
+              <span class="cust-row-reward-type">${escapeHtml(entry.detail)}</span>
+              ${entry.bike ? `<span class="cust-row-reward-detail"> · ${escapeHtml(entry.bike)}</span>` : ""}
+            </div>
+          </div>
+          <span class="cust-row-chevron">${ICONS.chevronRight}</span>
+        </div>
+      `).join("")}</div>`}
     </div>
   `;
 }
@@ -4050,6 +4131,8 @@ function render() {
     case "customers": html = renderCustomersHome(); break;
     case "customer": html = renderCustomerDetail(); break;
     case "needs-review": html = renderNeedsReview(); break;
+    case "rewards-ready": html = renderRewardsReadyScreen(); break;
+    case "active-riders": html = renderActiveRidersScreen(); break;
     case "vehicles": html = renderVehiclesList(); break;
     case "vehicle": html = renderVehicleDetail(); break;
     case "settings": html = renderSettings(); break;

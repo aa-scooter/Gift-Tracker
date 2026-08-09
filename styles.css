@@ -679,6 +679,64 @@ p { margin: 0; }
 }
 .module-card.light .module-card-arrow { background: var(--paper-dim); }
 
+/* ---------- Compact App Home variant (iPhone-optimized) ---------- */
+.launcher-wrap.compact {
+  padding-top: max(18px, env(safe-area-inset-top));
+  padding-bottom: calc(var(--tabbar-h) + 18px);
+}
+.launcher-compact-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 4px 0 22px;
+}
+.launcher-compact-mark {
+  width: 42px; height: 42px;
+  border-radius: 12px;
+  background: var(--ink-soft);
+  border: 1.5px solid rgba(255,196,7,0.4);
+  color: var(--mustard);
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 15px;
+  letter-spacing: -0.02em;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.launcher-compact-title {
+  font-family: var(--font-display);
+  font-size: 13.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: #FFFFFF;
+}
+.launcher-compact-sub {
+  font-size: 11px;
+  color: var(--mustard);
+  font-weight: 600;
+  margin-top: 2px;
+  letter-spacing: 0.02em;
+}
+.launcher-cards.compact { gap: 12px; }
+.module-card.compact {
+  padding: 18px 18px 16px;
+  min-height: 106px;
+  border-radius: var(--radius-m);
+}
+.module-card.compact .module-card-icon.compact {
+  width: 38px; height: 38px;
+  border-radius: 11px;
+  margin-bottom: 10px;
+}
+.module-card.compact .module-card-icon.compact svg { width: 19px; height: 19px; display: block; }
+.module-card.dark .module-card-icon.compact { background: rgba(255,196,7,0.14); color: var(--mustard); }
+.module-card.light .module-card-icon.compact { background: var(--orange-soft); color: var(--orange-dark); }
+.module-card.compact .module-card-title { font-size: 17.5px; margin-bottom: 3px; }
+.module-card.compact .module-card-sub { font-size: 11.5px; opacity: 0.6; line-height: 1.35; }
+.module-card.compact .module-card-arrow { top: 16px; right: 16px; width: 26px; height: 26px; }
+.module-card.compact .module-card-arrow svg { width: 13px; height: 13px; }
+
+
 /* ---------- Hero banner (Customer Loyalty home) ---------- */
 .hero-banner {
   position: relative;
@@ -1163,3 +1221,59 @@ p { margin: 0; }
 .reward-row-v2-reason { font-size: 12px; color: var(--text-secondary); margin-top: 3px; line-height: 1.35; }
 .reward-row-v2-rate { font-size: 12.5px; color: var(--ink); margin-top: 5px; }
 .reward-row-v2-actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+
+/* ============================================================
+   V5 — Dedicated Rewards Ready / Active Riders screens. Stacked
+   customer-reward rows: one clearly separated card per customer,
+   never a two-column name/reward layout. iPhone-first.
+   ============================================================ */
+.cust-row-list { display: flex; flex-direction: column; }
+.cust-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 4px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.cust-row:last-child { border-bottom: none; }
+.cust-row:active { background: var(--paper-dim); }
+.cust-row-main { flex: 1; min-width: 0; }
+.cust-row-name {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--ink);
+  line-height: 1.25;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+.cust-row-reward {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.cust-row-reward:first-of-type { margin-top: 0; }
+.cust-row-reward .bold-icon-badge.row svg { width: 16px; height: 16px; flex-shrink: 0; }
+.cust-row-reward-type {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--orange-dark);
+  white-space: nowrap;
+}
+.cust-row-reward-detail {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.cust-row-chevron {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  margin-top: 4px;
+}
+.cust-row-chevron svg { width: 16px; height: 16px; display: block; }
