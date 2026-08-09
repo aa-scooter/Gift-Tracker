@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+<title>AA Scooter Rental — Manager</title>
+<meta name="description" content="Internal operations dashboard for AA Scooters Chiang Mai" />
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#141414" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="AA Manager" />
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <div id="app" class="app"></div>
+
+  <button class="gear-btn" id="gear-btn" aria-label="Settings">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="17" height="17"><circle cx="12" cy="12" r="3"/><path d="M19.4 13.5a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.9 2.9l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V20a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.9-2.9l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H4a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.6-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.9-2.9l.1.1a1.7 1.7 0 0 0 1.9.3H10.5a1.7 1.7 0 0 0 1-1.6V4a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.9 2.9l-.1.1a1.7 1.7 0 0 0-.3 1.9V10.5a1.7 1.7 0 0 0 1.6 1H20a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.6 1z"/></svg>
+  </button>
+
+  <!-- Bottom tab navigation — only two main sections, per design. -->
+  <nav class="tabbar" id="tabbar" aria-label="Primary">
+    <button class="tab" data-route="customers" aria-current="page">
+      <span class="tab-icon" aria-hidden="true">
+        <svg viewBox="0 0 40 40" width="22" height="22"><circle cx="9" cy="29" r="6.2" fill="currentColor"/><circle cx="9" cy="29" r="2.4" fill="#111111" opacity="0.35"/><circle cx="27" cy="29" r="6.2" fill="currentColor"/><circle cx="27" cy="29" r="2.4" fill="#111111" opacity="0.35"/><path d="M8 26 Q8 14 18 14 Q23 14 25 20 L31 26 Q34 27 34 29 L4 29 Q4 27 8 26 Z" fill="currentColor"/><path d="M12 18h9" stroke="#111111" stroke-width="2" stroke-linecap="round" opacity="0.35"/></svg>
+      </span>
+      <span>Customer Loyalty</span>
+    </button>
+    <button class="tab" data-route="vehicles">
+      <span class="tab-icon" aria-hidden="true">
+        <svg viewBox="0 0 40 40" width="22" height="22"><path d="M10 6h14l7 7v20a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z" fill="currentColor"/><path d="M24 6v7h7" fill="none" stroke="#F6F6F6" stroke-width="2"/><path d="M14 22h6M14 27h9" stroke="#F6F6F6" stroke-width="2.2" stroke-linecap="round" opacity="0.7"/></svg>
+      </span>
+      <span>Vehicle Renewal</span>
+    </button>
+  </nav>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="modal-root"></div>
+
+  <script src="app.js" defer></script>
+  <script>
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("sw.js").catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
