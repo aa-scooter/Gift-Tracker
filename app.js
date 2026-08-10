@@ -58,6 +58,32 @@ const RETURN_PRIVILEGE_MIN_REVENUE = 8000;
 // last time that specific reward was used. Lifetime paid days never reset; this does.
 const PREMIUM_RIDE_MIN_PAID_DAYS = 180;
 
+// Default financial/threshold values for the loyalty program — ALL of these are seeded
+// here but the live, staff-editable copy lives in DB.data.meta (Settings). Nothing here
+// should be read directly by business logic; always go through DB.data.meta.* so edits
+// in Settings take effect immediately without a code change.
+const DEFAULT_REWARD_COSTS = { welcomeGift: 50, journeyGift: 150 };
+// Estimated daily rental value used for Premium Ride Experience (x2 days) and VIP Extra
+// Day — keyed by Standardized Vehicle Category (the fine-grained Ride Upgrade tiers).
+const DEFAULT_DAILY_VALUES = {
+  "125cc": 300,
+  "Aerox Standard Key 155cc": 400,
+  "NMAX White Standard Key 155cc": 400,
+  "Aerox Keyless/ABS 155cc": 450,
+  "NMAX Keyless/ABS 155cc": 500,
+  "Forza 300": 600,
+  "XMAX 300": 800,
+};
+// VIP Extra Day qualification: meaningful repeat rentals + cumulative paid days, tier-aware.
+const DEFAULT_VIP_THRESHOLDS = {
+  "125cc": { episodes: 2, days: 20 },
+  "155cc": { episodes: 2, days: 18 },
+  "300cc": { episodes: 2, days: 14 },
+};
+// Reward-to-Revenue Loyalty Health bands (%). <= healthyMax => Healthy, <= watchMax =>
+// Watch, above that => High. Initial suggested values only — meant to be tuned in Settings.
+const DEFAULT_HEALTH_THRESHOLDS = { healthyMax: 8, watchMax: 15 };
+
 const ALL_BIKE_MODELS = CATEGORY_TIERS;
 
 // Bike Name Mapping — Original Bike Name (as it appears in historical records) -> Standardized
@@ -1142,6 +1168,10 @@ const DB = {
     if (!this.data.meta) this.data.meta = { loyaltyEffectiveDate: "2026-08-10" };
     if (this.data.meta.loyaltyEffectiveDate === undefined && this.data.meta.welcomeKitLaunchDate !== undefined) this.data.meta.loyaltyEffectiveDate = this.data.meta.welcomeKitLaunchDate;
     if (!this.data.meta.bikeNameMap) this.data.meta.bikeNameMap = Object.assign({}, DEFAULT_BIKE_NAME_MAP);
+    if (!this.data.meta.rewardCosts) this.data.meta.rewardCosts = Object.assign({}, DEFAULT_REWARD_COSTS);
+    if (!this.data.meta.dailyValues) this.data.meta.dailyValues = Object.assign({}, DEFAULT_DAILY_VALUES);
+    if (!this.data.meta.vipThresholds) this.data.meta.vipThresholds = JSON.parse(JSON.stringify(DEFAULT_VIP_THRESHOLDS));
+    if (!this.data.meta.healthThresholds) this.data.meta.healthThresholds = Object.assign({}, DEFAULT_HEALTH_THRESHOLDS);
     if (!this.data.customers) this.data.customers = [];
     if (!this.data.rentals) this.data.rentals = [];
     if (!this.data.vehicles) this.data.vehicles = [];
@@ -1451,6 +1481,15 @@ function fmtDate(iso) {
   const d = new Date(iso + "T00:00:00");
   return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 }
+// A precise "10 Aug 2026 10:30"-style timestamp — used only for audit-trail events
+// (Marked Used / Use Reversed) where staff need to see exactly when a transaction
+// happened, not just the date, to distinguish an action from its later reversal.
+function nowDateTimeLabel() {
+  const d = new Date();
+  const datePart = d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+  const timePart = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
+  return `${datePart} ${timePart}`;
+}
 function fmtMoney(n) {
   const v = Number(n) || 0;
   return "฿" + v.toLocaleString("en-US", { maximumFractionDigits: 0 });
@@ -1612,6 +1651,55 @@ function isQualifiedRental(rental) {
   const days = Number(rental.paidDays) || 0;
   const revenue = Number(rental.revenue) || 0;
   return days >= t.days || revenue >= t.revenue;
+}
+
+/* ---------------------------------------------------------------------- */
+/* REWARD FINANCIALS — estimated value / actual cost, all editable via     */
+/* DB.data.meta.* (Settings), never hard-coded business rules.             */
+/* ---------------------------------------------------------------------- */
+
+// Collapses the 5 fine-grained Ride Upgrade tiers into the 3 broad bands VIP Extra Day
+// qualification is defined against (110/125cc, 155cc, Forza/XMAX 300).
+function broadTier(category) {
+  if (category === "125cc") return "125cc";
+  if (category === "Forza 300" || category === "XMAX 300") return "300cc";
+  return "155cc";
+}
+function dailyValueFor(category) {
+  const table = (DB.data.meta && DB.data.meta.dailyValues) || DEFAULT_DAILY_VALUES;
+  return table[category] ?? 0;
+}
+function rewardCost(field) {
+  const table = (DB.data.meta && DB.data.meta.rewardCosts) || DEFAULT_REWARD_COSTS;
+  return table[field] ?? 0;
+}
+function vipThresholdFor(broad) {
+  const table = (DB.data.meta && DB.data.meta.vipThresholds) || DEFAULT_VIP_THRESHOLDS;
+  return table[broad] ?? DEFAULT_VIP_THRESHOLDS[broad];
+}
+// Loyalty Health status from a Reward-to-Revenue ratio (%), using editable thresholds.
+function loyaltyHealth(ratioPct) {
+  const t = (DB.data.meta && DB.data.meta.healthThresholds) || DEFAULT_HEALTH_THRESHOLDS;
+  if (ratioPct <= t.healthyMax) return { label: "Healthy", emoji: "🟢", cls: "green" };
+  if (ratioPct <= t.watchMax) return { label: "Watch", emoji: "🟡", cls: "amber" };
+  return { label: "High", emoji: "🔴", cls: "red" };
+}
+// A customer's full financial/loyalty-value summary — used on the profile's "Customer
+// Value" section and the Reward History screen. Reads only already-computed stats/rewards;
+// never recalculates rental history or eligibility.
+function customerFinancialSummary(customer, stats) {
+  const given = rewardsFor(customer.id).filter((r) => r.given);
+  const totalValue = given.reduce((s, r) => s + (Number(r.value) || 0), 0);
+  const totalActualCost = given.reduce((s, r) => s + (Number(r.actualCost ?? r.value) || 0), 0);
+  const ratio = stats.totalRevenue > 0 ? (totalValue / stats.totalRevenue) * 100 : 0;
+  return {
+    lifetimeRevenue: stats.totalRevenue,
+    rewardsGivenCount: given.length,
+    totalRewardValue: totalValue,
+    actualGiftCost: totalActualCost,
+    ratioPct: ratio,
+    health: loyaltyHealth(ratio),
+  };
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1804,6 +1892,7 @@ function getSuggestions(customer, stats) {
       notActive: !alreadyGiven && !qualifying && !hasEraRental,
       reward: existing, repeatable: false,
       rentalId: qualifying ? qualifying.id : null,
+      estimatedValue: rewardCost("welcomeGift"),
     });
   }
 
@@ -1853,6 +1942,7 @@ function getSuggestions(customer, stats) {
               ? `${accruedDays} completed paid day(s) so far — already past the ${threshold}-day threshold, waiting on return.`
               : `${accruedDays} completed paid day(s) so far (still active) — bike not yet returned.`,
         reward: rewardRec, repeatable: false,
+        estimatedValue: rewardCost("journeyGift"),
       });
     });
 
@@ -1938,6 +2028,9 @@ function getSuggestions(customer, stats) {
         reason, notYetReason: reason, needsReview: !!familyUncertain,
         reward: rewardRec, repeatable: true, upgradeTarget: nextTarget, fromCategory: lastRideCategory,
         normalRate: pricing ? pricing.normalRate : null, loyaltyRate: pricing ? pricing.loyaltyRate : null, rateUnit: pricing ? pricing.unit : null,
+        // The reward's financial value is only the DISCOUNT actually given (normal minus
+        // loyalty rate) — never the full rental price. Null when the step isn't priced yet.
+        estimatedValue: pricing ? Math.max(pricing.normalRate - pricing.loyaltyRate, 0) : null,
         rideUpgradeStatus,
       });
     } else if (lastRideCategory === "NMAX Keyless/ABS 155cc") {
@@ -1989,6 +2082,7 @@ function getSuggestions(customer, stats) {
         reason: `Used ${fmtDate(rw.dateGiven)}${rw.bikeUsed ? " on " + rw.bikeUsed : ""}.`
           + (isLatest ? ` Next reward progress: ${paidDaysSinceLast} / ${PREMIUM_RIDE_MIN_PAID_DAYS} days.` : ""),
         reward: rw, repeatable: true,
+        estimatedValue: rw.value,
       });
     });
 
@@ -2016,23 +2110,39 @@ function getSuggestions(customer, stats) {
       reward: rewardRec, repeatable: true,
       savedForNextVisit: eligible && !stats.current,
       paidDaysSinceLast, currentBikeRaw, experienceBike,
+      estimatedValue: experienceBike ? dailyValueFor(experienceBike) * 2 : null,
     });
   }
 
-  // 5. VIP Extra Day on Us — an EARNED reward with its own qualification/redemption cycle,
-  //    particularly for customers whose normal/preferred level is already Forza/XMAX (a
-  //    Forza/XMAX trial via Premium Ride wouldn't mean much to them). Same 180-paid-day
-  //    cycle mechanic as Premium Ride, gated additionally on having ridden Forza/XMAX.
+  // 5. VIP Extra Day on Us — an EARNED reward with its own qualification/redemption cycle.
+  //    A dynamic benefit for EVERY customer now (not just Forza/XMAX riders) — this is
+  //    Option B of the Return Privilege choice: same preferred bike/category, one
+  //    complimentary extra rental day, rather than moving up a tier. Qualification is
+  //    meaningful repeat rentals + cumulative paid days since the last Extra Day cycle,
+  //    tier-aware (110/125cc, 155cc, Forza/XMAX 300) via editable Settings thresholds —
+  //    never just counting transactions (e.g. 3+3 days across two visits does not qualify
+  //    on its own if the day threshold isn't met).
   {
-    const hasForzaXmax = stats.previousBikes.includes("Forza 300") || stats.previousBikes.includes("XMAX 300")
-      || (stats.current && ["Forza 300", "XMAX 300"].includes(rentalCategory(stats.current)));
+    const lastRental = stats.current || stats.rentals[0] || null;
+    const currentTierVip = lastRental ? rentalCategory(lastRental) : null;
+    const broadTierVip = currentTierVip ? broadTier(currentTierVip) : "125cc";
+    const thresholdVip = vipThresholdFor(broadTierVip);
+    // dailyValueFor() needs the FINE-grained category (matches the Ride Upgrade ladder
+    // naming used as keys in DEFAULT_DAILY_VALUES) — rentalCategory() above is the coarse
+    // 5-tier bucket used only for the threshold lookup, never for the value lookup.
+    const fineTierVip = lastRental ? rideUpgradeCategory(lastRental) : null;
+
     const givenVip = rewardsFor(customer.id).filter((r) => r.type === "vip_extra_day" && r.given)
       .sort((a, b) => (a.dateGiven < b.dateGiven ? -1 : 1));
 
     const lastUsedVip = givenVip[givenVip.length - 1] || null;
     const cycleBaselineVip = lastUsedVip && lastUsedVip.cycleBaselinePaidDays !== undefined ? lastUsedVip.cycleBaselinePaidDays : 0;
+    const cycleBaselineQualifiedVip = lastUsedVip && lastUsedVip.cycleBaselineQualifiedCount !== undefined ? lastUsedVip.cycleBaselineQualifiedCount : 0;
     const paidDaysSinceLastVip = Math.max(stats.paidRentalDays - cycleBaselineVip, 0);
-    const calculatedEligible = hasForzaXmax && paidDaysSinceLastVip >= PREMIUM_RIDE_MIN_PAID_DAYS;
+    const qualifiedEpisodesSinceLastVip = Math.max(stats.qualifiedRentalCount - cycleBaselineQualifiedVip, 0);
+    const enoughEpisodes = qualifiedEpisodesSinceLastVip >= thresholdVip.episodes;
+    const enoughDays = paidDaysSinceLastVip >= thresholdVip.days;
+    const calculatedEligible = enoughEpisodes && enoughDays;
 
     givenVip.forEach((rw, idx) => {
       const isLatest = idx === givenVip.length - 1;
@@ -2041,9 +2151,10 @@ function getSuggestions(customer, stats) {
         title: REWARD_LABELS.vip_extra_day,
         desc: "VIP Extra Day — used.",
         eligible: true, calculatedEligible: true, overridden: false, cycleStatus: "used",
-        reason: `Used ${fmtDate(rw.dateGiven)}.`
-          + (isLatest ? ` Next reward progress: ${paidDaysSinceLastVip} / ${PREMIUM_RIDE_MIN_PAID_DAYS} days.` : ""),
+        reason: `Used ${fmtDate(rw.dateGiven)}${rw.bikeUsed ? " on " + rw.bikeUsed : ""}.`
+          + (isLatest ? ` Next reward progress: ${qualifiedEpisodesSinceLastVip}/${thresholdVip.episodes} episodes, ${paidDaysSinceLastVip}/${thresholdVip.days} days.` : ""),
         reward: rw, repeatable: true,
+        estimatedValue: rw.value,
       });
     });
 
@@ -2053,19 +2164,26 @@ function getSuggestions(customer, stats) {
     const isReserved = !!(rewardRec && rewardRec.reserved && !rewardRec.given);
     const cycleStatus = eligible ? (isReserved ? "reserved" : "ready") : "locked";
 
+    let reasonVip;
+    if (calculatedEligible) {
+      reasonVip = `${qualifiedEpisodesSinceLastVip} qualified rental(s), ${paidDaysSinceLastVip} paid day(s) since last VIP reward (needs ${thresholdVip.episodes}+ episodes and ${thresholdVip.days}+ days).`;
+    } else if (!enoughEpisodes) {
+      reasonVip = `${qualifiedEpisodesSinceLastVip} of ${thresholdVip.episodes} qualified rental episodes since last VIP reward.`;
+    } else {
+      reasonVip = `${paidDaysSinceLastVip} of ${thresholdVip.days} cumulative paid days since last VIP reward.`;
+    }
+
     out.push({
       key, type: "vip_extra_day",
       title: REWARD_LABELS.vip_extra_day,
-      desc: "One complimentary extra rental day (e.g. pay 5 days, ride 6) — an earned reward with its own cycle, particularly for customers whose normal rental level is already Forza/XMAX. Subject to availability.",
+      desc: `An earned reward, redeemed as one complimentary day added to a qualifying rental of 7+ paid days — e.g. Pay 7 → Ride 8, Pay 10 → Ride 11 (not a repeating "7+1" promotion, and paying 14 doesn't become 16). The alternative to Ride Upgrade for customers who genuinely prefer their current bike size.`,
       eligible, calculatedEligible, overridden: isOverridden(rewardRec), cycleStatus,
-      reason: !hasForzaXmax
-        ? "Not yet on record as a Forza/XMAX rider."
-        : calculatedEligible
-          ? `${paidDaysSinceLastVip} paid day(s) since last VIP reward.`
-          : `${paidDaysSinceLastVip} of ${PREMIUM_RIDE_MIN_PAID_DAYS} paid days since last VIP reward.`,
+      reason: reasonVip,
       reward: rewardRec, repeatable: true,
       savedForNextVisit: eligible && !stats.current,
       lastUsed: lastUsedVip ? lastUsedVip.dateGiven : null,
+      currentTierVip, qualifiedEpisodesSinceLastVip, paidDaysSinceLastVip, thresholdVip,
+      estimatedValue: fineTierVip ? dailyValueFor(fineTierVip) : null,
     });
   }
 
@@ -2151,7 +2269,7 @@ function dashboardStats() {
 /* ROUTER + STATE                                                          */
 /* ---------------------------------------------------------------------- */
 
-const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false };
+const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all" };
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -2176,7 +2294,7 @@ function navigate(route, params = {}) {
   window.scrollTo(0, 0);
 }
 function topLevel(route) {
-  if (route.startsWith("customer") || route === "needs-review" || route === "rewards-ready" || route === "active-riders") return "customers";
+  if (route.startsWith("customer") || route === "needs-review" || route === "rewards-ready" || route === "active-riders" || route === "reward-history" || route === "loyalty-reports") return "customers";
   if (route.startsWith("vehicle")) return "vehicles";
   return "settings"; // settings/import — no bottom tab, reached via gear icon
 }
@@ -2424,8 +2542,8 @@ function renderCustomersHome() {
         <div class="quick-actions-row">
           <button class="quick-action" data-action="open-search"><span class="quick-action-circle">${boldIcon("search")}</span><span class="quick-action-label">Search<br/>Customer</span></button>
           <button class="quick-action" data-action="open-search"><span class="quick-action-circle">${boldIcon("gift")}</span><span class="quick-action-label">Add<br/>Reward</span></button>
-          <button class="quick-action" data-goto="vehicles"><span class="quick-action-circle">${boldIcon("scan")}</span><span class="quick-action-label">Scan<br/>Document</span></button>
-          <button class="quick-action" data-action="reports-soon"><span class="quick-action-circle">${boldIcon("reports")}</span><span class="quick-action-label">Reports</span></button>
+          <button class="quick-action" data-action="open-reward-history-fresh"><span class="quick-action-circle">${boldIcon("gift")}</span><span class="quick-action-label">Reward<br/>History</span></button>
+          <button class="quick-action" data-goto="loyalty-reports"><span class="quick-action-circle">${boldIcon("reports")}</span><span class="quick-action-label">Loyalty<br/>Reports</span></button>
         </div>
       </div>
     </div>
@@ -2638,13 +2756,20 @@ function renderRewardCardV2(customer, s) {
         ? `<button class="btn btn-orange btn-sm" data-action="mark-premium-used" data-key="${s.key}" data-customer="${customer.id}" data-rental="${s.rentalId || ""}">Mark used</button>`
         : `<button class="btn btn-orange btn-sm" data-action="quick-give-use" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}">Mark used</button>`;
     }
+    if (s.cycleStatus === "reserved") {
+      actionHtml += `<button class="btn btn-ghost btn-sm" data-action="return-to-ready" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}">Return to Ready</button>`;
+    }
     if (s.type === "premium_ride" && (s.cycleStatus === "ready" || s.cycleStatus === "reserved") && s.experienceBike) {
       actionHtml += `<button class="btn btn-ghost btn-sm" data-action="send-premium-invite" data-customer="${customer.id}" data-current-bike="${escapeHtml(s.currentBikeRaw || "")}" data-experience-bike="${escapeHtml(s.experienceBike)}">Send Invite</button>`;
     }
   } else if (s.type === "return_privilege" && s.rideUpgradeStatus && s.rideUpgradeStatus !== "used" && s.eligible) {
     if (s.rideUpgradeStatus === "available") actionHtml += `<button class="btn btn-outline btn-sm" data-action="accept-upgrade" data-key="${s.key}" data-customer="${customer.id}" data-rental="${s.rentalId || ""}">Accept Upgrade</button>`;
     actionHtml += `<button class="btn btn-orange btn-sm" data-action="quick-give-use" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}" data-upgrade-target="${s.upgradeTarget || ""}">Mark used</button>`;
-    actionHtml += `<button class="btn btn-ghost btn-sm" data-action="decline-upgrade" data-key="${s.key}" data-customer="${customer.id}" data-rental="${s.rentalId || ""}">Decline</button>`;
+    if (s.rideUpgradeStatus === "accepted") {
+      actionHtml += `<button class="btn btn-ghost btn-sm" data-action="return-to-ready" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}">Return to Ready</button>`;
+    } else {
+      actionHtml += `<button class="btn btn-ghost btn-sm" data-action="decline-upgrade" data-key="${s.key}" data-customer="${customer.id}" data-rental="${s.rentalId || ""}">Decline</button>`;
+    }
   } else if (!given && !s.inProgress && !s.historical && !s.notActive && !s.isNoCurrentRentalMarker) {
     actionHtml = `<button class="btn btn-orange btn-sm" data-action="quick-give-use" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}" data-upgrade-target="${s.upgradeTarget || ""}">${s.type === "return_privilege" ? "Use" : "Give Gift"}</button>`;
   }
@@ -2667,6 +2792,7 @@ function renderRewardCardV2(customer, s) {
           ${s.type === "return_privilege" && s.normalRate ? `
             <div class="reward-row-v2-rate">Loyalty Rate: <b>${fmtMoney(s.loyaltyRate)}/${escapeHtml(s.rateUnit || "month")}</b> <span class="muted">(regular ${fmtMoney(s.normalRate)})</span></div>
           ` : ""}
+          ${given ? `<div class="reward-row-v2-rate">Value: <b>${fmtMoney(s.reward.value)}</b>${s.reward.actualCost !== undefined ? ` · Actual Cost: <b>${fmtMoney(s.reward.actualCost)}</b>` : ""}</div>` : ""}
         </div>
       </div>
       ${actionHtml ? `<div class="reward-row-v2-actions">${actionHtml}</div>` : ""}
@@ -2674,9 +2800,11 @@ function renderRewardCardV2(customer, s) {
         <div class="detail-panel" id="${panelId}" hidden>
           ${s.overridden ? `<div class="loyalty-override-tag">Manually set — system calculated ${s.calculatedEligible ? "Eligible" : "Not eligible"}</div>` : ""}
           ${s.reward && s.reward.notes ? `<div class="reward-note">${escapeHtml(s.reward.notes)}</div>` : ""}
-          ${s.reward && s.reward.history && s.reward.history.length ? s.reward.history.slice().reverse().map((h) => `<div class="reward-note" style="margin-bottom:4px;font-size:12px;">${escapeHtml(h.field)}: ${escapeHtml(String(h.previous))} → ${escapeHtml(String(h.new))} · ${fmtDate(h.changedOn)}</div>`).join("") : ""}
+          ${s.reward && s.reward.history && s.reward.history.length ? s.reward.history.slice().reverse().map((h) => `<div class="reward-note" style="margin-bottom:4px;font-size:12px;">${escapeHtml(h.field)}: ${escapeHtml(String(h.previous))} → ${escapeHtml(String(h.new))} · ${h.changedOn}</div>`).join("") : ""}
         </div>` : ""}
-      <button class="link-btn" data-action="edit-reward-full" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}" style="font-size:11.5px; margin-top:4px;">${given ? "Edit / Undo" : "Edit / override"}</button>
+      ${given
+        ? `<button class="btn btn-outline btn-sm" data-action="reward-override-menu" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}" style="margin-top:8px;">Edit / Override</button>`
+        : `<button class="link-btn" data-action="edit-reward-full" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}" style="font-size:11.5px; margin-top:4px;">Edit / override</button>`}
     </div>
   `;
 }
@@ -2773,20 +2901,37 @@ function renderLoyaltySection(c, stats, suggestions) {
   const pr = primaryForType(suggestions, "premium_ride");
   const vip = primaryForType(suggestions, "vip_extra_day");
 
-  // Premium Ride Experience is now a universal 180-paid-day countdown relevant to every
-  // customer (shown even while Locked, so progress is visible). VIP Extra Day stays gated
-  // to customers who've actually ridden Forza/XMAX — showing "Locked, not a 300cc rider" on
-  // everyone else's profile would just be noise.
-  const isRelevantVip = (g) => g && (g.primary.eligible || (g.primary.reward && g.primary.reward.given) || g.all.some((s) => s.reward && s.reward.given));
+  // Premium Ride Experience and VIP Extra Day are both now universal, dynamic benefits —
+  // shown on every profile (even while Locked, so progress toward qualifying is visible),
+  // not gated to a pre-selected group of customers.
+
+  // Return Privilege has two alternative paths — a bigger bike (Ride Upgrade) or staying
+  // on the same preferred bike/category (VIP Extra Day). When a customer genuinely
+  // qualifies for BOTH at once, surface that as an explicit choice rather than letting
+  // one silently take precedence — staff picks, nothing is ever auto-given.
+  const rpPending = rp && rp.all.find((s) => s.type === "return_privilege" && s.upgradeTarget && s.eligible && !(s.reward && s.reward.given));
+  const vipPending = vip && vip.all.find((s) => s.type === "vip_extra_day" && (s.cycleStatus === "ready" || s.cycleStatus === "reserved"));
+  const showChoice = !!(rpPending && vipPending);
 
   return `
     <div class="rewards-panel">
       <div class="rewards-panel-title">AA Rewards</div>
+      ${showChoice ? `
+        <div class="reward-choice-card">
+          <div class="reward-choice-title">Choose Return Privilege</div>
+          <div class="reward-choice-sub">This customer qualifies for both — offer one, not both. See the matching cards below to act.</div>
+          <div class="reward-choice-options">
+            <div class="reward-choice-option">⬆ Ride Upgrade<span>${escapeHtml(rpPending.upgradeTarget)}</span></div>
+            <div class="reward-choice-or">OR</div>
+            <div class="reward-choice-option">+1 VIP Extra Day on Us<span>Same bike, one more day</span></div>
+          </div>
+        </div>
+      ` : ""}
       ${wk ? renderRewardCardV2(c, wk.primary) : ""}
       ${jg ? renderRewardCardV2(c, jg.primary) : ""}
       ${rp ? renderRewardCardV2(c, rp.primary) : ""}
       ${pr ? renderRewardCardV2(c, pr.primary) : ""}
-      ${isRelevantVip(vip) ? renderRewardCardV2(c, vip.primary) : ""}
+      ${vip ? renderRewardCardV2(c, vip.primary) : ""}
     </div>
   `;
 }
@@ -2819,6 +2964,26 @@ function renderRentalCard(r) {
         ${r.status === "active" ? `<button class="btn btn-outline btn-sm" data-action="complete-rental" data-id="${r.id}">Mark returned</button>` : ""}
         <button class="btn btn-ghost btn-sm" data-action="edit-rental" data-id="${r.id}">Edit rental</button>
       </div>
+    </div>
+  `;
+}
+
+// Compact "Customer Value" section — Lifetime Revenue, Reward Value Given, Actual Gift
+// Cost, Reward-to-Revenue ratio, and a Loyalty Health status, with a link into the full
+// Reward History for this customer. Read-only summary; all editing happens there.
+function renderCustomerValueCard(c, stats) {
+  const fin = customerFinancialSummary(c, stats);
+  return `
+    <div class="card" style="margin-bottom:14px;">
+      <div class="section-label" style="margin-top:0;">Customer Value</div>
+      <div class="grid-2" style="margin-bottom:10px;">
+        <div><div class="muted" style="font-size:11.5px;">Lifetime Revenue</div><div style="font-weight:700;">${fmtMoney(fin.lifetimeRevenue)}</div></div>
+        <div><div class="muted" style="font-size:11.5px;">Reward Value Given</div><div style="font-weight:700;">${fmtMoney(fin.totalRewardValue)}</div></div>
+        <div><div class="muted" style="font-size:11.5px;">Actual Gift Cost</div><div style="font-weight:700;">${fmtMoney(fin.actualGiftCost)}</div></div>
+        <div><div class="muted" style="font-size:11.5px;">Reward-to-Revenue</div><div style="font-weight:700;">${fin.ratioPct.toFixed(1)}%</div></div>
+      </div>
+      <span class="pill ${fin.health.cls === "green" ? "pill-green" : fin.health.cls === "amber" ? "pill-amber" : "pill-red"}">${fin.health.emoji} ${escapeHtml(fin.health.label)}</span>
+      <button class="link-btn" data-action="view-reward-history" data-id="${c.id}" style="display:block;margin-top:10px;">View Reward History</button>
     </div>
   `;
 }
@@ -2879,6 +3044,8 @@ function renderCustomerDetail() {
 
       ${renderLoyaltySection(c, stats, suggestions)}
 
+      ${renderCustomerValueCard(c, stats)}
+
       <button class="link-btn" data-toggle="rental-history-panel" style="margin-top:10px;">View details</button>
       <div class="detail-panel" id="rental-history-panel" hidden>
         <div class="section-label">Rental &amp; revenue summary</div>
@@ -2933,6 +3100,238 @@ function renderVehicleRow(v, st) {
       </div>
       <span class="chev">${ICONS.chevronRight}</span>
     </div>`;
+}
+
+/* ---------------------------------------------------------------------- */
+/* RENDER — REWARD HISTORY (search a customer, see everything: given,      */
+/* available, pending — with full edit access via the existing sheets)     */
+/* ---------------------------------------------------------------------- */
+
+function renderRewardHistoryScreen() {
+  if (state.rewardHistoryCustomerId) {
+    const c = DB.data.customers.find((x) => x.id === state.rewardHistoryCustomerId);
+    if (!c) { state.rewardHistoryCustomerId = null; return renderRewardHistoryScreen(); }
+    const stats = customerStats(c);
+    const suggestions = getSuggestions(c, stats);
+    const byType = ["welcome_kit", "journey_gift", "return_privilege", "premium_ride", "vip_extra_day"];
+    const filter = state.rewardHistoryFilter || "all";
+    const filterTabs = [["all", "All"], ["used", "Used"], ["available", "Available"], ["archived", "Archived"],
+      ["welcome_kit", "Welcome Gift"], ["return_privilege", "Ride Upgrade"], ["vip_extra_day", "VIP Extra Day"],
+      ["premium_ride", "Premium Ride"], ["journey_gift", "Journey Gift"]];
+    // "Used" and "Archived" both mean the same thing here — a completed, permanently
+    // preserved past cycle — since this app never deletes a reward once given.
+    const matchesFilter = (s) => {
+      const isGiven = !!(s.reward && s.reward.given);
+      if (filter === "all") return true;
+      if (filter === "used" || filter === "archived") return isGiven;
+      if (filter === "available") return !isGiven && (s.eligible || s.qualifiedPending);
+      return s.type === filter;
+    };
+    return `
+      <header class="screen-header">
+        <button class="back-btn" data-action="reward-history-back">‹ Reward History</button>
+        <h1 class="screen-title" style="margin-top:8px;">${escapeHtml(c.name)}</h1>
+        <p class="screen-sub">Every reward on record — given, available, and pending</p>
+      </header>
+      <div class="screen-body">
+        ${renderCustomerValueCard(c, stats)}
+        <div class="period-tabs" style="margin-bottom:6px;">
+          ${filterTabs.map(([id, label]) => `<button class="period-tab ${filter === id ? "active" : ""}" data-action="set-reward-history-filter" data-filter="${id}">${escapeHtml(label)}</button>`).join("")}
+        </div>
+        ${byType.map((type) => {
+          const items = suggestions.filter((s) => s.type === type && !s.isNoCurrentRentalMarker && matchesFilter(s));
+          if (!items.length) return "";
+          return `<div class="section-label">${escapeHtml(REWARD_LABELS[type])}</div>${items.map((s) => renderRewardCardV2(c, s)).join("")}`;
+        }).join("")}
+      </div>
+    `;
+  }
+
+  const q = state.rewardHistorySearch.trim().toLowerCase();
+  const list = q ? DB.data.customers.filter((c) =>
+    c.name.toLowerCase().includes(q) || (c.phone || "").toLowerCase().includes(q) || (c.passport || "").toLowerCase().includes(q)
+  ).sort((a, b) => a.name.localeCompare(b.name)) : [];
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="customers">‹ Customer Loyalty</button>
+      <h1 class="screen-title" style="margin-top:8px;">Reward History</h1>
+      <p class="screen-sub">Search a customer to see every reward — given, available, or pending</p>
+      <div class="home-search-wrap" style="margin-top:14px;">
+        <span class="search-icon">${boldIcon("search")}</span>
+        <input id="reward-history-search" type="search" inputmode="search" placeholder="Search by name, phone, or passport…" value="${escapeHtml(state.rewardHistorySearch)}" autocomplete="off" />
+      </div>
+    </header>
+    <div class="screen-body">
+      ${!q ? renderRecentlyGivenList()
+        : list.length === 0 ? `<div class="empty"><div class="empty-icon">${boldIcon("search")}</div><h3>No matches</h3><p>Try a different name, phone number, or passport.</p></div>`
+        : `<div class="cust-row-list">${list.map((c) => `
+            <div class="cust-row" data-action="open-reward-history" data-id="${c.id}">
+              <div class="cust-row-main"><div class="cust-row-name">${escapeHtml(c.name)}</div></div>
+              <span class="cust-row-chevron">${ICONS.chevronRight}</span>
+            </div>
+          `).join("")}</div>`}
+    </div>
+  `;
+}
+
+// "Who did I just give a reward to?" — without this, the only way to find a customer again
+// after giving them a reward is to remember and re-type their exact name. This lists the
+// most recently given rewards (any type, any customer), most recent first, each one tapping
+// straight into that customer's full history — the direct answer to that question.
+function renderRecentlyGivenList() {
+  // Recently Given = currently active USED/GIVEN rewards only. A reversed reward drops out
+  // of this list automatically (given flips back to false) — it's not deleted, just no
+  // longer an active "given" transaction; it's still fully visible in that customer's full
+  // Reward History (the complete ledger, reversals included).
+  const recent = DB.data.rewards
+    .filter((r) => r.given)
+    .sort((a, b) => (b.givenAt || b.dateGiven || "").localeCompare(a.givenAt || a.dateGiven || ""))
+    .slice(0, 15);
+
+  if (recent.length === 0) {
+    return `<div class="empty"><div class="empty-icon">${boldIcon("gift")}</div><h3>Search for a customer</h3><p>Their full reward history, current value, and edit access will show up here. No rewards have been given yet.</p></div>`;
+  }
+
+  return `
+    <div class="section-label" style="margin-top:0;">Recently Given</div>
+    <div class="cust-row-list">
+      ${recent.map((rw) => {
+        const c = DB.data.customers.find((x) => x.id === rw.customerId);
+        if (!c) return "";
+        return `
+          <div class="cust-row" data-action="open-reward-transaction" data-key="${rw.key}">
+            <div class="cust-row-main">
+              <div class="cust-row-name">${escapeHtml(c.name)}</div>
+              <div class="cust-row-reward">
+                ${boldIcon(REWARD_ICON[rw.type] || "gift", "row")}
+                <span class="cust-row-reward-type">${escapeHtml(REWARD_LABELS[rw.type] || rw.type)}</span>
+                <span class="cust-row-reward-detail"> · ${fmtDate(rw.dateGiven)}${rw.value ? " · " + fmtMoney(rw.value) : ""}</span>
+              </div>
+            </div>
+            <span class="cust-row-chevron">${ICONS.chevronRight}</span>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+// The reward transaction detail sheet — opened from "Recently Given" (or anywhere else a
+// specific reward key needs a closer look). Shows the full timeline and current status
+// (Used or, if it's since been undone, Reversed — never silently treated as if nothing
+// happened), and links both ways: to the customer's profile, and into Edit / Override.
+function sheetRewardTransaction(key) {
+  const rw = findReward(key);
+  if (!rw) return;
+  const customer = DB.data.customers.find((c) => c.id === rw.customerId);
+  const wasReversed = !rw.given && rw.history && rw.history.some((h) => h.field === "Use Reversed");
+  const statusLabel = rw.given ? "USED" : wasReversed ? "REVERSED" : "READY";
+  const statusCls = rw.given ? "pill-green" : wasReversed ? "pill-neutral" : "pill-orange";
+
+  openSheet(`
+    <div class="sheet-title">${escapeHtml(REWARD_LABELS[rw.type] || rw.type)}</div>
+    <div class="sheet-sub">${escapeHtml(customer ? customer.name : "Unknown customer")}</div>
+    <span class="pill ${statusCls}" style="margin-bottom:12px; display:inline-block;">${statusLabel}</span>
+    ${rw.given ? `<div class="reward-note">Used ${fmtDate(rw.dateGiven)}${rw.value ? " · " + fmtMoney(rw.value) : ""}${rw.bikeUsed ? " · " + escapeHtml(rw.bikeUsed) : ""}</div>` : ""}
+    <div class="section-label" style="margin-top:14px;">Timeline</div>
+    ${rw.history && rw.history.length ? rw.history.map((h) => `
+      <div class="reward-note" style="margin-bottom:6px;">
+        <b>${escapeHtml(h.field)}</b><br/>${escapeHtml(String(h.previous))} → ${escapeHtml(String(h.new))}<br/><span class="muted">${escapeHtml(h.changedOn)}</span>
+      </div>
+    `).join("") : `<p class="muted">No recorded events yet.</p>`}
+    ${rw.notes ? `<div class="section-label">Staff Note</div><div class="reward-note">${escapeHtml(rw.notes)}</div>` : ""}
+    <div class="btn-row" style="margin-top:16px;">
+      ${customer ? `<button class="btn btn-outline btn-block" id="txn-view-customer">View Customer</button>` : ""}
+    </div>
+    <div class="btn-row" style="margin-top:8px;">
+      ${rw.given ? `<button class="btn btn-primary btn-block" id="txn-edit-override">Edit / Override</button>` : ""}
+    </div>
+  `);
+  if (customer) {
+    document.getElementById("txn-view-customer").addEventListener("click", () => {
+      closeSheet();
+      navigate("customer", { customerId: customer.id });
+    });
+  }
+  const editBtn = document.getElementById("txn-edit-override");
+  if (editBtn) editBtn.addEventListener("click", () => {
+    closeSheet();
+    sheetRewardActionMenu(rw.key, rw.customerId, rw.type, rw.rentalId);
+  });
+}
+
+/* ---------------------------------------------------------------------- */
+/* RENDER — LOYALTY REPORTS (This Month / Last Month / This Year /         */
+/* Lifetime — Customer Loyalty only, never touches Vehicle Renewal)        */
+/* ---------------------------------------------------------------------- */
+
+function reportsDateRange(period) {
+  const now = new Date();
+  const y = now.getFullYear(), m = now.getMonth();
+  if (period === "month") return { start: new Date(y, m, 1), end: new Date(y, m + 1, 1) };
+  if (period === "lastMonth") return { start: new Date(y, m - 1, 1), end: new Date(y, m, 1) };
+  if (period === "year") return { start: new Date(y, 0, 1), end: new Date(y + 1, 0, 1) };
+  return { start: new Date(2000, 0, 1), end: new Date(2100, 0, 1) }; // lifetime
+}
+
+function renderLoyaltyReportsScreen() {
+  const periods = [["month", "This Month"], ["lastMonth", "Last Month"], ["year", "This Year"], ["lifetime", "Lifetime"]];
+  const { start, end } = reportsDateRange(state.reportsPeriod);
+  const inRange = (iso) => { if (!iso) return false; const d = new Date(iso + "T00:00:00"); return d >= start && d < end; };
+
+  const givenInRange = DB.data.rewards.filter((r) => r.given && inRange(r.dateGiven));
+  const countByType = (t) => givenInRange.filter((r) => r.type === t).length;
+  const actualCost = givenInRange.reduce((s, r) => s + (Number(r.actualCost ?? r.value) || 0), 0);
+  const estValue = givenInRange.reduce((s, r) => s + (Number(r.value) || 0), 0);
+
+  // Rewards Outstanding — eligible now, not yet given, across every customer (not period-filtered,
+  // since this is a live "what's waiting on staff right now" figure).
+  let outstanding = 0;
+  const loyaltyCustomerIds = new Set(DB.data.rewards.filter((r) => r.given).map((r) => r.customerId));
+  DB.data.customers.forEach((c) => {
+    const stats = customerStats(c);
+    const sugg = getSuggestions(c, stats);
+    outstanding += sugg.filter((s) => s.eligible && !(s.reward && s.reward.given) && !s.isNoCurrentRentalMarker).length;
+  });
+  const loyaltyRevenue = [...loyaltyCustomerIds].reduce((s, id) => {
+    const cust = DB.data.customers.find((c) => c.id === id);
+    return cust ? s + customerStats(cust).totalRevenue : s;
+  }, 0);
+  const overallRatio = loyaltyRevenue > 0 ? (estValue / loyaltyRevenue) * 100 : 0;
+
+  const tile = (label, value) => `<div class="report-tile"><div class="report-tile-value">${value}</div><div class="report-tile-label">${escapeHtml(label)}</div></div>`;
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="customers">‹ Customer Loyalty</button>
+      <h1 class="screen-title" style="margin-top:8px;">Loyalty Reports</h1>
+      <p class="screen-sub">Customer Loyalty only — separate from Vehicle Renewal</p>
+    </header>
+    <div class="screen-body">
+      <div class="period-tabs">
+        ${periods.map(([id, label]) => `<button class="period-tab ${state.reportsPeriod === id ? "active" : ""}" data-action="set-reports-period" data-period="${id}">${label}</button>`).join("")}
+      </div>
+      <div class="report-grid">
+        ${tile("Welcome Gifts Given", countByType("welcome_kit"))}
+        ${tile("Journey Gifts Given", countByType("journey_gift"))}
+        ${tile("Ride Upgrades Used", countByType("return_privilege"))}
+        ${tile("VIP Extra Days Used", countByType("vip_extra_day"))}
+        ${tile("Premium Rides Used", countByType("premium_ride"))}
+        ${tile("Rewards Outstanding", outstanding)}
+      </div>
+      <div class="card" style="margin-bottom:14px;">
+        <div class="section-label" style="margin-top:0;">Loyalty Value</div>
+        <div class="grid-2">
+          <div><div class="muted" style="font-size:11.5px;">Actual Gift Cost</div><div style="font-weight:700;">${fmtMoney(actualCost)}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Estimated Complimentary Value</div><div style="font-weight:700;">${fmtMoney(estValue)}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Total Loyalty Value Given</div><div style="font-weight:700;">${fmtMoney(estValue)}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Overall Reward-to-Revenue</div><div style="font-weight:700;">${overallRatio.toFixed(1)}%</div></div>
+        </div>
+        <div class="reward-note" style="margin-top:10px;">Revenue from loyalty customers (lifetime, all customers who have ever received a reward): ${fmtMoney(loyaltyRevenue)}.</div>
+      </div>
+    </div>
+  `;
 }
 
 function renderVehiclesList() {
@@ -3281,6 +3680,43 @@ function renderSettings() {
         <p class="muted">The AA Loyalty &amp; Rewards Program's official start date. Welcome Gift only applies to bookings handed over on or after this date; Journey Gift only applies to rentals that are still active, or that complete, on or after this date — a rental fully completed before it never creates a pending gift. Historical rentals before this date still count fully toward Times Rented, Qualified Rentals, Total Time with AA, Lifetime Revenue, and Ride Upgrade / Long-Term / VIP status — nothing about relationship history is lost, only physical gift obligations are not applied retroactively. Changing this date recalculates eligibility live without deleting any rental history.</p>
         <div class="btn-row" style="margin-top:12px;">
           <button class="btn btn-primary btn-sm" id="save-launch-date">Save date</button>
+        </div>
+      </div>
+
+      <div class="section-title">Reward Costs &amp; Values</div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px;">Estimated Reward Value and Actual Cash Cost are tracked separately — giving a complimentary day has a rental value even though AA may not have spent that much cash. All figures here are starting defaults; correct them any time as real costs become clear.</p>
+        <div class="field"><label>Welcome Gift — actual cost (THB)</label><input type="number" min="0" id="cost-welcomeGift" value="${DB.data.meta.rewardCosts.welcomeGift}" /></div>
+        <div class="field"><label>Journey Gift — actual cost (THB)</label><input type="number" min="0" id="cost-journeyGift" value="${DB.data.meta.rewardCosts.journeyGift}" /></div>
+        <div class="section-label" style="margin-top:4px;">Daily rental value by bike (THB/day)</div>
+        <p class="muted" style="margin-bottom:8px;">Used for Premium Ride Experience (×2 days) and VIP Extra Day (×1 day), based on the actual bike given.</p>
+        ${Object.keys(DEFAULT_DAILY_VALUES).map((k) => `<div class="field"><label>${escapeHtml(k)}</label><input type="number" min="0" id="daily-${escapeHtml(k)}" value="${DB.data.meta.dailyValues[k]}" /></div>`).join("")}
+        <div class="btn-row" style="margin-top:12px;">
+          <button class="btn btn-primary btn-sm" id="save-reward-costs">Save values</button>
+        </div>
+      </div>
+
+      <div class="section-title">VIP Extra Day Qualification</div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px;">Meaningful repeat rentals + cumulative paid days since the last Extra Day cycle — never just a raw visit count. Tier-aware, separately editable for each fleet level.</p>
+        ${["125cc", "155cc", "300cc"].map((tier) => `
+          <div class="grid-2" style="margin-bottom:10px;">
+            <div class="field" style="margin-bottom:0;"><label>${escapeHtml(tier)} — min. episodes</label><input type="number" min="1" id="vip-${tier}-episodes" value="${DB.data.meta.vipThresholds[tier].episodes}" /></div>
+            <div class="field" style="margin-bottom:0;"><label>${escapeHtml(tier)} — min. paid days</label><input type="number" min="1" id="vip-${tier}-days" value="${DB.data.meta.vipThresholds[tier].days}" /></div>
+          </div>
+        `).join("")}
+        <div class="btn-row" style="margin-top:4px;">
+          <button class="btn btn-primary btn-sm" id="save-vip-thresholds">Save thresholds</button>
+        </div>
+      </div>
+
+      <div class="section-title">Loyalty Health Thresholds</div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px;">Reward-to-Revenue Ratio = Total Reward Value ÷ Lifetime Revenue × 100. At or below the first number shows 🟢 Healthy, up to the second shows 🟡 Watch, above that shows 🔴 High. Individual rewards can still be manually overridden case by case via Edit / Undo.</p>
+        <div class="field"><label>Healthy — up to (%)</label><input type="number" min="0" step="0.5" id="health-healthyMax" value="${DB.data.meta.healthThresholds.healthyMax}" /></div>
+        <div class="field"><label>Watch — up to (%)</label><input type="number" min="0" step="0.5" id="health-watchMax" value="${DB.data.meta.healthThresholds.watchMax}" /></div>
+        <div class="btn-row" style="margin-top:12px;">
+          <button class="btn btn-primary btn-sm" id="save-health-thresholds">Save thresholds</button>
         </div>
       </div>
 
@@ -3645,6 +4081,26 @@ function openSheet(html) {
 }
 function closeSheet() { document.getElementById("modal-root").innerHTML = ""; }
 
+// In-app confirmation, NOT the native browser confirm() — sandboxed preview iframes (and
+// some embedded/PWA contexts) block or silently no-op window.confirm()/alert(), which would
+// make "Continue anyway?" and "Undo Mark Used" appear to do nothing when tapped. This always
+// works because it's just a normal sheet in the app's own DOM.
+function confirmSheet(message, onConfirm, confirmLabel) {
+  openSheet(`
+    <div class="sheet-title">Please confirm</div>
+    <div class="sheet-sub">${escapeHtml(message)}</div>
+    <div class="btn-row" style="margin-top:16px;">
+      <button class="btn btn-outline btn-block" id="confirm-sheet-cancel">Cancel</button>
+      <button class="btn btn-primary btn-block" id="confirm-sheet-ok">${escapeHtml(confirmLabel || "Continue")}</button>
+    </div>
+  `);
+  document.getElementById("confirm-sheet-cancel").addEventListener("click", () => closeSheet());
+  document.getElementById("confirm-sheet-ok").addEventListener("click", () => {
+    closeSheet();
+    onConfirm();
+  });
+}
+
 function sheetAddCustomer() {
   openSheet(`
     <div class="sheet-title">Add customer</div>
@@ -3798,54 +4254,263 @@ function markRentalComplete(rentalId) {
 // One-tap Give/Use — the primary action for an eligible, not-yet-given reward.
 // Records today's date and the current time automatically; no typing required.
 // Corrections/undo/backdating still go through "Edit / Undo" (sheetEditRewardFull).
+// AA normally offers one loyalty benefit per rental. If the customer has OTHER reward
+// types currently sitting Ready/Reserved/qualified-at-return besides the one being acted
+// on, warn staff before finalizing — they can still confirm and proceed if it's genuinely
+// appropriate (e.g. Welcome Gift + Journey Gift on the same long booking is fine).
+function otherRewardsCurrentlyReady(customer, excludeKey) {
+  const stats = customerStats(customer);
+  const sugg = getSuggestions(customer, stats);
+  const seenTypes = new Set();
+  sugg.forEach((s) => {
+    if (s.key === excludeKey || (s.reward && s.reward.given) || s.isNoCurrentRentalMarker) return;
+    const isReady = s.cycleStatus === "ready" || s.cycleStatus === "reserved" || s.qualifiedPending || (s.eligible && s.upgradeTarget);
+    if (isReady) seenTypes.add(s.type);
+  });
+  return [...seenTypes];
+}
+// ATOMIC TRANSACTION WRAPPER — Mark Used / Undo / Edit / Override must succeed or fail as
+// one complete change. There is deliberately only ONE source of truth (DB.data.rewards) —
+// Customer Profile, Reward History, and Loyalty Reports all read it live on every render,
+// never a separate cached copy — so the one risk to guard against is a mutation that throws
+// partway through. This snapshots the rewards array first; if anything inside `fn` throws,
+// the snapshot is restored before any DB.save(), so a failed transaction leaves zero trace
+// rather than a Profile/History/Reports disagreement.
+function withAtomicRewardUpdate(fn) {
+  const snapshot = JSON.stringify(DB.data.rewards);
+  try {
+    fn();
+    DB.save();
+    return true;
+  } catch (err) {
+    DB.data.rewards = JSON.parse(snapshot);
+    toast("Update failed — no changes were saved.");
+    render();
+    return false;
+  }
+}
+
 function quickGiveOrUse(key, customerId, type, rentalId, upgradeTarget) {
-  let rw = findReward(key);
-  const isNew = !rw;
-  if (!rw) {
-    rw = { id: uid("rw"), key, type, customerId, rentalId: rentalId || null, given: false, history: [] };
-    DB.data.rewards.push(rw);
-  }
-  if (!rw.history) rw.history = [];
-  const now = new Date();
-  const nowISO = now.toISOString();
-  const wasGiven = !!rw.given;
+  const customer0 = DB.data.customers.find((c) => c.id === customerId);
 
-  rw.given = true;
-  rw.reserved = false;
-  rw.dateGiven = todayISO();
-  rw.givenAt = nowISO;
-  if (upgradeTarget) rw.notes = rw.notes ? rw.notes : `Upgraded to ${upgradeTarget}`;
+  const proceed = () => {
+    let resultDateGiven = null, resultVerb = "Given";
+    const ok = withAtomicRewardUpdate(() => {
+      let rw = findReward(key);
+      const isNew = !rw;
+      if (!rw) {
+        rw = { id: uid("rw"), key, type, customerId, rentalId: rentalId || null, given: false, history: [] };
+        DB.data.rewards.push(rw);
+      }
+      if (!rw.history) rw.history = [];
+      const now = new Date();
+      const nowISO = now.toISOString();
+      const wasGiven = !!rw.given;
 
-  // Premium Ride Experience / VIP Extra Day: using the reward starts a fresh qualification
-  // cycle — the customer's cumulative paid days keep growing, but progress toward the NEXT
-  // reward of this type counts only from this point on.
-  if (type === "premium_ride" || type === "vip_extra_day") {
-    const customer = DB.data.customers.find((c) => c.id === customerId);
-    if (customer) rw.cycleBaselinePaidDays = customerStats(customer).paidRentalDays;
-  }
+      const customer = DB.data.customers.find((c) => c.id === customerId);
+      // Look up the live suggestion (rate, estimated value, cycle counters) BEFORE mutating
+      // the reward record — computing it after `given` flips true would make the customer's
+      // own now-just-given reward shadow the pending one and always come back empty.
+      const preStats = customer ? customerStats(customer) : null;
+      const match = customer ? getSuggestions(customer, preStats).find((s) => s.key === key) : null;
 
-  // Ride Upgrade: lock in whichever rate applied to this specific transition at the moment
-  // it was actually used (never assumed — only recorded if this step has a priced rate).
-  if (type === "return_privilege") {
-    const customer = DB.data.customers.find((c) => c.id === customerId);
-    if (customer) {
-      const match = getSuggestions(customer, customerStats(customer)).find((s) => s.key === key);
-      if (match && match.normalRate) {
+      // VIP Extra Day is redeemed as +1 day on a qualifying rental of 7+ paid days (Pay 7 ->
+      // Ride 8) — never a detached freestanding day. Soft warning only; staff stays in control.
+      if (type === "vip_extra_day" && preStats && preStats.current && (Number(preStats.current.bookedDays) || 0) < 7) {
+        toast("Note: VIP Extra Day is normally redeemed on a rental of 7+ paid days");
+      }
+
+      // Record the TRUE state immediately before Mark Used — never assume it was plain
+      // "Ready". A reward can be Reserved (Premium Ride/VIP Extra Day) or Accepted (Ride
+      // Upgrade) first; Undo Mark Used must restore exactly that, not silently downgrade an
+      // accepted/reserved reward back to a bare Ready.
+      const previousStatus = rw.reserved ? "reserved" : (rw.upgradeStatus === "accepted" ? "accepted" : "ready");
+
+      rw.given = true;
+      rw.reserved = false;
+      rw.previousStatus = previousStatus;
+      rw.dateGiven = todayISO();
+      rw.givenAt = nowISO;
+      if (upgradeTarget) rw.notes = rw.notes ? rw.notes : `Upgraded to ${upgradeTarget}`;
+
+      // Estimated Reward Value defaults from the live Settings-editable rates at the moment
+      // the reward is actually given — never invented later, never silently recalculated
+      // after the fact. Actual Cost starts equal to the estimate but is a genuinely separate,
+      // independently editable field (a complimentary day's rental value isn't the same as
+      // AA's real cash cost).
+      if (match && match.estimatedValue !== undefined && match.estimatedValue !== null && (rw.value === undefined || rw.value === null)) {
+        rw.value = match.estimatedValue;
+        if (rw.actualCost === undefined || rw.actualCost === null) rw.actualCost = match.estimatedValue;
+      }
+
+      // Premium Ride Experience / VIP Extra Day: using the reward starts a fresh qualification
+      // cycle — the customer's cumulative paid days keep growing, but progress toward the NEXT
+      // reward of this type counts only from this point on. VIP Extra Day also resets its
+      // qualified-episode counter the same way.
+      if ((type === "premium_ride" || type === "vip_extra_day") && preStats) {
+        rw.cycleBaselinePaidDays = preStats.paidRentalDays;
+        if (type === "vip_extra_day") rw.cycleBaselineQualifiedCount = preStats.qualifiedRentalCount;
+      }
+
+      // Ride Upgrade: lock in whichever rate applied to this specific transition at the moment
+      // it was actually used (never assumed — only recorded if this step has a priced rate).
+      if (type === "return_privilege" && match && match.normalRate) {
         rw.normalRate = match.normalRate;
         rw.loyaltyRate = match.loyaltyRate;
         rw.rateUnit = match.rateUnit;
       }
+
+      if (isNew || !wasGiven) {
+        rw.history.push({ field: "Marked Used", previous: "Ready", new: "Used", changedOn: nowDateTimeLabel() });
+      }
+      resultDateGiven = rw.dateGiven;
+      resultVerb = ["return_privilege", "premium_ride", "vip_extra_day"].includes(type) ? "Used" : "Given";
+    });
+
+    if (ok) {
+      toast(`${REWARD_LABELS[type] || "Reward"} ${resultVerb.toLowerCase()} · ${fmtDate(resultDateGiven)}`);
+      render();
     }
-  }
+  };
 
-  if (isNew || !wasGiven) {
-    rw.history.push({ field: "Given", previous: "Not given", new: "Given", changedOn: todayISO() });
+  const others = customer0 ? otherRewardsCurrentlyReady(customer0, key) : [];
+  if (others.length > 0) {
+    confirmSheet("Multiple rewards are available. AA normally uses one loyalty benefit per rental. Continue anyway?", proceed, "Continue Anyway");
+  } else {
+    proceed();
   }
+}
 
-  DB.save();
-  const verb = ["return_privilege", "premium_ride", "vip_extra_day"].includes(type) ? "Used" : "Given";
-  toast(`${REWARD_LABELS[type] || "Reward"} ${verb.toLowerCase()} · ${fmtDate(rw.dateGiven)}`);
-  render();
+// Undo Mark Used — a direct, one-tap reversal of a mistaken "Mark Used", distinct from the
+// general Edit sheet. Because every screen (Profile, Reward History, Loyalty Reports,
+// Reward-to-Revenue ratios) reads the SAME reward records live on every render — nothing is
+// cached separately — simply flipping `given` back to false and clearing the cycle-start
+// fields is sufficient for every downstream figure to already be correct on the next render.
+// This also removes any higher-numbered cycle of the same type that exists ONLY as an
+// unused, never-given placeholder — i.e. a "next cycle" that was created solely as a side
+// effect of the mistaken Mark Used, never a real cycle with its own legitimate history.
+// "Customer changed their mind" — distinct from Undo Mark Used. This is for a reward that
+// was Reserved/Accepted but never actually Used: it goes back to Ready, stays fully
+// available for later, earns no value, starts no new cycle, and is never treated as the
+// customer losing what they already qualified for.
+function returnToReady(key, customerId, type) {
+  const rw = findReward(key);
+  if (!rw || rw.given) return;
+  const prevLabel = rw.reserved ? "Reserved" : (rw.upgradeStatus === "accepted" ? "Accepted" : "Ready");
+
+  confirmSheet(
+    `Return this ${REWARD_LABELS[type] || "reward"} to Ready? The customer keeps their eligibility for later — this is not a cancellation.`,
+    () => {
+      const ok = withAtomicRewardUpdate(() => {
+        if (!rw.history) rw.history = [];
+        rw.history.push({ field: "Returned to Ready", previous: prevLabel, new: "Ready — Customer did not use reward", changedOn: nowDateTimeLabel() });
+        rw.reserved = false;
+        rw.upgradeStatus = undefined;
+      });
+      if (ok) {
+        toast("Returned to Ready — still available for later");
+        render();
+      }
+    },
+    "Return to Ready"
+  );
+}
+
+function undoMarkUsed(key, customerId, type) {
+  const rw = findReward(key);
+  if (!rw || !rw.given) return;
+  const restoreTo = rw.previousStatus || "ready"; // "ready" | "reserved" | "accepted"
+  const restoreLabel = restoreTo === "reserved" ? "Reserved" : restoreTo === "accepted" ? "Accepted" : "Ready";
+
+  openSheet(`
+    <div class="sheet-title">Undo Mark Used</div>
+    <div class="sheet-sub">Reverses this ${escapeHtml(REWARD_LABELS[type] || "reward")} back to ${restoreLabel} (its status just before it was marked used) and removes its value from this customer's totals.</div>
+    <div class="field"><label>Reason (optional)</label><input id="f-undo-reason" type="text" placeholder="e.g. Customer changed mind" /></div>
+    <div class="btn-row" style="margin-top:12px;">
+      <button class="btn btn-outline btn-block" id="undo-cancel">Cancel</button>
+      <button class="btn btn-primary btn-block" id="undo-confirm">Undo Mark Used</button>
+    </div>
+  `);
+  document.getElementById("undo-cancel").addEventListener("click", () => closeSheet());
+  document.getElementById("undo-confirm").addEventListener("click", () => {
+    const reason = document.getElementById("f-undo-reason").value.trim();
+    closeSheet();
+    const ok = withAtomicRewardUpdate(() => {
+      if (!rw.history) rw.history = [];
+      rw.history.push({ field: "Use Reversed", previous: "Used", new: restoreLabel + (reason ? ` — Reason: ${reason}` : ""), changedOn: nowDateTimeLabel() });
+
+      rw.given = false;
+      rw.reserved = restoreTo === "reserved";
+      rw.upgradeStatus = restoreTo === "accepted" ? "accepted" : undefined;
+      rw.dateGiven = undefined;
+      rw.givenAt = undefined;
+      rw.bikeUsed = undefined;
+      delete rw.previousStatus;
+      delete rw.cycleBaselinePaidDays;
+      delete rw.cycleBaselineQualifiedCount;
+
+      // Clean up an orphaned next-cycle placeholder: same customer + type, a higher cycle
+      // number in the key, never actually given. A genuinely used later cycle is never
+      // touched — only ever a still-pending one created by this now-undone Mark Used.
+      const m = /^(.+):(\d+)$/.exec(key);
+      if (m) {
+        const prefix = m[1], n = Number(m[2]);
+        DB.data.rewards = DB.data.rewards.filter((r) => {
+          if (r.customerId !== customerId || r.type !== type || r.given) return true;
+          const rm = /^(.+):(\d+)$/.exec(r.key);
+          return !(rm && rm[1] === prefix && Number(rm[2]) > n);
+        });
+      }
+    });
+
+    if (ok) {
+      toast(`Use reversed — back to ${restoreLabel}`);
+      render();
+    }
+  });
+}
+
+// "Edit / Override" for a USED/ARCHIVED reward — a real, visible action sheet with the
+// four correction options, so Undo Mark Used is a menu tap away from the reward card
+// itself, never buried only in code. The three "change" options reuse the existing full
+// edit form (which already has Date / Value / Cost / Notes all together and correctly
+// wired into the same atomic-transaction + audit-trail machinery).
+function sheetRewardActionMenu(key, customerId, type, rentalId) {
+  const rw = findReward(key);
+  openSheet(`
+    <div class="sheet-title">${escapeHtml(REWARD_LABELS[type] || "Reward")} — Edit / Override</div>
+    <div class="sheet-sub">Currently: ${rw && rw.given ? "Used" : "Ready"}${rw && rw.dateGiven ? " · " + fmtDate(rw.dateGiven) : ""}</div>
+    <div class="action-menu">
+      <button class="action-menu-item" id="menu-undo-used">
+        <span>Undo Mark Used</span><span class="muted">Back to Ready</span>
+      </button>
+      <button class="action-menu-item" id="menu-change-date">
+        <span>Change Used Date</span><span class="muted">${rw ? fmtDate(rw.dateGiven) : "—"}</span>
+      </button>
+      <button class="action-menu-item" id="menu-change-value">
+        <span>Change Reward Value / Cost</span><span class="muted">${rw ? fmtMoney(rw.value) : "—"}</span>
+      </button>
+      <button class="action-menu-item" id="menu-add-note">
+        <span>Add Staff Note</span><span class="muted">${rw && rw.notes ? "Has note" : "None"}</span>
+      </button>
+    </div>
+  `);
+  document.getElementById("menu-undo-used").addEventListener("click", () => {
+    closeSheet();
+    undoMarkUsed(key, customerId, type);
+  });
+  document.getElementById("menu-change-date").addEventListener("click", () => {
+    closeSheet();
+    sheetEditRewardFull(key, customerId, type, rentalId);
+  });
+  document.getElementById("menu-change-value").addEventListener("click", () => {
+    closeSheet();
+    sheetEditRewardFull(key, customerId, type, rentalId);
+  });
+  document.getElementById("menu-add-note").addEventListener("click", () => {
+    closeSheet();
+    sheetEditRewardFull(key, customerId, type, rentalId);
+  });
 }
 
 // An intermediate state between Ready and Used, so staff can note a customer's
@@ -3867,7 +4532,7 @@ function reserveReward(key, customerId, type, rentalId) {
     field: isPremium ? "Standby" : "Reserved",
     previous: isPremium ? "No date noted" : "Not reserved",
     new: (isPremium ? "Preferred date noted " : "Reserved ") + fmtDate(todayISO()),
-    changedOn: todayISO(),
+    changedOn: nowDateTimeLabel(),
   });
   DB.save();
   toast(isPremium ? "Preferred date noted — standby, not guaranteed" : `${REWARD_LABELS[type] || "Reward"} reserved`);
@@ -3884,7 +4549,7 @@ function acceptRideUpgrade(key, customerId, rentalId) {
   }
   if (!rw.history) rw.history = [];
   rw.upgradeStatus = "accepted";
-  rw.history.push({ field: "Ride Upgrade", previous: "Available", new: "Accepted " + fmtDate(todayISO()), changedOn: todayISO() });
+  rw.history.push({ field: "Ride Upgrade", previous: "Available", new: "Accepted " + fmtDate(todayISO()), changedOn: nowDateTimeLabel() });
   DB.save();
   toast("Ride Upgrade accepted");
   render();
@@ -3900,7 +4565,7 @@ function declineRideUpgrade(key, customerId, rentalId) {
   }
   if (!rw.history) rw.history = [];
   rw.upgradeStatus = undefined; // stays/returns to Available -- decline never blocks future acceptance
-  rw.history.push({ field: "Ride Upgrade", previous: "Offered", new: "Declined " + fmtDate(todayISO()) + " — still Available", changedOn: todayISO() });
+  rw.history.push({ field: "Ride Upgrade", previous: "Offered", new: "Declined " + fmtDate(todayISO()) + " — still Available", changedOn: nowDateTimeLabel() });
   DB.save();
   toast("Recorded as declined — offer stays available");
   render();
@@ -3930,29 +4595,50 @@ function sheetMarkPremiumRideUsed(key, customerId, rentalId) {
     <button class="btn btn-primary btn-block" id="save-premium-used">Mark used</button>
   `);
   document.getElementById("save-premium-used").addEventListener("click", () => {
-    let rw = existing;
-    const isNew = !rw;
-    if (!rw) {
-      rw = { id: uid("rw"), key, type: "premium_ride", customerId, rentalId: rentalId || null, given: false, history: [] };
-      DB.data.rewards.push(rw);
+    const proceedMarkPremium = () => {
+      let bikeUsedResult = "";
+      const ok = withAtomicRewardUpdate(() => {
+        let rw = existing;
+        const isNew = !rw;
+        if (!rw) {
+          rw = { id: uid("rw"), key, type: "premium_ride", customerId, rentalId: rentalId || null, given: false, history: [] };
+          DB.data.rewards.push(rw);
+        }
+        if (!rw.history) rw.history = [];
+        const wasGiven = !!rw.given;
+        const previousStatus = rw.reserved ? "reserved" : "ready";
+        rw.given = true;
+        rw.reserved = false;
+        rw.previousStatus = previousStatus;
+        rw.dateGiven = todayISO();
+        rw.givenAt = new Date().toISOString();
+        rw.bikeUsed = document.getElementById("f-bike-used").value;
+        rw.notes = document.getElementById("f-notes").value.trim();
+        // Estimated Reward Value = the actual bike's daily rate × 2 days (live Settings-editable
+        // rate for whichever bike staff actually picked, not necessarily the system's original
+        // recommendation). Actual Cost starts equal but stays independently editable.
+        rw.value = dailyValueFor(rw.bikeUsed) * 2;
+        if (rw.actualCost === undefined || rw.actualCost === null) rw.actualCost = rw.value;
+        const customer = DB.data.customers.find((c) => c.id === customerId);
+        if (customer) rw.cycleBaselinePaidDays = customerStats(customer).paidRentalDays;
+        if (isNew || !wasGiven) {
+          rw.history.push({ field: "Marked Used", previous: "Ready", new: `Used on ${rw.bikeUsed}`, changedOn: nowDateTimeLabel() });
+        }
+        bikeUsedResult = rw.bikeUsed;
+      });
+      if (ok) {
+        closeSheet();
+        toast(`Premium Ride Experience used · ${bikeUsedResult}`);
+        render();
+      }
+    };
+
+    const others = customer0 ? otherRewardsCurrentlyReady(customer0, key) : [];
+    if (others.length > 0) {
+      confirmSheet("Multiple rewards are available. AA normally uses one loyalty benefit per rental. Continue anyway?", proceedMarkPremium, "Continue Anyway");
+    } else {
+      proceedMarkPremium();
     }
-    if (!rw.history) rw.history = [];
-    const wasGiven = !!rw.given;
-    rw.given = true;
-    rw.reserved = false;
-    rw.dateGiven = todayISO();
-    rw.givenAt = new Date().toISOString();
-    rw.bikeUsed = document.getElementById("f-bike-used").value;
-    rw.notes = document.getElementById("f-notes").value.trim();
-    const customer = DB.data.customers.find((c) => c.id === customerId);
-    if (customer) rw.cycleBaselinePaidDays = customerStats(customer).paidRentalDays;
-    if (isNew || !wasGiven) {
-      rw.history.push({ field: "Given", previous: "Not given", new: `Used on ${rw.bikeUsed}`, changedOn: todayISO() });
-    }
-    DB.save();
-    closeSheet();
-    toast(`Premium Ride Experience used · ${rw.bikeUsed}`);
-    render();
   });
 }
 
@@ -4008,11 +4694,16 @@ function sheetEditRewardFull(key, customerId, type, rentalId) {
     <div class="field"><label>Bike used</label>
       <select id="f-bike-used">
         <option value="">— Not set —</option>
+        <option value="Aerox Keyless/ABS 155cc" ${existing?.bikeUsed === "Aerox Keyless/ABS 155cc" ? "selected" : ""}>Aerox Keyless/ABS 155cc</option>
+        <option value="NMAX Keyless/ABS 155cc" ${existing?.bikeUsed === "NMAX Keyless/ABS 155cc" ? "selected" : ""}>NMAX Keyless/ABS 155cc</option>
         <option value="Forza 300" ${existing?.bikeUsed === "Forza 300" ? "selected" : ""}>Forza 300</option>
         <option value="XMAX 300" ${existing?.bikeUsed === "XMAX 300" ? "selected" : ""}>XMAX 300</option>
       </select>
     </div>` : ""}
-    <div class="field"><label>Estimated cost / value (THB)</label><input id="f-value" type="number" min="0" value="${existing?.value ?? 0}" /></div>
+    <div class="field"><label>Estimated Reward Value (THB)</label><input id="f-value" type="number" min="0" value="${existing?.value ?? 0}" /></div>
+    <div class="field"><label>Actual Cost (THB)</label><input id="f-actual-cost" type="number" min="0" value="${existing?.actualCost ?? existing?.value ?? 0}" />
+      <p class="muted" style="margin-top:6px;">Estimated Value and Actual Cost are different things — e.g. a complimentary day's rental value may be ฿600, but AA's real cash cost is usually lower. Keep both accurate for reporting.</p>
+    </div>
     <div class="field"><label>Notes</label><textarea id="f-notes" rows="2" placeholder="e.g. given at pickup, bike availability confirmed">${escapeHtml(existing?.notes || "")}</textarea></div>
     ${calculatedEligible !== null ? `
     <div class="field">
@@ -4028,50 +4719,67 @@ function sheetEditRewardFull(key, customerId, type, rentalId) {
     <button class="btn btn-primary btn-block" id="save-reward">Save</button>
   `);
   document.getElementById("save-reward").addEventListener("click", () => {
-    let rw = existing;
-    const isNew = !rw;
-    if (!rw) {
-      rw = { id: uid("rw"), key, type, customerId, rentalId: rentalId || null, given: false, history: [] };
-      DB.data.rewards.push(rw);
+    const ok = withAtomicRewardUpdate(() => {
+      let rw = existing;
+      const isNew = !rw;
+      if (!rw) {
+        rw = { id: uid("rw"), key, type, customerId, rentalId: rentalId || null, given: false, history: [] };
+        DB.data.rewards.push(rw);
+      }
+      if (!rw.history) rw.history = [];
+
+      const newGiven = document.getElementById("f-given").checked;
+      const reservedCheckbox = document.getElementById("f-reserved");
+      const newDate = document.getElementById("f-date").value || todayISO();
+      const newValue = Number(document.getElementById("f-value").value) || 0;
+      const newActualCost = Number(document.getElementById("f-actual-cost").value) || 0;
+      const newNotes = document.getElementById("f-notes").value.trim();
+      const bikeUsedSelect = document.getElementById("f-bike-used");
+      const overrideSelect = document.getElementById("f-override");
+      const newOverride = overrideSelect ? (overrideSelect.value === "" ? null : overrideSelect.value === "true") : null;
+
+      // Editing an already-used reward keeps a full audit trail — never silently overwritten.
+      if (!isNew) {
+        if (!!rw.given !== newGiven) rw.history.push({ field: newGiven ? "Marked Used" : "Use Reversed", previous: rw.given ? "Used" : "Ready", new: newGiven ? "Used" : "Ready", changedOn: nowDateTimeLabel() });
+        if (newGiven && rw.dateGiven !== newDate) rw.history.push({ field: "Date given", previous: rw.dateGiven || "—", new: newDate, changedOn: nowDateTimeLabel() });
+        if ((rw.value || 0) !== newValue) rw.history.push({ field: "Estimated Value", previous: fmtMoney(rw.value || 0), new: fmtMoney(newValue), changedOn: nowDateTimeLabel() });
+        if ((rw.actualCost || 0) !== newActualCost) rw.history.push({ field: "Actual Cost", previous: fmtMoney(rw.actualCost || 0), new: fmtMoney(newActualCost), changedOn: nowDateTimeLabel() });
+      } else if (newGiven) {
+        rw.history.push({ field: "Marked Used", previous: "Ready", new: "Used", changedOn: nowDateTimeLabel() });
+      }
+
+      // If this edit is the moment "Given/Used" flips from false to true, this starts a new
+      // reward cycle for Premium Ride / VIP Extra Day, same as the quick-action flows. If it
+      // flips from true to false (an undo done through this sheet rather than the dedicated
+      // Undo Mark Used button), clear the cycle-start fields the same way undoMarkUsed does,
+      // so nothing downstream is left computing against a stale cycle baseline.
+      if ((type === "premium_ride" || type === "vip_extra_day") && !rw.given && newGiven) {
+        const customer2 = DB.data.customers.find((c) => c.id === customerId);
+        if (customer2) {
+          const cs2 = customerStats(customer2);
+          rw.cycleBaselinePaidDays = cs2.paidRentalDays;
+          if (type === "vip_extra_day") rw.cycleBaselineQualifiedCount = cs2.qualifiedRentalCount;
+        }
+      } else if ((type === "premium_ride" || type === "vip_extra_day") && rw.given && !newGiven) {
+        delete rw.cycleBaselinePaidDays;
+        delete rw.cycleBaselineQualifiedCount;
+      }
+
+      rw.given = newGiven;
+      if (reservedCheckbox) rw.reserved = newGiven ? false : reservedCheckbox.checked;
+      rw.dateGiven = newGiven ? newDate : undefined;
+      rw.value = newValue;
+      rw.actualCost = newActualCost;
+      rw.notes = newNotes;
+      if (bikeUsedSelect) rw.bikeUsed = bikeUsedSelect.value || undefined;
+      if (overrideSelect) rw.overrideEligible = newOverride;
+    });
+
+    if (ok) {
+      closeSheet();
+      toast("Saved");
+      render();
     }
-    if (!rw.history) rw.history = [];
-
-    const newGiven = document.getElementById("f-given").checked;
-    const reservedCheckbox = document.getElementById("f-reserved");
-    const newDate = document.getElementById("f-date").value || todayISO();
-    const newValue = Number(document.getElementById("f-value").value) || 0;
-    const newNotes = document.getElementById("f-notes").value.trim();
-    const bikeUsedSelect = document.getElementById("f-bike-used");
-    const overrideSelect = document.getElementById("f-override");
-    const newOverride = overrideSelect ? (overrideSelect.value === "" ? null : overrideSelect.value === "true") : null;
-
-    if (!isNew) {
-      if (!!rw.given !== newGiven) rw.history.push({ field: "Given", previous: rw.given ? "Given" : "Not given", new: newGiven ? "Given" : "Not given", changedOn: todayISO() });
-      if (newGiven && rw.dateGiven !== newDate) rw.history.push({ field: "Date given", previous: rw.dateGiven || "—", new: newDate, changedOn: todayISO() });
-      if ((rw.value || 0) !== newValue) rw.history.push({ field: "Value", previous: fmtMoney(rw.value || 0), new: fmtMoney(newValue), changedOn: todayISO() });
-    } else if (newGiven) {
-      rw.history.push({ field: "Given", previous: "Not given", new: "Given", changedOn: todayISO() });
-    }
-
-    // If this edit is the moment "Given/Used" flips from false to true, this starts a new
-    // reward cycle for Premium Ride / VIP Extra Day, same as the quick-action flows.
-    if ((type === "premium_ride" || type === "vip_extra_day") && !rw.given && newGiven) {
-      const customer2 = DB.data.customers.find((c) => c.id === customerId);
-      if (customer2) rw.cycleBaselinePaidDays = customerStats(customer2).paidRentalDays;
-    }
-
-    rw.given = newGiven;
-    if (reservedCheckbox) rw.reserved = newGiven ? false : reservedCheckbox.checked;
-    rw.dateGiven = newDate;
-    rw.value = newValue;
-    rw.notes = newNotes;
-    if (bikeUsedSelect) rw.bikeUsed = bikeUsedSelect.value || undefined;
-    if (overrideSelect) rw.overrideEligible = newOverride;
-
-    DB.save();
-    closeSheet();
-    toast("Saved");
-    render();
   });
 }
 
@@ -4244,6 +4952,8 @@ function render() {
     case "needs-review": html = renderNeedsReview(); break;
     case "rewards-ready": html = renderRewardsReadyScreen(); break;
     case "active-riders": html = renderActiveRidersScreen(); break;
+    case "reward-history": html = renderRewardHistoryScreen(); break;
+    case "loyalty-reports": html = renderLoyaltyReportsScreen(); break;
     case "vehicles": html = renderVehiclesList(); break;
     case "vehicle": html = renderVehicleDetail(); break;
     case "settings": html = renderSettings(); break;
@@ -4299,6 +5009,28 @@ function wireScreenEvents() {
   if (searchInput) {
     searchInput.addEventListener("input", (e) => { state.search = e.target.value; render(); searchFocusFix(); });
   }
+  const rewardHistorySearchInput = document.getElementById("reward-history-search");
+  if (rewardHistorySearchInput) {
+    rewardHistorySearchInput.addEventListener("input", (e) => { state.rewardHistorySearch = e.target.value; render(); searchFocusFix(); });
+  }
+  document.querySelectorAll('[data-action="open-reward-history"]').forEach((el) => {
+    el.addEventListener("click", () => { state.rewardHistoryCustomerId = el.dataset.id; render(); });
+  });
+  document.querySelectorAll('[data-action="view-reward-history"]').forEach((el) => {
+    el.addEventListener("click", () => { state.rewardHistoryCustomerId = el.dataset.id; navigate("reward-history"); });
+  });
+  document.querySelectorAll('[data-action="reward-history-back"]').forEach((el) => {
+    el.addEventListener("click", () => { state.rewardHistoryCustomerId = null; state.rewardHistorySearch = ""; render(); });
+  });
+  document.querySelectorAll('[data-action="open-reward-history-fresh"]').forEach((el) => {
+    el.addEventListener("click", () => { state.rewardHistoryCustomerId = null; state.rewardHistorySearch = ""; navigate("reward-history"); });
+  });
+  document.querySelectorAll('[data-action="set-reports-period"]').forEach((el) => {
+    el.addEventListener("click", () => { state.reportsPeriod = el.dataset.period; render(); });
+  });
+  document.querySelectorAll('[data-action="set-reward-history-filter"]').forEach((el) => {
+    el.addEventListener("click", () => { state.rewardHistoryFilter = el.dataset.filter; render(); });
+  });
 
   const addCustomerFab = document.getElementById("add-customer-fab");
   if (addCustomerFab) addCustomerFab.addEventListener("click", sheetAddCustomer);
@@ -4320,6 +5052,18 @@ function wireScreenEvents() {
   });
   document.querySelectorAll('[data-action="reserve-reward"]').forEach((el) => {
     el.addEventListener("click", () => reserveReward(el.dataset.key, el.dataset.customer, el.dataset.type, el.dataset.rental));
+  });
+  document.querySelectorAll('[data-action="undo-mark-used"]').forEach((el) => {
+    el.addEventListener("click", () => undoMarkUsed(el.dataset.key, el.dataset.customer, el.dataset.type));
+  });
+  document.querySelectorAll('[data-action="return-to-ready"]').forEach((el) => {
+    el.addEventListener("click", () => returnToReady(el.dataset.key, el.dataset.customer, el.dataset.type));
+  });
+  document.querySelectorAll('[data-action="open-reward-transaction"]').forEach((el) => {
+    el.addEventListener("click", () => sheetRewardTransaction(el.dataset.key));
+  });
+  document.querySelectorAll('[data-action="reward-override-menu"]').forEach((el) => {
+    el.addEventListener("click", () => sheetRewardActionMenu(el.dataset.key, el.dataset.customer, el.dataset.type, el.dataset.rental));
   });
   document.querySelectorAll('[data-action="open-search"]').forEach((el) => {
     el.addEventListener("click", () => { state.searchOpen = true; render(); });
@@ -4357,6 +5101,41 @@ function wireScreenEvents() {
     render();
   });
 
+  const saveRewardCosts = document.getElementById("save-reward-costs");
+  if (saveRewardCosts) saveRewardCosts.addEventListener("click", () => {
+    DB.data.meta.rewardCosts.welcomeGift = Number(document.getElementById("cost-welcomeGift").value) || 0;
+    DB.data.meta.rewardCosts.journeyGift = Number(document.getElementById("cost-journeyGift").value) || 0;
+    Object.keys(DEFAULT_DAILY_VALUES).forEach((k) => {
+      const el = document.getElementById(`daily-${k}`);
+      if (el) DB.data.meta.dailyValues[k] = Number(el.value) || 0;
+    });
+    DB.save();
+    toast("Reward costs & values saved");
+    render();
+  });
+
+  const saveVipThresholds = document.getElementById("save-vip-thresholds");
+  if (saveVipThresholds) saveVipThresholds.addEventListener("click", () => {
+    ["125cc", "155cc", "300cc"].forEach((tier) => {
+      const epEl = document.getElementById(`vip-${tier}-episodes`);
+      const dayEl = document.getElementById(`vip-${tier}-days`);
+      if (epEl) DB.data.meta.vipThresholds[tier].episodes = Number(epEl.value) || 1;
+      if (dayEl) DB.data.meta.vipThresholds[tier].days = Number(dayEl.value) || 1;
+    });
+    DB.save();
+    toast("VIP Extra Day thresholds saved");
+    render();
+  });
+
+  const saveHealthThresholds = document.getElementById("save-health-thresholds");
+  if (saveHealthThresholds) saveHealthThresholds.addEventListener("click", () => {
+    DB.data.meta.healthThresholds.healthyMax = Number(document.getElementById("health-healthyMax").value) || 0;
+    DB.data.meta.healthThresholds.watchMax = Number(document.getElementById("health-watchMax").value) || 0;
+    DB.save();
+    toast("Loyalty Health thresholds saved");
+    render();
+  });
+
   document.querySelectorAll("[data-bike-map-key]").forEach((el) => {
     el.addEventListener("change", () => {
       DB.data.meta.bikeNameMap[el.dataset.bikeMapKey] = el.value;
@@ -4379,12 +5158,12 @@ function wireScreenEvents() {
 
   const resetBikeMappingBtn = document.getElementById("reset-bike-mapping");
   if (resetBikeMappingBtn) resetBikeMappingBtn.addEventListener("click", () => {
-    if (confirm("Reset the Bike Name Mapping to the default table? Any corrections you've made will be lost.")) {
+    confirmSheet("Reset the Bike Name Mapping to the default table? Any corrections you've made will be lost.", () => {
       DB.data.meta.bikeNameMap = Object.assign({}, DEFAULT_BIKE_NAME_MAP);
       DB.save();
       toast("Bike Name Mapping reset to defaults");
       render();
-    }
+    }, "Reset to Defaults");
   });
 
   const exportBtn = document.getElementById("export-data");
@@ -4417,11 +5196,11 @@ function wireScreenEvents() {
 
   const wipeBtn = document.getElementById("wipe-data");
   if (wipeBtn) wipeBtn.addEventListener("click", () => {
-    if (confirm("Reset all data on this device? This cannot be undone. Export a backup first if unsure.")) {
+    confirmSheet("Reset all data on this device? This cannot be undone. Export a backup first if unsure.", () => {
       DB.wipe();
       toast("All data reset");
       navigate("customers");
-    }
+    }, "Reset All Data");
   });
 
   const startImportBtn = document.getElementById("start-import");
