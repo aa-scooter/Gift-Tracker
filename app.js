@@ -14,6 +14,18 @@
 
 const STORAGE_KEY = "aa_scooter_manager_db_v1";
 
+// Live Spreadsheet Sync — same Google Apps Script deployment (scriptUrl) every other
+// AA Scooters page already calls, bound to the "AA Scooter Account 2026" spreadsheet.
+// Three read-only actions added there (Aug 2026) specifically for this app:
+//   loyaltyRentals2026   -- the "customer" sheet on that live spreadsheet (2026 rentals)
+//   loyaltyBikeTax        -- the "Bike Tax" sheet (per-vehicle plate/Por Ror Bor/Tax/Insurance)
+//   loyaltyCustomers2025 -- the "customer" sheet on the separate, closed "AA SCOOTERS
+//                            Accounts 2025" spreadsheet (opened by ID on the Apps Script side)
+// Read-only: this app never writes back to any spreadsheet. Sync pulls fresh data in and
+// runs it through the exact same create/update/skip-duplicate pipeline as a CSV import
+// (see runLiveSync() near LIVE SYNC below) — nothing here bypasses that safety net.
+const LIVE_SYNC_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbztdtViH9qFCZ755EefaZqiZWzKK_yTOWkwaFLqZJm271wzDIVMgGoaYGFaSrd20OGsnQ/exec";
+
 // Standardized Vehicle Category tiers (Ride Upgrade ladder + Journey Gift / Qualified
 // Rental thresholds are all keyed off these five, never the raw historical bike name).
 const CATEGORY_TIERS = [
@@ -1172,6 +1184,7 @@ const DB = {
     if (!this.data.meta.dailyValues) this.data.meta.dailyValues = Object.assign({}, DEFAULT_DAILY_VALUES);
     if (!this.data.meta.vipThresholds) this.data.meta.vipThresholds = JSON.parse(JSON.stringify(DEFAULT_VIP_THRESHOLDS));
     if (!this.data.meta.healthThresholds) this.data.meta.healthThresholds = Object.assign({}, DEFAULT_HEALTH_THRESHOLDS);
+    if (this.data.meta.lastLiveSync === undefined) this.data.meta.lastLiveSync = "";
     if (!this.data.customers) this.data.customers = [];
     if (!this.data.rentals) this.data.rentals = [];
     if (!this.data.vehicles) this.data.vehicles = [];
@@ -1769,6 +1782,174 @@ function parseTaxColumn(raw, prbExpiryIso) {
     return { taxExpiryDate: "", taxOverduePending: true, renewalNote: "Pending vehicle inspection (ตรอ.)" };
   }
   return { taxExpiryDate: parseDateLoose(s), taxOverduePending: false, renewalNote: "" };
+}
+
+/* ---------------------------------------------------------------------- */
+/* LIVE SYNC — pulls read-only data from the real AA Scooters spreadsheets */
+/* via LIVE_SYNC_SCRIPT_URL and runs it through the SAME create/update/    */
+/* skip-duplicate pipeline a CSV import already uses (buildImportRecords/  */
+/* commitImport in the IMPORT WIZARD section below) — this module never    */
+/* invents its own merge logic, it just builds { headers, rows, mapping }  */
+/* from a live fetch instead of a parsed CSV file, then drives the exact   */
+/* same, already-trusted commit path. Never writes anything back to any    */
+/* spreadsheet — read-only in, local DB out, same as CSV import always was.*/
+/* ---------------------------------------------------------------------- */
+
+// Header matching here is deliberately hand-built per source rather than reusing
+// guessColumnMapping()/IMPORT_SCHEMAS[...].aliases: the real sheet headers ("Renting date
+// from ", "( Por. Ror. Bor)", "Plate No.") don't reliably match those CSV-oriented aliases
+// (punctuation, different wording) — this is the same normalize-then-substring approach as
+// guessColumnMapping, just with punctuation stripped too so "( Por. Ror. Bor)" -> "por ror bor".
+function normalizeHeaderLoose(h) {
+  return String(h || "").toLowerCase().replace(/[().,_\-]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function findHeaderIndex(headers, candidates) {
+  const norm = headers.map(normalizeHeaderLoose);
+  for (const cand of candidates) {
+    const c = normalizeHeaderLoose(cand);
+    const idx = norm.indexOf(c);
+    if (idx !== -1) return idx;
+  }
+  for (const cand of candidates) {
+    const c = normalizeHeaderLoose(cand);
+    const idx = norm.findIndex((h) => h && h.includes(c));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+async function fetchLoyaltySheet(action) {
+  const res = await fetch(`${LIVE_SYNC_SCRIPT_URL}?action=${action}`);
+  if (!res.ok) throw new Error(`Network error (${res.status})`);
+  const json = await res.json();
+  if (!json.success) throw new Error(json.error || "Request failed");
+  return { headers: json.headers || [], rows: json.rows || [] };
+}
+
+// Neither IMPORT_SCHEMAS.rentals nor commitImport()'s rentals path capture nationality/
+// passport (those live on the customer, and a rental-row import only ever auto-creates a
+// bare customer). This fills them in on customers this sync just touched, WITHOUT ever
+// overwriting a value that's already on file — live data enriches, never clobbers curated
+// history. 2025's sheet has no Passport Number column at all, so that stays a no-op there.
+function backfillCustomerProfileFields(rows, mapping) {
+  if (mapping.customerName === -1) return;
+  rows.forEach((row) => {
+    const name = getMappedValue(row, mapping.customerName, "text");
+    if (!name) return;
+    const customer = DB.data.customers.find((c) => normalizeText(c.name) === normalizeText(name));
+    if (!customer) return;
+    const nationality = getMappedValue(row, mapping.nationality, "text");
+    const passport = getMappedValue(row, mapping.passport, "text");
+    if (nationality && !customer.nationality) customer.nationality = nationality;
+    if (passport && !customer.passport) customer.passport = passport;
+  });
+}
+
+function rentalSheetMapping(headers) {
+  return {
+    customerName: findHeaderIndex(headers, ["name"]),
+    bikeModel: findHeaderIndex(headers, ["bike model"]),
+    plate: -1,
+    startDate: findHeaderIndex(headers, ["renting date from", "renting date"]),
+    endDate: findHeaderIndex(headers, ["return date"]),
+    bookedDays: -1,
+    paidDays: -1,
+    revenue: findHeaderIndex(headers, ["total price"]),
+    status: findHeaderIndex(headers, ["status"]),
+  };
+}
+
+async function runLiveSync() {
+  const summary = { vehicles: null, rentals2026: null, rentals2025: null, errors: [] };
+  const savedImportState = importState;
+
+  try {
+    const { headers, rows } = await fetchLoyaltySheet("loyaltyBikeTax");
+    const mapping = {
+      plate: findHeaderIndex(headers, ["plate no", "plate number", "plate"]),
+      bikeName: findHeaderIndex(headers, ["bike"]),
+      modelYear: findHeaderIndex(headers, ["model year"]),
+      // The sheet's own "Status" column ("Not expiring soon" etc.) is a TAX renewal status,
+      // not this app's vehicle.status field (active/sold/maintenance) -- deliberately left
+      // unmapped (-1) so live sync never overwrites vehicle.status with the wrong meaning.
+      porRorBorExpiryDate: findHeaderIndex(headers, ["por ror bor"]),
+      taxRaw: findHeaderIndex(headers, ["tax"]),
+      renewalNote: -1, currentKm: -1, nextServiceKm: -1, status: -1, notes: -1,
+    };
+    importState = { type: "vehicles", headers, rows, mapping, fileName: "Bike Tax (live sync)", updateDuplicates: true, result: null };
+    commitImport();
+    summary.vehicles = importState.result;
+  } catch (err) {
+    summary.errors.push(`Vehicles (Bike Tax): ${err.message}`);
+  }
+
+  try {
+    const { headers, rows } = await fetchLoyaltySheet("loyaltyRentals2026");
+    const mapping = rentalSheetMapping(headers);
+    importState = { type: "rentals", headers, rows, mapping, fileName: "customer 2026 (live sync)", updateDuplicates: true, result: null };
+    commitImport();
+    summary.rentals2026 = importState.result;
+    backfillCustomerProfileFields(rows, {
+      customerName: mapping.customerName,
+      nationality: findHeaderIndex(headers, ["nationality"]),
+      passport: findHeaderIndex(headers, ["passport number", "passport"]),
+    });
+  } catch (err) {
+    summary.errors.push(`2026 rentals: ${err.message}`);
+  }
+
+  try {
+    const { headers, rows } = await fetchLoyaltySheet("loyaltyCustomers2025");
+    const mapping = rentalSheetMapping(headers);
+    importState = { type: "rentals", headers, rows, mapping, fileName: "customer 2025 (live sync)", updateDuplicates: true, result: null };
+    commitImport();
+    summary.rentals2025 = importState.result;
+    backfillCustomerProfileFields(rows, {
+      customerName: mapping.customerName,
+      nationality: findHeaderIndex(headers, ["nationality"]),
+      passport: -1, // 2025's "customer" sheet has no Passport Number column.
+    });
+  } catch (err) {
+    summary.errors.push(`2025 rentals: ${err.message}`);
+  }
+
+  importState = savedImportState;
+  DB.data.meta.lastLiveSync = new Date().toISOString();
+  DB.save();
+  return summary;
+}
+
+function showLiveSyncResultSheet(summary) {
+  const sections = [
+    ["Vehicles — Bike Tax (live)", summary.vehicles],
+    ["Rentals — 2026 customer sheet (live)", summary.rentals2026],
+    ["Rentals — 2025 customer sheet (closed)", summary.rentals2025],
+  ];
+  openSheet(`
+    <div class="sheet-title">Live sync complete</div>
+    <div class="sheet-sub">${escapeHtml(new Date().toLocaleString())}</div>
+    <div style="margin-top:10px;">
+      ${sections.map(([label, r]) => `
+        <div class="card" style="margin-bottom:10px;">
+          <div class="list-item-title" style="margin-bottom:6px;">${escapeHtml(label)}</div>
+          ${r
+            ? `<p class="muted">${r.created} new · ${r.updated} updated · ${r.skipped} unchanged (skipped) · ${r.invalid} row(s) skipped (missing required data)${r.autoCreatedCustomers ? ` · ${r.autoCreatedCustomers} new customer(s) created` : ""}</p>`
+            : `<p class="muted">Could not sync this source — see error below.</p>`}
+        </div>
+      `).join("")}
+      ${summary.errors.length ? `
+        <div class="card">
+          <div class="list-item-title" style="margin-bottom:6px;">Errors</div>
+          ${summary.errors.map((e) => `<p class="muted" style="color:#c0392b;">${escapeHtml(e)}</p>`).join("")}
+        </div>
+      ` : ""}
+    </div>
+    <div class="btn-row" style="margin-top:16px;">
+      <button class="btn btn-primary btn-block" id="live-sync-result-close">Done</button>
+    </div>
+  `);
+  document.getElementById("live-sync-result-close").addEventListener("click", () => { closeSheet(); render(); });
 }
 
 
@@ -3744,11 +3925,20 @@ function renderSettings() {
         </div>
       </div>
 
+      <div class="section-title">Live Spreadsheet Sync</div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px;">Pulls fresh, read-only data straight from the real AA Scooters spreadsheets: the live "customer" sheet and "Bike Tax" sheet on AA Scooter Account 2026, plus the closed 2025 customer sheet. Never writes anything back to any spreadsheet — it's the same one-way direction as a CSV import, just fetched live instead of uploaded by hand. Runs through the exact same matching rules as Import from CSV below: existing vehicles matched by plate, existing customers/rentals matched by name (+ bike + start date for rentals) — nothing is silently overwritten.</p>
+        <p class="muted" style="margin-bottom:12px;">Last synced: ${DB.data.meta.lastLiveSync ? escapeHtml(new Date(DB.data.meta.lastLiveSync).toLocaleString()) : "never"}</p>
+        <div class="btn-row">
+          <button class="btn btn-orange btn-sm" id="run-live-sync">Sync now</button>
+        </div>
+      </div>
+
       <div class="section-title">Import Existing Data</div>
       <div class="card">
-        <p class="muted" style="margin-bottom:12px;">Bring in customers, rentals, or vehicles from a spreadsheet (e.g. exported from Google Sheets as CSV). This app never reads live from a spreadsheet — import is a one-time or occasional action, and everything then runs from this device's own database. Existing records are matched first; nothing is overwritten without your say-so.</p>
+        <p class="muted" style="margin-bottom:12px;">Bring in customers, rentals, or vehicles from a CSV file (e.g. exported from Google Sheets) — useful for a one-off source that isn't wired up above. Existing records are matched first; nothing is overwritten without your say-so.</p>
         <div class="btn-row">
-          <button class="btn btn-orange btn-sm" id="start-import">Import from CSV…</button>
+          <button class="btn btn-outline btn-sm" id="start-import">Import from CSV…</button>
         </div>
       </div>
 
@@ -5205,6 +5395,21 @@ function wireScreenEvents() {
 
   const startImportBtn = document.getElementById("start-import");
   if (startImportBtn) startImportBtn.addEventListener("click", () => { resetImportState(null); navigate("import"); });
+
+  const runLiveSyncBtn = document.getElementById("run-live-sync");
+  if (runLiveSyncBtn) runLiveSyncBtn.addEventListener("click", async () => {
+    runLiveSyncBtn.disabled = true;
+    runLiveSyncBtn.textContent = "Syncing…";
+    try {
+      const summary = await runLiveSync();
+      showLiveSyncResultSheet(summary);
+    } catch (err) {
+      toast("Live sync failed — see console for details");
+      console.error(err);
+      runLiveSyncBtn.disabled = false;
+      runLiveSyncBtn.textContent = "Sync now";
+    }
+  });
 
   wireImportScreenEvents();
 }
