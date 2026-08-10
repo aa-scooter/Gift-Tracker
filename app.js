@@ -3927,7 +3927,7 @@ function renderSettings() {
 
       <div class="section-title">Live Spreadsheet Sync</div>
       <div class="card">
-        <p class="muted" style="margin-bottom:12px;">Pulls fresh, read-only data straight from the real AA Scooters spreadsheets: the live "customer" sheet and "Bike Tax" sheet on AA Scooter Account 2026, plus the closed 2025 customer sheet. Never writes anything back to any spreadsheet — it's the same one-way direction as a CSV import, just fetched live instead of uploaded by hand. Runs through the exact same matching rules as Import from CSV below: existing vehicles matched by plate, existing customers/rentals matched by name (+ bike + start date for rentals) — nothing is silently overwritten.</p>
+        <p class="muted" style="margin-bottom:12px;">Pulls fresh, read-only data straight from the real AA Scooters spreadsheets: the live "customer" sheet and "Bike Tax" sheet on AA Scooter Account 2026, plus the closed 2025 customer sheet. Never writes anything back to any spreadsheet — it's the same one-way direction as a CSV import, just fetched live instead of uploaded by hand. Runs through the exact same matching rules as Import from CSV below: existing vehicles matched by plate, existing customers/rentals matched by name (+ bike + start date for rentals) — nothing is silently overwritten. Also runs automatically in the background whenever the app is opened (at most once every 5 minutes) — use the button below only to force a sync sooner.</p>
         <p class="muted" style="margin-bottom:12px;">Last synced: ${DB.data.meta.lastLiveSync ? escapeHtml(new Date(DB.data.meta.lastLiveSync).toLocaleString()) : "never"}</p>
         <div class="btn-row">
           <button class="btn btn-orange btn-sm" id="run-live-sync">Sync now</button>
@@ -5488,7 +5488,31 @@ document.getElementById("tabbar").addEventListener("click", (e) => {
 
 document.getElementById("gear-btn").addEventListener("click", () => navigate("settings"));
 
+// Auto-sync on app open: runs the same live sync as the Settings "Sync now" button, just
+// silently (a toast instead of the full result sheet) and throttled so re-opening the app
+// or navigating between tabs within the same session doesn't hammer the spreadsheet on every
+// load. The app still boots instantly from whatever's in localStorage — this happens in the
+// background afterward and re-renders only if it actually changed something.
+const AUTO_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+async function autoSyncOnLoad() {
+  const last = DB.data.meta.lastLiveSync ? new Date(DB.data.meta.lastLiveSync).getTime() : 0;
+  if (Date.now() - last < AUTO_SYNC_MIN_INTERVAL_MS) return;
+  try {
+    const summary = await runLiveSync();
+    if (summary.errors.length) console.error("Auto-sync errors:", summary.errors);
+    const totalNew = (summary.vehicles?.created || 0) + (summary.rentals2026?.created || 0) + (summary.rentals2025?.created || 0);
+    const totalUpdated = (summary.vehicles?.updated || 0) + (summary.rentals2026?.updated || 0) + (summary.rentals2025?.updated || 0);
+    if (totalNew || totalUpdated) {
+      toast(`Synced with spreadsheet — ${totalNew} new, ${totalUpdated} updated`);
+      render();
+    }
+  } catch (err) {
+    console.error("Auto-sync on load failed:", err);
+  }
+}
+
 DB.load();
 navigate("home");
+autoSyncOnLoad();
 
 })();
