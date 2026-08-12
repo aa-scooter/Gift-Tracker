@@ -1773,6 +1773,208 @@ function runDataAudit() {
 }
 
 /* ---------------------------------------------------------------------- */
+/* SOURCE-ROW MAPPING DIAGNOSTIC (READ-ONLY). Rental technical IDs are NOT */
+/* treated as business identity — they were assigned once, offline, and   */
+/* are not provably stable across different generations of this array     */
+/* (confirmed: several past Needs Review resolutions changed record count */
+/* and would have shifted sequential numbering had the array ever been    */
+/* regenerated). sourceRows are the only stable anchor, since they cite    */
+/* the untouched original spreadsheet directly. This function determines, */
+/* per mismatched customer, whether every live record can be              */
+/* deterministically mapped to a canonical episode by sourceRows overlap  */
+/* — and if not, marks that customer REVIEW REQUIRED rather than guessing.*/
+/* ---------------------------------------------------------------------- */
+
+function buildSourceRowMappingDiagnostic() {
+  const canonicalByCustomer = {};
+  IMPORTED_RENTALS.forEach((r) => {
+    (canonicalByCustomer[r.customerId] = canonicalByCustomer[r.customerId] || []).push(r);
+  });
+
+  const results = [];
+
+  IMPORTED_CUSTOMERS.forEach((seedCust) => {
+    const custId = seedCust.id;
+    const canonicalRentals = canonicalByCustomer[custId] || [];
+    const storedRentals = DB.data.rentals.filter((r) => r.customerId === custId);
+
+    const storedVisits = storedRentals.length;
+    const storedDays = storedRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+    const storedRevenue = storedRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+    const canonicalVisits = canonicalRentals.length;
+    const canonicalDays = canonicalRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+    const canonicalRevenue = canonicalRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+    const isMatch = storedVisits === canonicalVisits && storedDays === canonicalDays && storedRevenue === canonicalRevenue;
+    if (isMatch) return; // only mismatched customers are examined
+
+    const displayCust = DB.data.customers.find((c) => c.id === custId);
+    const displayName = displayCust ? displayCust.name : seedCust.name;
+
+    // Map every canonical sourceRow citation to the episode it belongs to.
+    const canonicalRowToEpisode = {};
+    canonicalRentals.forEach((ep) => { (ep.sourceRows || []).forEach((row) => { canonicalRowToEpisode[row] = ep; }); });
+
+    const importSourced = storedRentals.filter((r) => String(r.id).startsWith("imp_r"));
+    const manualRentals = storedRentals.filter((r) => !String(r.id).startsWith("imp_r"));
+
+    const claimedRows = new Set();
+    const episodeCoverage = {}; // episode.id -> Set of rows covered so far by live records
+
+    const liveRecordClassifications = importSourced.map((liveRec) => {
+      const rows = liveRec.sourceRows || [];
+      if (rows.length === 0) {
+        return { id: liveRec.id, record: liveRec, classification: "AMBIGUOUS / REVIEW REQUIRED", reason: "No sourceRows on this record — cannot verify its origin." };
+      }
+      const episodesHit = new Set(rows.map((r) => canonicalRowToEpisode[r]).filter(Boolean));
+      if (episodesHit.size === 0) {
+        return { id: liveRec.id, record: liveRec, classification: "MISSING CANONICAL EPISODE", reason: "None of this record's sourceRows match any canonical episode." };
+      }
+      if (episodesHit.size > 1) {
+        return { id: liveRec.id, record: liveRec, classification: "AMBIGUOUS / REVIEW REQUIRED", reason: "sourceRows span more than one canonical episode." };
+      }
+      const episode = [...episodesHit][0];
+      const duplicateClaim = rows.some((r) => claimedRows.has(r));
+      rows.forEach((r) => claimedRows.add(r));
+      if (duplicateClaim) {
+        return { id: liveRec.id, record: liveRec, classification: "DUPLICATE SOURCE ROW CLAIM", reason: "One or more sourceRows already claimed by another live record.", episodeId: episode.id };
+      }
+      episodeCoverage[episode.id] = episodeCoverage[episode.id] || new Set();
+      rows.forEach((r) => episodeCoverage[episode.id].add(r));
+      const episodeRowCount = (episode.sourceRows || []).length;
+      const coveredSoFar = episodeCoverage[episode.id].size;
+      if (coveredSoFar < episodeRowCount) {
+        return { id: liveRec.id, record: liveRec, classification: "FRAGMENT OF CANONICAL EPISODE", reason: `Covers ${coveredSoFar} of ${episodeRowCount} rows belonging to this episode.`, episodeId: episode.id };
+      }
+      const contentMatches = liveRec.startDate === episode.startDate && liveRec.endDate === episode.endDate
+        && Number(liveRec.paidDays) === Number(episode.paidDays) && Number(liveRec.revenue) === Number(episode.revenue);
+      return {
+        id: liveRec.id, record: liveRec,
+        classification: contentMatches ? "MATCH" : "FRAGMENT OF CANONICAL EPISODE",
+        reason: contentMatches ? "Covers all rows for this episode and content matches canonical exactly." : "Covers all rows for this episode, but its own field values differ from canonical.",
+        episodeId: episode.id,
+      };
+    });
+
+    const missingEpisodes = canonicalRentals.filter((ep) => {
+      const covered = episodeCoverage[ep.id];
+      return !(covered && covered.size === (ep.sourceRows || []).length);
+    });
+
+    const anyAmbiguous = liveRecordClassifications.some((c) => c.classification === "AMBIGUOUS / REVIEW REQUIRED" || c.classification === "MISSING CANONICAL EPISODE");
+    const deterministic = !anyAmbiguous && missingEpisodes.length === 0;
+
+    results.push({
+      customerId: custId,
+      name: displayName,
+      liveRecords: liveRecordClassifications,
+      manualRentals,
+      canonicalEpisodes: canonicalRentals,
+      missingEpisodes,
+      deterministic,
+      status: deterministic ? "SAFE (sourceRows-verified)" : "REVIEW REQUIRED",
+    });
+  });
+
+  const categoryTotals = { fragmented: 0, duplicate: 0, missingEpisode: 0, ambiguous: 0, safe: 0, review: 0 };
+  results.forEach((r) => {
+    if (r.deterministic) categoryTotals.safe++; else categoryTotals.review++;
+    r.liveRecords.forEach((lr) => {
+      if (lr.classification === "FRAGMENT OF CANONICAL EPISODE") categoryTotals.fragmented++;
+      if (lr.classification === "DUPLICATE SOURCE ROW CLAIM") categoryTotals.duplicate++;
+      if (lr.classification === "MISSING CANONICAL EPISODE") categoryTotals.missingEpisode++;
+      if (lr.classification === "AMBIGUOUS / REVIEW REQUIRED") categoryTotals.ambiguous++;
+    });
+  });
+
+  // Customer-level counts (how many CUSTOMERS exhibit each pattern at least once) — distinct
+  // from categoryTotals above, which counts individual RECORDS.
+  const customerCounts = {
+    withDuplicateClaims: results.filter((r) => r.liveRecords.some((lr) => lr.classification === "DUPLICATE SOURCE ROW CLAIM")).length,
+    withMissingSourceRows: results.filter((r) => r.liveRecords.some((lr) => (lr.record.sourceRows || []).length === 0)).length,
+    withOnlyCleanFragments: results.filter((r) => r.deterministic && r.liveRecords.some((lr) => lr.classification === "FRAGMENT OF CANONICAL EPISODE") && r.liveRecords.every((lr) => lr.classification === "FRAGMENT OF CANONICAL EPISODE" || lr.classification === "MATCH")).length,
+    withMissingCanonicalEpisode: results.filter((r) => r.missingEpisodes.length > 0 || r.liveRecords.some((lr) => lr.classification === "MISSING CANONICAL EPISODE")).length,
+    withAmbiguous: results.filter((r) => r.liveRecords.some((lr) => lr.classification === "AMBIGUOUS / REVIEW REQUIRED")).length,
+  };
+
+  return { customers: results, categoryTotals, customerCounts };
+}
+
+// Read-only screen for the source-row mapping diagnostic. Nothing here writes anything —
+// it only displays buildSourceRowMappingDiagnostic()'s output.
+function renderSourceRowDiagnosticScreen() {
+  const diag = buildSourceRowMappingDiagnostic();
+  const classPill = (c) => {
+    if (c === "MATCH") return `<span class="pill pill-green">MATCH</span>`;
+    if (c === "FRAGMENT OF CANONICAL EPISODE") return `<span class="pill pill-amber">FRAGMENT</span>`;
+    if (c === "DUPLICATE SOURCE ROW CLAIM") return `<span class="pill pill-red">DUPLICATE CLAIM</span>`;
+    if (c === "MISSING CANONICAL EPISODE") return `<span class="pill pill-red">NO CANONICAL MATCH</span>`;
+    return `<span class="pill pill-neutral">AMBIGUOUS</span>`;
+  };
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="data-audit">‹ Data Audit</button>
+      <h1 class="screen-title" style="margin-top:8px;">Source-Row Mapping</h1>
+      <p class="screen-sub">Every live record for each mismatched customer, matched to canonical episodes by source spreadsheet row only — never by technical rental ID.</p>
+    </header>
+    <div class="screen-body">
+      <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="report-tile"><div class="report-tile-value" style="color:var(--green);">${diag.categoryTotals.safe}</div><div class="report-tile-label">Deterministic (SAFE)</div></div>
+        <div class="report-tile"><div class="report-tile-value" style="color:var(--red);">${diag.categoryTotals.review}</div><div class="report-tile-label">Review Required</div></div>
+        <div class="report-tile"><div class="report-tile-value">${diag.categoryTotals.fragmented}</div><div class="report-tile-label">Fragment Records</div></div>
+        <div class="report-tile"><div class="report-tile-value">${diag.categoryTotals.duplicate}</div><div class="report-tile-label">Duplicate Claims</div></div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <div class="section-label" style="margin-top:0;">Customer-Level Summary</div>
+        <div class="grid-2">
+          <div><div class="muted" style="font-size:11px;">Total customers analysed</div><div style="font-weight:700;">${diag.customers.length}</div></div>
+          <div><div class="muted" style="font-size:11px;">SAFE / deterministic</div><div style="font-weight:700; color:var(--green);">${diag.categoryTotals.safe}</div></div>
+          <div><div class="muted" style="font-size:11px;">Review Required</div><div style="font-weight:700; color:var(--red);">${diag.categoryTotals.review}</div></div>
+          <div><div class="muted" style="font-size:11px;">With duplicate source-row claims</div><div style="font-weight:700;">${diag.customerCounts.withDuplicateClaims}</div></div>
+          <div><div class="muted" style="font-size:11px;">With records missing sourceRows</div><div style="font-weight:700;">${diag.customerCounts.withMissingSourceRows}</div></div>
+          <div><div class="muted" style="font-size:11px;">Only clean fragments</div><div style="font-weight:700;">${diag.customerCounts.withOnlyCleanFragments}</div></div>
+          <div><div class="muted" style="font-size:11px;">With missing canonical episode</div><div style="font-weight:700;">${diag.customerCounts.withMissingCanonicalEpisode}</div></div>
+          <div><div class="muted" style="font-size:11px;">With ambiguous mappings</div><div style="font-weight:700;">${diag.customerCounts.withAmbiguous}</div></div>
+        </div>
+      </div>
+
+      ${diag.customers.length === 0 ? `<div class="empty"><div class="empty-icon">✓</div><h3>Nothing to map</h3></div>` : diag.customers.map((c) => `
+        <div class="card" style="margin-bottom:14px;">
+          <div class="card-row" style="margin-bottom:10px;">
+            <div style="font-weight:700; font-size:15px;">${escapeHtml(c.name)}</div>
+            <span class="pill ${c.deterministic ? "pill-green" : "pill-red"}">${c.deterministic ? "SAFE" : "REVIEW REQUIRED"}</span>
+          </div>
+
+          <div class="section-label" style="margin-top:0;">Canonical Episodes (${c.canonicalEpisodes.length})</div>
+          ${c.canonicalEpisodes.map((ep) => `
+            <div class="reward-note" style="margin-bottom:6px;">
+              <b>${fmtDate(ep.startDate)} → ${ep.endDate ? fmtDate(ep.endDate) : "ongoing"}</b> · ${escapeHtml(ep.bikeNameRaw || ep.bikeModel)} · ${fmtMoney(ep.revenue)} · ${ep.paidDays} days<br/>
+              <span class="muted">sourceRows: ${(ep.sourceRows || []).map(escapeHtml).join(", ") || "—"}</span>
+              ${c.missingEpisodes.some((m) => m.id === ep.id) ? `<br/><span style="color:var(--red);">No live record fully covers this episode</span>` : ""}
+            </div>
+          `).join("")}
+
+          <div class="section-label">Live Records (${c.liveRecords.length})</div>
+          ${c.liveRecords.map((lr) => `
+            <div class="reward-note" style="margin-bottom:6px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+                <b>${escapeHtml(lr.id)}</b> ${classPill(lr.classification)}
+              </div>
+              ${fmtDate(lr.record.startDate)} → ${lr.record.endDate ? fmtDate(lr.record.endDate) : "ongoing"} · ${escapeHtml(lr.record.bikeNameRaw || lr.record.bikeModel)} · ${fmtMoney(lr.record.revenue)} · ${lr.record.paidDays} days<br/>
+              <span class="muted">sourceRows: ${(lr.record.sourceRows || []).map(escapeHtml).join(", ") || "none"}</span><br/>
+              <span class="muted">${escapeHtml(lr.reason)}</span>
+            </div>
+          `).join("")}
+
+          ${c.manualRentals.length > 0 ? `<div class="section-label">Manual Rentals (never touched, ${c.manualRentals.length})</div>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------------- */
 /* PHASE 2 — RECONCILIATION PLAN (PREVIEW ONLY, STRICTLY READ-ONLY).       */
 /* Computes what a future repair WOULD do, for inspection only. Does not   */
 /* call DB.save(), does not assign to any DB.data field, does not touch    */
@@ -1890,6 +2092,14 @@ function renderDataAuditScreen() {
         <div class="muted" style="font-size:12.5px;">Total excess/short revenue caused by stale records</div>
         <div style="font-family:var(--font-display); font-size:22px; font-weight:800; margin-top:4px;">${audit.totalDiffRevenue > 0 ? "+" : ""}${fmtMoney(audit.totalDiffRevenue)}</div>
       </div>
+
+      ${audit.mismatching > 0 ? `
+        <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--orange-soft-line);">
+          <div style="font-weight:700; margin-bottom:6px;">Source-Row Mapping Diagnostic</div>
+          <p class="muted" style="margin-bottom:12px;">Verifies whether every mismatched customer's live records can be deterministically matched to canonical episodes by source spreadsheet row — never by technical rental ID. Read-only.</p>
+          <button class="btn btn-outline btn-block" data-goto="sourcerow-diagnostic">View Source-Row Mapping</button>
+        </div>
+      ` : ""}
 
       ${audit.mismatching > 0 ? `
         <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--orange-soft-line);">
@@ -2093,6 +2303,23 @@ function executeReconciliation() {
   newRentals.forEach((r) => { idCounts[r.id] = (idCounts[r.id] || 0) + 1; });
   const dupes = Object.entries(idCounts).filter(([, n]) => n > 1);
   if (dupes.length > 0) errors.push(`Duplicate rental IDs introduced: ${dupes.map(([id]) => id).join(", ")}`);
+  // 6. HARD CHECK — every SAFE customer's proposed import-sourced record set must actually
+  //    differ (by ID set or by content) from their stale stored set, compared explicitly
+  //    here rather than trusted from the plan. If NONE of them show any real change, the
+  //    repair must never report success — that would be silently lying about what happened.
+  let anyRealChange = false;
+  safeIds.forEach((custId) => {
+    const beforeImport = beforeRentals.filter((r) => r.customerId === custId && String(r.id).startsWith("imp_r"));
+    const afterImport = newRentals.filter((r) => r.customerId === custId && String(r.id).startsWith("imp_r"));
+    const beforeIds = beforeImport.map((r) => r.id).sort().join(",");
+    const afterIds = afterImport.map((r) => r.id).sort().join(",");
+    const beforeContent = JSON.stringify(beforeImport.slice().sort((a, b) => a.id.localeCompare(b.id)));
+    const afterContent = JSON.stringify(afterImport.slice().sort((a, b) => a.id.localeCompare(b.id)));
+    if (beforeIds !== afterIds || beforeContent !== afterContent) anyRealChange = true;
+  });
+  if (safeIds.size > 0 && !anyRealChange) {
+    return { success: false, reason: "Reconciliation produced no data changes." };
+  }
 
   if (errors.length > 0) {
     return { success: false, reason: errors.join("; ") };
@@ -5509,6 +5736,7 @@ function render() {
     case "settings": html = renderSettings(); break;
     case "data-audit": html = renderDataAuditScreen(); break;
     case "reconcile-preview": html = renderReconcilePreviewScreen(); break;
+    case "sourcerow-diagnostic": html = renderSourceRowDiagnosticScreen(); break;
     case "reconcile-confirm": html = renderReconcileConfirmScreen(); break;
     case "reconcile-result": html = renderReconcileResultScreen(); break;
     case "import": html = renderImportScreen(); break;
