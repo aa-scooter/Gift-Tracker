@@ -1527,8 +1527,17 @@ function initials(name) {
 // since several imported names carry them (e.g. "Mr.Benjamin Andrew Van Herten").
 function firstNameOf(name) {
   let s = String(name || "").trim();
-  s = s.replace(/^(mr|mrs|ms|miss|dr)\.?\s*/i, "").trim();
+  s = s.replace(/^(mrs|miss|mr|ms|dr)\.?\s*/i, "").trim();
   return s.split(/\s+/)[0] || s;
+}
+// Full readable display name — strips the same honorifics as firstNameOf, but keeps the
+// rest of the name intact (never touches the actual stored customer.name; this is a
+// display-only transform used for screens like Rewards Ready). Also normalizes common
+// punctuation variants some imported records carry, like "Mr," instead of "Mr.".
+function cleanCustomerDisplayName(name) {
+  let s = String(name || "").trim();
+  s = s.replace(/^(mrs|miss|mr|ms|dr)[.,]?\s*/i, "");
+  return s.replace(/\s+/g, " ").trim() || String(name || "").trim();
 }
 // Customer-facing bike name only — drops internal trim/spec detail (Standard Key,
 // Keyless, ABS) that means nothing to a customer and could set the wrong expectation,
@@ -3667,7 +3676,7 @@ function renderCustomerRewardRow(entry) {
   return `
     <div class="cust-row" data-goto="customer" data-id="${entry.customer.id}">
       <div class="cust-row-main">
-        <div class="cust-row-name">${escapeHtml(entry.customer.name)}</div>
+        <div class="cust-row-name">${escapeHtml(cleanCustomerDisplayName(entry.customer.name))}</div>
         ${entry.items.map((it) => `
           <div class="cust-row-reward">
             ${boldIcon(REWARD_ICON[it.type] || "gift", "row")}
@@ -3683,7 +3692,14 @@ function renderCustomerRewardRow(entry) {
 
 function renderRewardsReadyScreen() {
   const insights = computeHomeInsights();
-  const list = insights.rewardsReady.slice().sort((a, b) => a.customer.name.localeCompare(b.customer.name));
+  // ONE customer = one row, guaranteed by computeHomeInsights()'s Map-based grouping (keyed
+  // by customerId) — a customer with multiple eligible rewards already accumulates them into
+  // one entry's `items` list, never a separate entry per reward. Sorted by the cleaned
+  // display name (honorifics stripped) so real alphabetical order isn't thrown off by
+  // everyone named "Mr." clustering together.
+  const list = insights.rewardsReady.slice().sort((a, b) =>
+    cleanCustomerDisplayName(a.customer.name).localeCompare(cleanCustomerDisplayName(b.customer.name))
+  );
   return `
     <header class="screen-header">
       <button class="back-btn" data-goto="customers">‹ Customer Loyalty</button>
