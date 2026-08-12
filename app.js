@@ -1966,6 +1966,140 @@ function buildSourceRowMappingDiagnostic() {
   return { customers: results, categoryTotals, customerCounts };
 }
 
+/* ---------------------------------------------------------------------- */
+/* NON-IMPORT RENTAL CLASSIFICATION DIAGNOSTIC (READ-ONLY). Scans every    */
+/* current non-import rental (id NOT starting "imp_r") and classifies it   */
+/* against that customer's canonical episodes, WITHOUT assuming "manual"   */
+/* means suspicious — only overlap evidence (date/bike/revenue) marks a    */
+/* record as a likely duplicate. No delete/repair action exists anywhere   */
+/* in this screen.                                                         */
+/* ---------------------------------------------------------------------- */
+
+function classifyNonImportRentals() {
+  const canonicalByCustomer = {};
+  IMPORTED_RENTALS.forEach((r) => {
+    (canonicalByCustomer[r.customerId] = canonicalByCustomer[r.customerId] || []).push(r);
+  });
+
+  const results = [];
+  DB.data.customers.forEach((cust) => {
+    // Only 2026-onward non-import rentals are in scope — 2025 stays legacy/recognition-only,
+    // out of scope for this diagnostic the same way it's out of scope for Data Audit.
+    const nonImport = DB.data.rentals.filter((r) =>
+      r.customerId === cust.id && !String(r.id).startsWith("imp_r") && r.startDate >= LEGACY_CUTOFF_DATE
+    );
+    if (nonImport.length === 0) return;
+
+    const canonical = canonicalByCustomer[cust.id] || [];
+
+    const classified = nonImport.map((r) => {
+      const zeroDayFinancial = (Number(r.paidDays) || 0) === 0 && (Number(r.revenue) || 0) > 0;
+      let overlapEpisode = null;
+      const overlapReasons = [];
+      canonical.forEach((ep) => {
+        if (overlapEpisode) return; // first genuine match is enough to explain this record
+        const rEnd = r.endDate || r.startDate;
+        const epEnd = ep.endDate || ep.startDate;
+        const dateOverlap = r.startDate <= epEnd && rEnd >= ep.startDate;
+        const bikeMatchRaw = r.bikeNameRaw && ep.bikeNameRaw && normalizeText(r.bikeNameRaw) === normalizeText(ep.bikeNameRaw);
+        // The exact cross-field comparison that explains how these records were created in
+        // the first place: a raw bike name landing in bikeModel matching an existing
+        // canonical record's true bikeNameRaw.
+        const bikeMatchCross = r.bikeModel && ep.bikeNameRaw && normalizeText(r.bikeModel) === normalizeText(ep.bikeNameRaw);
+        const revenueSubset = Number(r.revenue) > 0 && Number(r.revenue) <= Number(ep.revenue);
+        const reasons = [];
+        if (dateOverlap) reasons.push("date range overlaps this episode");
+        if (bikeMatchRaw) reasons.push("bike (raw name) matches");
+        if (bikeMatchCross) reasons.push("bike matches this episode's raw name (cross-field)");
+        if (zeroDayFinancial && revenueSubset && (bikeMatchRaw || bikeMatchCross)) reasons.push("zero-day revenue is a plausible subset of this episode's total");
+        if (reasons.length > 0) { overlapEpisode = ep; overlapReasons.push(...reasons); }
+      });
+
+      // A record can genuinely be BOTH a zero-day financial entry AND show duplicate
+      // overlap — both signals are preserved and shown, never collapsed into one.
+      let category;
+      if (overlapEpisode) category = "B";
+      else if (zeroDayFinancial) category = "C";
+      else if ((Number(r.paidDays) || 0) > 0 && (Number(r.revenue) || 0) > 0) category = "A";
+      else category = "D";
+
+      return {
+        id: r.id, startDate: r.startDate, endDate: r.endDate,
+        paidDays: r.paidDays, bookedDays: r.bookedDays, revenue: r.revenue,
+        bikeModel: r.bikeModel, bikeNameRaw: r.bikeNameRaw, status: r.status,
+        sourceRows: r.sourceRows || null,
+        category, zeroDayFinancial,
+        overlapEpisodeId: overlapEpisode ? overlapEpisode.id : null,
+        overlapReasons,
+      };
+    });
+
+    const genuineCount = classified.filter((r) => r.category === "A").length;
+    const duplicateCount = classified.filter((r) => r.category === "B").length;
+    const zeroDayCount = classified.filter((r) => r.zeroDayFinancial).length; // independent of category, per the "show both signals" rule
+    const ambiguousCount = classified.filter((r) => r.category === "D").length;
+    const duplicateRevenueTotal = classified.filter((r) => r.category === "B").reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+
+    results.push({
+      customerId: cust.id, name: cust.name,
+      records: classified,
+      genuineCount, duplicateCount, zeroDayCount, ambiguousCount, duplicateRevenueTotal,
+    });
+  });
+
+  return {
+    totalCustomers: results.length,
+    totalDuplicateRevenue: results.reduce((s, r) => s + r.duplicateRevenueTotal, 0),
+    customers: results.sort((a, b) => b.duplicateRevenueTotal - a.duplicateRevenueTotal),
+  };
+}
+
+function renderNonImportClassificationScreen() {
+  const diag = classifyNonImportRentals();
+  const catBadge = (cat) => {
+    if (cat === "A") return `<span class="pill pill-green">A · GENUINE</span>`;
+    if (cat === "B") return `<span class="pill pill-red">B · LIKELY DUPLICATE</span>`;
+    if (cat === "C") return `<span class="pill pill-amber">C · ZERO-DAY</span>`;
+    return `<span class="pill pill-neutral">D · AMBIGUOUS</span>`;
+  };
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="data-audit">‹ Data Audit</button>
+      <h1 class="screen-title" style="margin-top:8px;">Non-Import Rental Review</h1>
+      <p class="screen-sub">Read-only. Classifies every non-imported (manual-labeled) 2026 rental by comparing it against canonical import history — never assumes "manual" means suspicious. No delete or repair action exists on this screen.</p>
+    </header>
+    <div class="screen-body">
+      <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="report-tile"><div class="report-tile-value">${diag.totalCustomers}</div><div class="report-tile-label">Customers with Non-Import Rentals</div></div>
+        <div class="report-tile"><div class="report-tile-value" style="color:var(--red);">${fmtMoney(diag.totalDuplicateRevenue)}</div><div class="report-tile-label">Revenue in Likely Duplicates</div></div>
+      </div>
+
+      ${diag.customers.length === 0 ? `<div class="empty"><div class="empty-icon">✓</div><h3>Nothing to review</h3></div>` : diag.customers.map((c) => `
+        <div class="card" style="margin-bottom:14px;">
+          <div style="font-weight:700; font-size:15px; margin-bottom:8px;">${escapeHtml(c.name)}</div>
+          <div class="grid-2" style="margin-bottom:10px;">
+            <div><div class="muted" style="font-size:11px;">Genuine candidates (A)</div><div class="mono">${c.genuineCount}</div></div>
+            <div><div class="muted" style="font-size:11px;">Likely duplicates (B)</div><div class="mono" style="color:var(--red);">${c.duplicateCount}</div></div>
+            <div><div class="muted" style="font-size:11px;">Zero-day records (C)</div><div class="mono">${c.zeroDayCount}</div></div>
+            <div><div class="muted" style="font-size:11px;">Ambiguous (D)</div><div class="mono">${c.ambiguousCount}</div></div>
+          </div>
+          <div class="reward-note" style="margin-bottom:10px;">Revenue currently contributed by likely duplicates: <b>${fmtMoney(c.duplicateRevenueTotal)}</b></div>
+          ${c.records.map((r) => `
+            <div class="reward-note" style="margin-bottom:8px;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:2px;">
+                <b>${escapeHtml(r.id)}</b> ${catBadge(r.category)}${r.zeroDayFinancial && r.category !== "C" ? ` <span class="pill pill-amber">zero-day</span>` : ""}
+              </div>
+              ${fmtDate(r.startDate)} → ${r.endDate ? fmtDate(r.endDate) : "ongoing"} · ${escapeHtml(r.bikeNameRaw || r.bikeModel || "—")} · ${fmtMoney(r.revenue)} · paidDays: ${r.paidDays}<br/>
+              ${r.overlapEpisodeId ? `<span class="muted">Overlaps canonical ${escapeHtml(r.overlapEpisodeId)} — ${escapeHtml(r.overlapReasons.join(", "))}</span>` : `<span class="muted">No overlap found with canonical history</span>`}
+            </div>
+          `).join("")}
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
 // Read-only screen for the source-row mapping diagnostic. Nothing here writes anything —
 // it only displays buildSourceRowMappingDiagnostic()'s output.
 function renderSourceRowDiagnosticScreen() {
@@ -2172,6 +2306,14 @@ function renderDataAuditScreen() {
           <div style="font-weight:700; margin-bottom:6px;">Source-Row Mapping Diagnostic</div>
           <p class="muted" style="margin-bottom:12px;">Verifies whether every genuinely mismatched customer's live import-sourced records can be deterministically matched to canonical episodes by source spreadsheet row — never by technical rental ID. Read-only.</p>
           <button class="btn btn-outline btn-block" data-goto="sourcerow-diagnostic">View Source-Row Mapping</button>
+        </div>
+      ` : ""}
+
+      ${audit.customersWithManual > 0 ? `
+        <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--orange-soft-line);">
+          <div style="font-weight:700; margin-bottom:6px;">Non-Import Rental Review</div>
+          <p class="muted" style="margin-bottom:12px;">Classifies every non-imported (manual-labeled) rental for the ${audit.customersWithManual} customer${audit.customersWithManual === 1 ? "" : "s"} who have them — genuine new activity, likely duplicates of already-imported history, zero-day financial entries, or ambiguous. Never assumes "manual" means suspicious. Read-only, no delete or repair action.</p>
+          <button class="btn btn-outline btn-block" data-goto="nonimport-review">Review Non-Import Rentals</button>
         </div>
       ` : ""}
 
@@ -4722,8 +4864,28 @@ function buildImportRecords() {
         rec._existing = DB.data.vehicles.find((v) => normalizeText(v.plate) === normalizeText(rec.plate)) || null;
       } else if (importState.type === "rentals") {
         const cust = DB.data.customers.find((c) => normalizeText(c.name) === normalizeText(rec.customerName));
+        // Duplicate identity = same customer + same real bike + overlapping dates. NEVER
+        // compare standardized bikeModel-to-bikeModel — an existing (especially canonical
+        // historical) record's bikeModel is a loyalty-tier classification label (e.g.
+        // "Aerox Standard"), not the actual bike, while a freshly imported CSV row's bike
+        // column lands in bikeModel as raw text (e.g. "GT silver 1") since this importer
+        // does no classification step. Comparing those two never matches, which is exactly
+        // why re-importing the same historical data previously created duplicate records.
+        // Compare true raw bike identity instead — existing bikeNameRaw if present, falling
+        // back to existing bikeModel only when no raw field was ever recorded for it.
         rec._existing = cust
-          ? DB.data.rentals.find((r) => r.customerId === cust.id && normalizeText(r.bikeModel) === normalizeText(rec.bikeModel) && r.startDate === rec.startDate) || null
+          ? DB.data.rentals.find((r) => {
+              if (r.customerId !== cust.id) return false;
+              const existingRawBike = r.bikeNameRaw || r.bikeModel;
+              const incomingRawBike = rec.bikeNameRaw || rec.bikeModel;
+              if (normalizeText(existingRawBike) !== normalizeText(incomingRawBike)) return false;
+              // Date/episode OVERLAP, not an exact start-date match — a canonical episode
+              // merged from multiple original rows spans a wider range than any single
+              // re-imported row's own start/end, so an exact-date requirement missed them.
+              const existingEnd = r.endDate || r.startDate;
+              const incomingEnd = rec.endDate || rec.startDate;
+              return rec.startDate <= existingEnd && incomingEnd >= r.startDate;
+            }) || null
           : null;
       }
       rec._duplicate = !!rec._existing;
@@ -4969,7 +5131,10 @@ function commitImport() {
         } else result.skipped++;
       } else {
         DB.data.rentals.push({
-          id: uid("r"), customerId: customer.id, bikeModel: rec.bikeModel, plate: rec.plate || "",
+          // bikeNameRaw is now populated on newly-imported rentals too, using the same raw
+          // text as bikeModel — this is what makes future duplicate-detection actually work
+          // for records created by THIS importer going forward (see the fixed match above).
+          id: uid("r"), customerId: customer.id, bikeModel: rec.bikeModel, bikeNameRaw: rec.bikeModel, plate: rec.plate || "",
           startDate: rec.startDate, endDate: rec.endDate || null,
           bookedDays: rec.bookedDays || 0, paidDays: rec.paidDays || 0, revenue: rec.revenue || 0,
           status: rec.endDate ? "completed" : "active",
@@ -5880,6 +6045,7 @@ function render() {
     case "data-audit": html = renderDataAuditScreen(); break;
     case "reconcile-preview": html = renderReconcilePreviewScreen(); break;
     case "sourcerow-diagnostic": html = renderSourceRowDiagnosticScreen(); break;
+    case "nonimport-review": html = renderNonImportClassificationScreen(); break;
     case "reconcile-confirm": html = renderReconcileConfirmScreen(); break;
     case "reconcile-result": html = renderReconcileResultScreen(); break;
     case "import": html = renderImportScreen(); break;
