@@ -1772,6 +1772,97 @@ function runDataAudit() {
   };
 }
 
+/* ---------------------------------------------------------------------- */
+/* PHASE 2 — RECONCILIATION PLAN (PREVIEW ONLY, STRICTLY READ-ONLY).       */
+/* Computes what a future repair WOULD do, for inspection only. Does not   */
+/* call DB.save(), does not assign to any DB.data field, does not touch    */
+/* localStorage. No button in this UI triggers a write — this function's   */
+/* only output is a plain JS object describing a plan, and a render        */
+/* function that displays it.                                              */
+/* ---------------------------------------------------------------------- */
+
+// Fields compared to detect an import-sourced record that's been edited in place since
+// import (same id, different values) — this must NEVER be silently overwritten, since it
+// likely represents a legitimate staff correction, not stale pre-merge data.
+const RECONCILE_COMPARE_FIELDS = ["startDate", "endDate", "bookedDays", "paidDays", "revenue", "bikeModel", "bikeNameRaw", "status"];
+
+function buildReconciliationPlan() {
+  const canonicalByCustomer = {};
+  IMPORTED_RENTALS.forEach((r) => {
+    (canonicalByCustomer[r.customerId] = canonicalByCustomer[r.customerId] || []).push(r);
+  });
+
+  const plans = [];
+  IMPORTED_CUSTOMERS.forEach((seedCust) => {
+    const custId = seedCust.id;
+    const canonicalRentals = canonicalByCustomer[custId] || [];
+    const canonicalVisits = canonicalRentals.length;
+    const canonicalDays = canonicalRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+    const canonicalRevenue = canonicalRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+    const canonicalById = {};
+    canonicalRentals.forEach((r) => { canonicalById[r.id] = r; });
+
+    const storedCust = DB.data.customers.find((c) => c.id === custId);
+    const displayName = storedCust ? storedCust.name : seedCust.name;
+    const storedRentals = DB.data.rentals.filter((r) => r.customerId === custId); // read-only filter
+    const storedVisits = storedRentals.length;
+    const storedDays = storedRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+    const storedRevenue = storedRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+
+    // Same mismatch definition as runDataAudit() — only a MISMATCH customer is a candidate.
+    const isMatch = storedVisits === canonicalVisits && storedDays === canonicalDays && storedRevenue === canonicalRevenue;
+    if (isMatch) return;
+
+    // A) imported historical records = id starts with "imp_r" (assigned once, at import
+    //    time, never reused for anything else). B) manually created records = everything
+    //    else (uid("r") never produces this prefix) — these are NEVER a reconciliation
+    //    candidate, full stop, regardless of SAFE/REVIEW status.
+    const manualRentals = storedRentals.filter((r) => !String(r.id).startsWith("imp_r"));
+    const importSourcedStored = storedRentals.filter((r) => String(r.id).startsWith("imp_r"));
+
+    // C) records potentially linked to rewards, or edited in place since import — both
+    // make automatic reconciliation ambiguous for this customer.
+    let editedRecordCount = 0;
+    importSourcedStored.forEach((r) => {
+      const canon = canonicalById[r.id];
+      if (canon && RECONCILE_COMPARE_FIELDS.some((f) => String(r[f] ?? "") !== String(canon[f] ?? ""))) {
+        editedRecordCount++;
+      }
+    });
+
+    const custRewards = DB.data.rewards.filter((r) => r.customerId === custId);
+    const hasRewardHistory = custRewards.some((r) => r.given || r.reserved);
+    const canonicalIds = new Set(canonicalRentals.map((r) => r.id));
+    const riskyRewards = custRewards.filter((r) => (r.given || r.reserved) && r.rentalId && !canonicalIds.has(r.rentalId));
+
+    const ambiguous = editedRecordCount > 0 || riskyRewards.length > 0;
+    const manualDays = manualRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+    const manualRevenue = manualRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+
+    plans.push({
+      customerId: custId,
+      name: displayName,
+      storedVisits, storedDays, storedRevenue,
+      afterVisits: canonicalVisits + manualRentals.length,
+      afterDays: canonicalDays + manualDays,
+      afterRevenue: canonicalRevenue + manualRevenue,
+      staleImportRecordsToReplace: importSourcedStored.length,
+      manualRentalsPreserved: manualRentals.length,
+      hasRewardHistory,
+      riskyRewardCount: riskyRewards.length,
+      editedRecordCount,
+      status: ambiguous ? "REVIEW REQUIRED" : "SAFE",
+    });
+  });
+
+  return {
+    total: plans.length,
+    safeCount: plans.filter((p) => p.status === "SAFE").length,
+    reviewCount: plans.filter((p) => p.status === "REVIEW REQUIRED").length,
+    plans: plans.sort((a, b) => Math.abs(b.storedRevenue - b.afterRevenue) - Math.abs(a.storedRevenue - a.afterRevenue)),
+  };
+}
+
 // Read-only report screen. Reached only via a Settings button — never auto-runs, never
 // wired to anything that mutates data. Rebuilding this view (e.g. tapping back and
 // re-entering) simply re-runs the same read-only comparison; it cannot drift or accumulate
@@ -1800,6 +1891,14 @@ function renderDataAuditScreen() {
         <div style="font-family:var(--font-display); font-size:22px; font-weight:800; margin-top:4px;">${audit.totalDiffRevenue > 0 ? "+" : ""}${fmtMoney(audit.totalDiffRevenue)}</div>
       </div>
 
+      ${audit.mismatching > 0 ? `
+        <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--orange-soft-line);">
+          <div style="font-weight:700; margin-bottom:6px;">Phase 2 — Reconciliation Preview</div>
+          <p class="muted" style="margin-bottom:12px;">See exactly what a repair would change for each mismatched customer, before any repair exists. This preview cannot write any data — there is no repair button yet.</p>
+          <button class="btn btn-outline btn-block" data-goto="reconcile-preview">View Reconciliation Preview</button>
+        </div>
+      ` : ""}
+
       ${audit.rows.length === 0 ? `
         <div class="empty"><div class="empty-icon">✓</div><h3>No mismatches found</h3><p>Every audited customer's stored data matches the canonical data exactly.</p></div>
       ` : audit.rows.map((r) => `
@@ -1820,6 +1919,71 @@ function renderDataAuditScreen() {
             <span>Linked rewards at risk: <b>${r.riskyRewardCount}</b></span>
           </div>
           ${riskPill(r.riskLevel)}
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+// PHASE 2 PREVIEW SCREEN — displays buildReconciliationPlan()'s output. Purely
+// informational: every value on this screen comes from a read-only computation: there is
+// no button anywhere on this screen that calls DB.save(), mutates DB.data, or touches
+// localStorage. Backup export (already-existing, already read-only DB.exportJSON()) is
+// offered here as a convenience, ready whenever a real repair step is built and approved.
+function renderReconcilePreviewScreen() {
+  const plan = buildReconciliationPlan();
+  const statusPill = (status) => status === "SAFE"
+    ? `<span class="pill pill-green">SAFE</span>`
+    : `<span class="pill pill-red">REVIEW REQUIRED</span>`;
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="data-audit">‹ Data Audit</button>
+      <h1 class="screen-title" style="margin-top:8px;">Reconciliation Preview</h1>
+      <p class="screen-sub">Preview only — shows exactly what a future repair would change. No write action exists on this screen yet.</p>
+    </header>
+    <div class="screen-body">
+      <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="report-tile"><div class="report-tile-value">${plan.total}</div><div class="report-tile-label">Mismatched Customers</div></div>
+        <div class="report-tile"><div class="report-tile-value" style="color:var(--green);">${plan.safeCount}</div><div class="report-tile-label">SAFE</div></div>
+        <div class="report-tile"><div class="report-tile-value" style="color:var(--red);">${plan.reviewCount}</div><div class="report-tile-label">Review Required</div></div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <p class="muted" style="margin-bottom:10px;">Optional: save a full backup of this device's current data now, ready for whenever a real repair step exists (this export itself changes nothing — it only downloads a copy).</p>
+        <button class="btn btn-outline btn-block" id="export-backup-now">Export Backup (JSON)</button>
+      </div>
+
+      ${plan.plans.length === 0 ? `
+        <div class="empty"><div class="empty-icon">✓</div><h3>Nothing to preview</h3><p>No mismatched customers found.</p></div>
+      ` : plan.plans.map((p) => `
+        <div class="card" style="margin-bottom:12px;">
+          <div class="card-row" style="margin-bottom:8px;">
+            <div style="font-weight:700; font-size:15px;">${escapeHtml(p.name)}</div>
+            ${statusPill(p.status)}
+          </div>
+          <div class="section-label" style="margin-top:0;">Current Stored</div>
+          <div class="grid-2" style="margin-bottom:8px;">
+            <div><div class="muted" style="font-size:11px;">Rental Visits</div><div class="mono">${p.storedVisits}</div></div>
+            <div><div class="muted" style="font-size:11px;">Paid Days</div><div class="mono">${p.storedDays}</div></div>
+            <div><div class="muted" style="font-size:11px;">Lifetime Revenue</div><div class="mono">${fmtMoney(p.storedRevenue)}</div></div>
+          </div>
+          <div class="section-label">After Reconciliation (proposed)</div>
+          <div class="grid-2" style="margin-bottom:8px;">
+            <div><div class="muted" style="font-size:11px;">Rental Visits</div><div class="mono">${p.afterVisits}</div></div>
+            <div><div class="muted" style="font-size:11px;">Paid Days</div><div class="mono">${p.afterDays}</div></div>
+            <div><div class="muted" style="font-size:11px;">Lifetime Revenue</div><div class="mono">${fmtMoney(p.afterRevenue)}</div></div>
+          </div>
+          <div class="status-line" style="margin-bottom:6px;">
+            <span>Stale import records to replace: <b>${p.staleImportRecordsToReplace}</b></span>
+            <span>Manual rentals preserved: <b>${p.manualRentalsPreserved}</b></span>
+          </div>
+          <div class="status-line" style="margin-bottom:8px;">
+            <span>Reward History: <b>${p.hasRewardHistory ? "Yes" : "No"}</b></span>
+            <span>Linked rewards at risk: <b>${p.riskyRewardCount}</b></span>
+            <span>Edited-in-place records: <b>${p.editedRecordCount}</b></span>
+          </div>
+          ${p.status === "REVIEW REQUIRED" ? `<div class="reward-note">Not proposed for automatic reconciliation — ${p.riskyRewardCount > 0 ? "a reward is linked to a rental record not present in the canonical set" : ""}${p.riskyRewardCount > 0 && p.editedRecordCount > 0 ? "; " : ""}${p.editedRecordCount > 0 ? "one or more records appear to have been edited in place since import" : ""}. Needs manual review before any change.</div>` : ""}
         </div>
       `).join("")}
     </div>
@@ -5088,6 +5252,7 @@ function render() {
     case "vehicle": html = renderVehicleDetail(); break;
     case "settings": html = renderSettings(); break;
     case "data-audit": html = renderDataAuditScreen(); break;
+    case "reconcile-preview": html = renderReconcilePreviewScreen(); break;
     case "import": html = renderImportScreen(); break;
     default: html = renderAppHome();
   }
@@ -5305,6 +5470,19 @@ function wireScreenEvents() {
     a.download = `aa-scooter-manager-backup-${todayISO()}.json`;
     a.click();
     toast("Exported");
+  });
+
+  // Same read-only export, offered from the Reconciliation Preview screen as a convenience
+  // ahead of any future repair step — this button only downloads a copy, it never mutates
+  // DB.data or localStorage.
+  const exportBackupBtn = document.getElementById("export-backup-now");
+  if (exportBackupBtn) exportBackupBtn.addEventListener("click", () => {
+    const blob = new Blob([DB.exportJSON()], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `aa-scooter-manager-backup-pre-reconcile-${todayISO()}.json`;
+    a.click();
+    toast("Backup exported");
   });
 
   const importBtn = document.getElementById("import-data");
