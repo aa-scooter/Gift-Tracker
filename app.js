@@ -53,6 +53,20 @@ const DEFAULT_QUALIFIED_RENTAL_THRESHOLD = { days: 5, revenue: 1800 };
 const RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS = 3;
 const RETURN_PRIVILEGE_MIN_REVENUE = 8000;
 
+// The operational/legacy boundary for the loyalty program's data model — deliberately
+// hardcoded, NOT staff-editable in Settings, unlike every other threshold in this app.
+// 2025 rentals still establish real customer identity/history (visible in rental history,
+// still counted in Rental Visits and "Returning Customer" recognition) but never feed
+// reward-eligibility math, Qualified Rental counts, cumulative loyalty day/revenue
+// thresholds, or Customer Value economics — those are 2026-onward operational concerns
+// only. This is a deliberate, one-time business/data-model decision for this version of
+// the app, not something that should silently recalculate every customer's eligibility if
+// changed casually — hence hardcoded rather than a Settings field.
+const LEGACY_CUTOFF_DATE = "2026-01-01";
+// Kept intentionally separate from DB.data.meta.loyaltyEffectiveDate, which answers a
+// different question (when Welcome/Journey Gift specifically became available) and stays
+// staff-editable exactly as before.
+
 // Premium Ride Experience / VIP Extra Day both use the same cycle mechanic: 180+ cumulative
 // PAID days (an active rental counts in full — no requirement to return first) since the
 // last time that specific reward was used. Lifetime paid days never reset; this does.
@@ -1728,8 +1742,10 @@ function customerFinancialSummary(customer, stats) {
 //   C. FULL CUSTOMER TOTAL — A + B, for business/display context only (e.g. Customer Value),
 //      never used to decide MATCH/MISMATCH.
 function runDataAudit() {
+  // 2025 is legacy/recognition-only — never in scope for MATCH/MISMATCH. Both sides of the
+  // comparison are restricted to 2026-01-01 onward before anything else happens.
   const canonicalByCustomer = {};
-  IMPORTED_RENTALS.forEach((r) => {
+  IMPORTED_RENTALS.filter((r) => r.startDate >= LEGACY_CUTOFF_DATE).forEach((r) => {
     (canonicalByCustomer[r.customerId] = canonicalByCustomer[r.customerId] || []).push(r);
   });
 
@@ -1748,7 +1764,9 @@ function runDataAudit() {
 
     const storedCust = DB.data.customers.find((c) => c.id === custId);
     const displayName = storedCust ? storedCust.name : seedCust.name;
-    const allStoredRentals = DB.data.rentals.filter((r) => r.customerId === custId); // read only
+    // 2025-dated live records (import-sourced or manual) never enter this screen at all —
+    // legacy history, visible on the customer's own profile, never audited here.
+    const allStoredRentals = DB.data.rentals.filter((r) => r.customerId === custId && r.startDate >= LEGACY_CUTOFF_DATE); // read only
 
     // SCOPE A — import-sourced only.
     const importRentals = allStoredRentals.filter((r) => String(r.id).startsWith("imp_r"));
@@ -1833,8 +1851,10 @@ function runDataAudit() {
 /* ---------------------------------------------------------------------- */
 
 function buildSourceRowMappingDiagnostic() {
+  // 2025 is legacy/recognition-only — excluded from source-row mapping the same way it's
+  // excluded from Data Audit.
   const canonicalByCustomer = {};
-  IMPORTED_RENTALS.forEach((r) => {
+  IMPORTED_RENTALS.filter((r) => r.startDate >= LEGACY_CUTOFF_DATE).forEach((r) => {
     (canonicalByCustomer[r.customerId] = canonicalByCustomer[r.customerId] || []).push(r);
   });
 
@@ -1843,7 +1863,7 @@ function buildSourceRowMappingDiagnostic() {
   IMPORTED_CUSTOMERS.forEach((seedCust) => {
     const custId = seedCust.id;
     const canonicalRentals = canonicalByCustomer[custId] || [];
-    const storedRentals = DB.data.rentals.filter((r) => r.customerId === custId);
+    const storedRentals = DB.data.rentals.filter((r) => r.customerId === custId && r.startDate >= LEGACY_CUTOFF_DATE);
 
     const storedVisits = storedRentals.length;
     const storedDays = storedRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
@@ -2036,8 +2056,11 @@ function renderSourceRowDiagnosticScreen() {
 const RECONCILE_COMPARE_FIELDS = ["startDate", "endDate", "bookedDays", "paidDays", "revenue", "bikeModel", "bikeNameRaw", "status"];
 
 function buildReconciliationPlan() {
+  // 2025 is legacy/recognition-only — excluded from the reconciliation plan the same way
+  // it's excluded from Data Audit and Source-Row Mapping. (This route stays disabled
+  // regardless — updated here only for internal consistency, per instruction.)
   const canonicalByCustomer = {};
-  IMPORTED_RENTALS.forEach((r) => {
+  IMPORTED_RENTALS.filter((r) => r.startDate >= LEGACY_CUTOFF_DATE).forEach((r) => {
     (canonicalByCustomer[r.customerId] = canonicalByCustomer[r.customerId] || []).push(r);
   });
 
@@ -2053,7 +2076,7 @@ function buildReconciliationPlan() {
 
     const storedCust = DB.data.customers.find((c) => c.id === custId);
     const displayName = storedCust ? storedCust.name : seedCust.name;
-    const storedRentals = DB.data.rentals.filter((r) => r.customerId === custId); // read-only filter
+    const storedRentals = DB.data.rentals.filter((r) => r.customerId === custId && r.startDate >= LEGACY_CUTOFF_DATE); // read-only filter
     const storedVisits = storedRentals.length;
     const storedDays = storedRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
     const storedRevenue = storedRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
@@ -2633,20 +2656,54 @@ function customerRentals(customerId) {
     .slice().sort((a, b) => (a.startDate < b.startDate ? 1 : -1));
 }
 
+// A reward's cycleBaselinePaidDays was, until now, always captured under the OLD all-time
+// paid-days model (2025 + 2026 combined). The new operational model only counts 2026-onward
+// days — so an old baseline is on a different scale from the new stats.paidRentalDays and
+// must be read-time normalized, never migrated/overwritten in storage. `baselineModel:
+// "operational"` is the version marker written onto every NEW baseline going forward (see
+// quickGiveOrUse / sheetMarkPremiumRideUsed / sheetEditRewardFull); its absence on an
+// existing record is exactly how a legacy baseline is safely distinguished, with zero risk
+// of a false positive, since no code before this update ever wrote that field.
+function effectiveCycleBaseline(rw, stats) {
+  if (!rw || rw.cycleBaselinePaidDays === undefined) return 0;
+  if (rw.baselineModel === "operational") return rw.cycleBaselinePaidDays; // already correct scale
+  const legacyPaidDaysBefore2026 = stats.rentals
+    .filter((r) => r.startDate < LEGACY_CUTOFF_DATE)
+    .reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+  return Math.max(0, rw.cycleBaselinePaidDays - legacyPaidDaysBefore2026);
+}
+// Same issue, same fix, for VIP Extra Day's qualified-episode counter specifically.
+function effectiveCycleBaselineQualified(rw, stats) {
+  if (!rw || rw.cycleBaselineQualifiedCount === undefined) return 0;
+  if (rw.baselineModel === "operational") return rw.cycleBaselineQualifiedCount;
+  const legacyQualifiedBefore2026 = stats.rentals
+    .filter((r) => r.startDate < LEGACY_CUTOFF_DATE && isQualifiedRental(r)).length;
+  return Math.max(0, rw.cycleBaselineQualifiedCount - legacyQualifiedBefore2026);
+}
+
 function customerStats(customer) {
   const rentals = customerRentals(customer.id);
   const current = rentals.find((r) => r.status === "active") || null;
   const completed = rentals.filter((r) => r.status === "completed");
-  const paidRentalDays = rentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+
+  // OPERATIONAL subset — 2026-01-01 onward only. This is what actually drives reward
+  // eligibility/progress and Customer Value economics. `rentals` above stays the FULL
+  // history (all years) for display and recognition purposes — a 2025 rental still shows
+  // up in rental history and still counts toward Rental Visits / "Returning Customer", but
+  // never contributes to any of the operational figures computed below.
+  const operationalRentals = rentals.filter((r) => r.startDate >= LEGACY_CUTOFF_DATE);
+
+  const paidRentalDays = operationalRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
   const lifetimeRentalDays = rentals.reduce((s, r) => {
     const end = r.endDate || todayISO();
     return s + Math.max(daysBetween(r.startDate, end), Number(r.paidDays) || 0);
   }, 0);
-  const totalRevenue = rentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+  const totalRevenue = operationalRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
   const previousBikes = [...new Set(completed.map((r) => rentalCategory(r)))];
-  // Rental Visits = every genuine rental record (rentals.length). Qualified Rentals = the
-  // subset substantial enough (by paid days or paid value) to count toward Ride Upgrade.
-  const qualifiedRentals = rentals.filter(isQualifiedRental);
+  // Rental Visits = every genuine rental record, ALL history (rentals.length) — recognition,
+  // not a reward threshold. Qualified Rentals = the operational subset substantial enough
+  // (by paid days or paid value) to count toward Ride Upgrade — 2026-onward only.
+  const qualifiedRentals = operationalRentals.filter(isQualifiedRental);
 
   return {
     rentals, current, completed,
@@ -2913,7 +2970,7 @@ function getSuggestions(customer, stats) {
       .sort((a, b) => (a.dateGiven < b.dateGiven ? -1 : 1));
 
     const lastUsed = givenPremium[givenPremium.length - 1] || null;
-    const cycleBaseline = lastUsed && lastUsed.cycleBaselinePaidDays !== undefined ? lastUsed.cycleBaselinePaidDays : 0;
+    const cycleBaseline = effectiveCycleBaseline(lastUsed, stats);
     const paidDaysSinceLast = Math.max(stats.paidRentalDays - cycleBaseline, 0);
     const enoughLoyaltyDays = paidDaysSinceLast >= PREMIUM_RIDE_MIN_PAID_DAYS;
 
@@ -2988,8 +3045,8 @@ function getSuggestions(customer, stats) {
       .sort((a, b) => (a.dateGiven < b.dateGiven ? -1 : 1));
 
     const lastUsedVip = givenVip[givenVip.length - 1] || null;
-    const cycleBaselineVip = lastUsedVip && lastUsedVip.cycleBaselinePaidDays !== undefined ? lastUsedVip.cycleBaselinePaidDays : 0;
-    const cycleBaselineQualifiedVip = lastUsedVip && lastUsedVip.cycleBaselineQualifiedCount !== undefined ? lastUsedVip.cycleBaselineQualifiedCount : 0;
+    const cycleBaselineVip = effectiveCycleBaseline(lastUsedVip, stats);
+    const cycleBaselineQualifiedVip = effectiveCycleBaselineQualified(lastUsedVip, stats);
     const paidDaysSinceLastVip = Math.max(stats.paidRentalDays - cycleBaselineVip, 0);
     const qualifiedEpisodesSinceLastVip = Math.max(stats.qualifiedRentalCount - cycleBaselineQualifiedVip, 0);
     const enoughEpisodes = qualifiedEpisodesSinceLastVip >= thresholdVip.episodes;
@@ -3829,7 +3886,7 @@ function renderCustomerValueCard(c, stats) {
     <div class="card" style="margin-bottom:14px;">
       <div class="section-label" style="margin-top:0;">Customer Value</div>
       <div class="grid-2" style="margin-bottom:10px;">
-        <div><div class="muted" style="font-size:11.5px;">Lifetime Revenue</div><div style="font-weight:700;">${fmtMoney(fin.lifetimeRevenue)}</div></div>
+        <div><div class="muted" style="font-size:11.5px;">2026 Revenue</div><div style="font-weight:700;">${fmtMoney(fin.lifetimeRevenue)}</div></div>
         <div><div class="muted" style="font-size:11.5px;">Reward Value Given</div><div style="font-weight:700;">${fmtMoney(fin.totalRewardValue)}</div></div>
         <div><div class="muted" style="font-size:11.5px;">Actual Gift Cost</div><div style="font-weight:700;">${fmtMoney(fin.actualGiftCost)}</div></div>
         <div><div class="muted" style="font-size:11.5px;">Reward-to-Revenue</div><div style="font-weight:700;">${fin.ratioPct.toFixed(1)}%</div></div>
@@ -4535,7 +4592,7 @@ function renderSettings() {
           <label>Loyalty Program Effective Date</label>
           <input type="date" id="loyalty-effective-date" value="${DB.data.meta.loyaltyEffectiveDate}" />
         </div>
-        <p class="muted">The AA Loyalty &amp; Rewards Program's official start date. Welcome Gift only applies to bookings handed over on or after this date; Journey Gift only applies to rentals that are still active, or that complete, on or after this date — a rental fully completed before it never creates a pending gift. Historical rentals before this date still count fully toward Times Rented, Qualified Rentals, Total Time with AA, Lifetime Revenue, and Ride Upgrade / Long-Term / VIP status — nothing about relationship history is lost, only physical gift obligations are not applied retroactively. Changing this date recalculates eligibility live without deleting any rental history.</p>
+        <p class="muted">The AA Loyalty &amp; Rewards Program's official start date. Welcome Gift only applies to bookings handed over on or after this date; Journey Gift only applies to rentals that are still active, or that complete, on or after this date — a rental fully completed before it never creates a pending gift. Rental Visits and "Returning Customer" recognition still reflect full history back to 2025. Qualified Rentals, Total Paid Days, 2026 Revenue, and Ride Upgrade / Long-Term / VIP progress are all based on 2026-onward activity only — 2025 rentals establish that a customer is a real returning customer, but don't feed those figures. Changing this date recalculates gift eligibility live without deleting any rental history.</p>
         <div class="btn-row" style="margin-top:12px;">
           <button class="btn btn-primary btn-sm" id="save-launch-date">Save date</button>
         </div>
@@ -4570,7 +4627,7 @@ function renderSettings() {
 
       <div class="section-title">Loyalty Health Thresholds</div>
       <div class="card">
-        <p class="muted" style="margin-bottom:12px;">Reward-to-Revenue Ratio = Total Reward Value ÷ Lifetime Revenue × 100. At or below the first number shows 🟢 Healthy, up to the second shows 🟡 Watch, above that shows 🔴 High. Individual rewards can still be manually overridden case by case via Edit / Undo.</p>
+        <p class="muted" style="margin-bottom:12px;">Reward-to-Revenue Ratio = Total Reward Value ÷ 2026 Revenue × 100. At or below the first number shows 🟢 Healthy, up to the second shows 🟡 Watch, above that shows 🔴 High. Individual rewards can still be manually overridden case by case via Edit / Undo.</p>
         <div class="field"><label>Healthy — up to (%)</label><input type="number" min="0" step="0.5" id="health-healthyMax" value="${DB.data.meta.healthThresholds.healthyMax}" /></div>
         <div class="field"><label>Watch — up to (%)</label><input type="number" min="0" step="0.5" id="health-watchMax" value="${DB.data.meta.healthThresholds.watchMax}" /></div>
         <div class="btn-row" style="margin-top:12px;">
@@ -5208,6 +5265,7 @@ function quickGiveOrUse(key, customerId, type, rentalId, upgradeTarget) {
       if ((type === "premium_ride" || type === "vip_extra_day") && preStats) {
         rw.cycleBaselinePaidDays = preStats.paidRentalDays;
         if (type === "vip_extra_day") rw.cycleBaselineQualifiedCount = preStats.qualifiedRentalCount;
+        rw.baselineModel = "operational"; // this baseline is already on the 2026-only scale
       }
 
       // Ride Upgrade: lock in whichever rate applied to this specific transition at the moment
@@ -5306,6 +5364,7 @@ function undoMarkUsed(key, customerId, type) {
       delete rw.previousStatus;
       delete rw.cycleBaselinePaidDays;
       delete rw.cycleBaselineQualifiedCount;
+      delete rw.baselineModel;
 
       // Clean up an orphaned next-cycle placeholder: same customer + type, a higher cycle
       // number in the key, never actually given. A genuinely used later cycle is never
@@ -5479,6 +5538,7 @@ function sheetMarkPremiumRideUsed(key, customerId, rentalId) {
         if (rw.actualCost === undefined || rw.actualCost === null) rw.actualCost = rw.value;
         const customer = DB.data.customers.find((c) => c.id === customerId);
         if (customer) rw.cycleBaselinePaidDays = customerStats(customer).paidRentalDays;
+        rw.baselineModel = "operational";
         if (isNew || !wasGiven) {
           rw.history.push({ field: "Marked Used", previous: "Ready", new: `Used on ${rw.bikeUsed}`, changedOn: nowDateTimeLabel() });
         }
@@ -5617,10 +5677,12 @@ function sheetEditRewardFull(key, customerId, type, rentalId) {
           const cs2 = customerStats(customer2);
           rw.cycleBaselinePaidDays = cs2.paidRentalDays;
           if (type === "vip_extra_day") rw.cycleBaselineQualifiedCount = cs2.qualifiedRentalCount;
+          rw.baselineModel = "operational";
         }
       } else if ((type === "premium_ride" || type === "vip_extra_day") && rw.given && !newGiven) {
         delete rw.cycleBaselinePaidDays;
         delete rw.cycleBaselineQualifiedCount;
+        delete rw.baselineModel;
       }
 
       rw.given = newGiven;
