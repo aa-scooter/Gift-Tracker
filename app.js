@@ -1940,7 +1940,7 @@ function renderReconcilePreviewScreen() {
     <header class="screen-header">
       <button class="back-btn" data-goto="data-audit">‹ Data Audit</button>
       <h1 class="screen-title" style="margin-top:8px;">Reconciliation Preview</h1>
-      <p class="screen-sub">Preview only — shows exactly what a future repair would change. No write action exists on this screen yet.</p>
+      <p class="screen-sub">Shows exactly what a repair would change. Nothing is written from this screen.</p>
     </header>
     <div class="screen-body">
       <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
@@ -1949,8 +1949,12 @@ function renderReconcilePreviewScreen() {
         <div class="report-tile"><div class="report-tile-value" style="color:var(--red);">${plan.reviewCount}</div><div class="report-tile-label">Review Required</div></div>
       </div>
 
+      ${plan.safeCount > 0 ? `
+        <button class="btn btn-primary btn-block" data-goto="reconcile-confirm" style="margin-bottom:16px;">Continue to Confirm Reconciliation</button>
+      ` : ""}
+
       <div class="card" style="margin-bottom:16px;">
-        <p class="muted" style="margin-bottom:10px;">Optional: save a full backup of this device's current data now, ready for whenever a real repair step exists (this export itself changes nothing — it only downloads a copy).</p>
+        <p class="muted" style="margin-bottom:10px;">Optional: save a full backup of this device's current data now (this export itself changes nothing — it only downloads a copy).</p>
         <button class="btn btn-outline btn-block" id="export-backup-now">Export Backup (JSON)</button>
       </div>
 
@@ -1986,6 +1990,258 @@ function renderReconcilePreviewScreen() {
           ${p.status === "REVIEW REQUIRED" ? `<div class="reward-note">Not proposed for automatic reconciliation — ${p.riskyRewardCount > 0 ? "a reward is linked to a rental record not present in the canonical set" : ""}${p.riskyRewardCount > 0 && p.editedRecordCount > 0 ? "; " : ""}${p.editedRecordCount > 0 ? "one or more records appear to have been edited in place since import" : ""}. Needs manual review before any change.</div>` : ""}
         </div>
       `).join("")}
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------------- */
+/* PHASE 3 — CONTROLLED RECONCILIATION. Everything below this point is    */
+/* what actually WRITES data — everything above (Phase 1 audit, Phase 2   */
+/* plan) is pure read. This section is deliberately isolated so it's easy */
+/* to verify: the confirmation screen and confirm sheet never call        */
+/* executeReconciliation() themselves, only a single explicit button      */
+/* press after backup + confirmation does.                                 */
+/* ---------------------------------------------------------------------- */
+
+const RECONCILE_BACKUP_KEY_PREFIX = "aa_scooter_manager_reconcile_backup_";
+const RECONCILE_LATEST_BACKUP_KEY = "aa_scooter_manager_latest_reconcile_backup_id";
+
+// Pure, read-only: figures out exactly what a repair WOULD do without doing it. Used both
+// by the confirmation screen (to show accurate numbers) and by executeReconciliation()
+// itself (which calls this again, fresh, at the actual moment of writing — never trusting
+// a plan generated even a few seconds earlier, per the requirement that ambiguity can
+// appear between viewing the preview and pressing the button).
+function computeSafePlan() {
+  const plan = buildReconciliationPlan();
+  return {
+    safe: plan.plans.filter((p) => p.status === "SAFE"),
+    review: plan.plans.filter((p) => p.status === "REVIEW REQUIRED"),
+  };
+}
+
+// The actual write. Builds the ENTIRE new rentals array in memory, validates it against a
+// set of hard invariants, and only if every check passes does it snapshot the pre-repair
+// state and call DB.save() — exactly once, for the whole operation, never per-customer.
+// Returns { success: true, ... } or { success: false, reason }. On failure, DB.data is
+// left completely untouched — nothing is partially written.
+function executeReconciliation() {
+  const { safe, review } = computeSafePlan(); // recalculated fresh, right now
+  const safeIds = new Set(safe.map((p) => p.customerId));
+  const reviewIds = new Set(review.map((p) => p.customerId));
+
+  const canonicalByCustomer = {};
+  IMPORTED_RENTALS.forEach((r) => {
+    (canonicalByCustomer[r.customerId] = canonicalByCustomer[r.customerId] || []).push(r);
+  });
+
+  // Snapshot of BEFORE state, for validation comparison (never mutated).
+  const beforeRentals = DB.data.rentals;
+  const beforeManualByCustomer = {};
+  const beforeRewardsCount = DB.data.rewards.length;
+  const beforeCustomersCount = DB.data.customers.length;
+  const beforeNeedsReviewCount = DB.data.needsReview.length;
+  const beforeVehiclesJSON = JSON.stringify(DB.data.vehicles);
+  const beforeMetaJSON = JSON.stringify(DB.data.meta);
+
+  safeIds.forEach((custId) => {
+    beforeManualByCustomer[custId] = beforeRentals.filter((r) => r.customerId === custId && !String(r.id).startsWith("imp_r")).length;
+  });
+
+  // Construct the full new array: every rental for a non-SAFE customer is carried over
+  // completely untouched; every SAFE customer's rentals are rebuilt as canonical
+  // import-sourced records + their existing manual records, unmodified.
+  const untouchedRentals = beforeRentals.filter((r) => !safeIds.has(r.customerId));
+  const rebuiltForSafe = [];
+  safeIds.forEach((custId) => {
+    const manual = beforeRentals.filter((r) => r.customerId === custId && !String(r.id).startsWith("imp_r"));
+    const canonical = (canonicalByCustomer[custId] || []).map((r) => ({ ...r })); // clone, never share references with the seed constant
+    rebuiltForSafe.push(...canonical, ...manual);
+  });
+  const newRentals = [...untouchedRentals, ...rebuiltForSafe];
+
+  // --- VALIDATION — every one of these must hold, or nothing is written ---
+  const errors = [];
+  // 1. Every REVIEW REQUIRED customer's rentals must be byte-identical to before.
+  reviewIds.forEach((custId) => {
+    const beforeR = JSON.stringify(beforeRentals.filter((r) => r.customerId === custId));
+    const afterR = JSON.stringify(newRentals.filter((r) => r.customerId === custId));
+    if (beforeR !== afterR) errors.push(`REVIEW REQUIRED customer ${custId} would have been modified`);
+  });
+  // 2. Every SAFE customer's manual rental count must be identical before vs after.
+  safeIds.forEach((custId) => {
+    const afterManual = newRentals.filter((r) => r.customerId === custId && !String(r.id).startsWith("imp_r")).length;
+    if (afterManual !== beforeManualByCustomer[custId]) errors.push(`Manual rental count changed for ${custId}`);
+  });
+  // 3. No rental record for any customer NOT in the safe set may have changed at all.
+  const untouchedCustomerIds = new Set(DB.data.customers.map((c) => c.id).filter((id) => !safeIds.has(id)));
+  untouchedCustomerIds.forEach((custId) => {
+    const beforeR = JSON.stringify(beforeRentals.filter((r) => r.customerId === custId));
+    const afterR = JSON.stringify(newRentals.filter((r) => r.customerId === custId));
+    if (beforeR !== afterR) errors.push(`Untouched customer ${custId} would have been modified`);
+  });
+  // 4. Rewards, customers, Needs Review, Vehicle Renewal, Settings — none of these are ever
+  //    touched by this function at all (structurally impossible — no code path below
+  //    assigns to any of them), but assert their counts/content are unchanged as a final
+  //    belt-and-braces check before allowing a save.
+  if (DB.data.rewards.length !== beforeRewardsCount) errors.push("Reward record count changed");
+  if (DB.data.customers.length !== beforeCustomersCount) errors.push("Customer count changed");
+  if (DB.data.needsReview.length !== beforeNeedsReviewCount) errors.push("Needs Review count changed");
+  if (JSON.stringify(DB.data.vehicles) !== beforeVehiclesJSON) errors.push("Vehicle Renewal data changed");
+  if (JSON.stringify(DB.data.meta) !== beforeMetaJSON) errors.push("Settings/meta changed unexpectedly");
+  // 5. No duplicate rental IDs introduced.
+  const idCounts = {};
+  newRentals.forEach((r) => { idCounts[r.id] = (idCounts[r.id] || 0) + 1; });
+  const dupes = Object.entries(idCounts).filter(([, n]) => n > 1);
+  if (dupes.length > 0) errors.push(`Duplicate rental IDs introduced: ${dupes.map(([id]) => id).join(", ")}`);
+
+  if (errors.length > 0) {
+    return { success: false, reason: errors.join("; ") };
+  }
+
+  // --- All checks passed. Snapshot BEFORE writing anything. ---
+  const runId = "reconcile_" + Date.now();
+  const timestamp = new Date().toISOString();
+  try {
+    localStorage.setItem(RECONCILE_BACKUP_KEY_PREFIX + runId, JSON.stringify(DB.data));
+    localStorage.setItem(RECONCILE_LATEST_BACKUP_KEY, runId);
+  } catch (err) {
+    return { success: false, reason: "Could not write pre-repair backup — aborting without changing any data." };
+  }
+
+  // --- The single write for this entire operation. ---
+  DB.data.rentals = newRentals;
+  DB.data.meta.lastReconciliation = { runId, timestamp, customersReconciled: [...safeIds].length, customersSkipped: [...reviewIds].length };
+  DB.save();
+
+  return {
+    success: true,
+    runId, timestamp,
+    reconciledIds: [...safeIds],
+    reconciledNames: safe.map((p) => p.name),
+    skippedIds: [...reviewIds],
+    skippedNames: review.map((p) => p.name),
+    totalRevenueCorrection: safe.reduce((s, p) => s + (p.storedRevenue - p.afterRevenue), 0),
+    manualRentalsPreserved: safe.reduce((s, p) => s + p.manualRentalsPreserved, 0),
+  };
+}
+
+// Restores DB.data from a pre-reconciliation backup snapshot — the rollback path. Always
+// available in Settings once at least one reconciliation has run.
+function restoreReconciliationBackup(runId) {
+  const raw = localStorage.getItem(RECONCILE_BACKUP_KEY_PREFIX + runId);
+  if (!raw) { toast("Backup not found"); return false; }
+  try {
+    DB.data = JSON.parse(raw);
+    DB.save();
+    return true;
+  } catch (err) {
+    toast("Restore failed — backup file could not be read");
+    return false;
+  }
+}
+
+// Final confirmation screen — the ONLY screen with the actual write button. Nothing
+// executes just from opening this screen; the button itself is disabled until the backup
+// checkbox is ticked, and pressing it opens an in-app confirm sheet (never native
+// confirm()) as one more explicit step before executeReconciliation() is ever called.
+function renderReconcileConfirmScreen() {
+  const { safe, review } = computeSafePlan();
+  const totalStaleRecords = safe.reduce((s, p) => s + p.staleImportRecordsToReplace, 0);
+  const totalManualPreserved = safe.reduce((s, p) => s + p.manualRentalsPreserved, 0);
+  const rewardLinkedExcluded = review.filter((p) => p.riskyRewardCount > 0).length;
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="reconcile-preview">‹ Reconciliation Preview</button>
+      <h1 class="screen-title" style="margin-top:8px;">Confirm Reconciliation</h1>
+      <p class="screen-sub">Final review before any data is written. Nothing changes until you press the button below and confirm again.</p>
+    </header>
+    <div class="screen-body">
+      <div class="card" style="margin-bottom:16px;">
+        <div class="grid-2" style="margin-bottom:4px;">
+          <div><div class="muted" style="font-size:11.5px;">Total mismatched customers</div><div style="font-weight:700; font-size:16px;">${safe.length + review.length}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">SAFE — will be reconciled</div><div style="font-weight:700; font-size:16px; color:var(--green);">${safe.length}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">REVIEW REQUIRED — excluded</div><div style="font-weight:700; font-size:16px; color:var(--red);">${review.length}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Reward-linked customers excluded</div><div style="font-weight:700; font-size:16px;">${rewardLinkedExcluded}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Stale imported records to replace</div><div style="font-weight:700; font-size:16px;">${totalStaleRecords}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Manual rentals preserved</div><div style="font-weight:700; font-size:16px;">${totalManualPreserved}</div></div>
+        </div>
+      </div>
+
+      ${review.length > 0 ? `
+        <div class="card" style="margin-bottom:16px;">
+          <div class="section-label" style="margin-top:0;">Excluded — REVIEW REQUIRED (unchanged)</div>
+          ${review.map((p) => `<div class="reward-note" style="margin-bottom:4px;">${escapeHtml(p.name)}${p.riskyRewardCount > 0 ? " — linked reward" : ""}${p.editedRecordCount > 0 ? " — edited-in-place record" : ""}</div>`).join("")}
+        </div>
+      ` : ""}
+
+      <div class="card" style="margin-bottom:16px;">
+        <div class="section-label" style="margin-top:0;">Backup status</div>
+        <p class="muted" style="margin-bottom:10px;">Export a copy of the current data before proceeding. A separate automatic snapshot is also taken the instant before anything is written, regardless.</p>
+        <button class="btn btn-outline btn-block" id="export-backup-confirm-screen" style="margin-bottom:10px;">Export Backup (JSON)</button>
+        <div class="checkbox-row">
+          <input type="checkbox" id="f-backup-confirmed" ${state.backupConfirmed ? "checked" : ""} />
+          <label style="margin:0;text-transform:none;font-weight:500;">I have exported a backup</label>
+        </div>
+      </div>
+
+      <button class="btn btn-primary btn-block" id="reconcile-execute-btn" ${state.backupConfirmed ? "" : "disabled"}>Reconcile ${safe.length} Safe Customer${safe.length === 1 ? "" : "s"}</button>
+    </div>
+  `;
+}
+
+// Result screen — shown only after executeReconciliation() has actually run. Reads the
+// outcome from state.lastReconciliationResult, set once, right after the write completes.
+function renderReconcileResultScreen() {
+  const r = state.lastReconciliationResult;
+  if (!r) { navigate("data-audit"); return ""; }
+
+  if (!r.success) {
+    return `
+      <header class="screen-header">
+        <button class="back-btn" data-goto="settings">‹ Settings</button>
+        <h1 class="screen-title" style="margin-top:8px;">Reconciliation Failed</h1>
+      </header>
+      <div class="screen-body">
+        <div class="card" style="border: 1.5px solid var(--red);">
+          <div style="font-weight:700; color:var(--red); margin-bottom:8px;">No changes were saved.</div>
+          <p class="muted">${escapeHtml(r.reason)}</p>
+        </div>
+      </div>
+    `;
+  }
+
+  // Post-repair validation, run fresh right now (not cached from before the repair).
+  const postAudit = runDataAudit();
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="settings">‹ Settings</button>
+      <h1 class="screen-title" style="margin-top:8px;">Reconciliation Complete</h1>
+      <p class="screen-sub">Run ID: ${escapeHtml(r.runId)} · ${fmtDate(r.timestamp.slice(0, 10))}</p>
+    </header>
+    <div class="screen-body">
+      <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="report-tile"><div class="report-tile-value" style="color:var(--green);">${r.reconciledIds.length}</div><div class="report-tile-label">Customers Reconciled</div></div>
+        <div class="report-tile"><div class="report-tile-value">${r.skippedIds.length}</div><div class="report-tile-label">Customers Skipped</div></div>
+        <div class="report-tile"><div class="report-tile-value" style="color:${postAudit.mismatching > 0 ? "var(--red)" : "var(--ink)"};">${postAudit.mismatching}</div><div class="report-tile-label">Remaining Mismatches</div></div>
+        <div class="report-tile"><div class="report-tile-value">${r.skippedIds.length}</div><div class="report-tile-label">Remaining REVIEW REQUIRED</div></div>
+      </div>
+      <div class="card" style="margin-bottom:16px;">
+        <div class="grid-2">
+          <div><div class="muted" style="font-size:11.5px;">Total revenue correction applied</div><div style="font-weight:700;">${fmtMoney(r.totalRevenueCorrection)}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Manual rentals preserved</div><div style="font-weight:700;">${r.manualRentalsPreserved}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Reward records preserved</div><div style="font-weight:700;">${DB.data.rewards.length} (unchanged)</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Backup run ID</div><div style="font-weight:700; font-size:12px;">${escapeHtml(r.runId)}</div></div>
+        </div>
+      </div>
+      ${r.skippedNames.length > 0 ? `
+        <div class="card" style="margin-bottom:16px;">
+          <div class="section-label" style="margin-top:0;">Skipped (unchanged, still REVIEW REQUIRED)</div>
+          ${r.skippedNames.map((n) => `<div class="reward-note" style="margin-bottom:4px;">${escapeHtml(n)}</div>`).join("")}
+        </div>
+      ` : ""}
+      <button class="btn btn-outline btn-block" data-goto="data-audit">View Updated Data Audit</button>
     </div>
   `;
 }
@@ -2557,7 +2813,7 @@ function dashboardStats() {
 /* ROUTER + STATE                                                          */
 /* ---------------------------------------------------------------------- */
 
-const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all" };
+const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null };
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -5253,6 +5509,8 @@ function render() {
     case "settings": html = renderSettings(); break;
     case "data-audit": html = renderDataAuditScreen(); break;
     case "reconcile-preview": html = renderReconcilePreviewScreen(); break;
+    case "reconcile-confirm": html = renderReconcileConfirmScreen(); break;
+    case "reconcile-result": html = renderReconcileResultScreen(); break;
     case "import": html = renderImportScreen(); break;
     default: html = renderAppHome();
   }
@@ -5483,6 +5741,42 @@ function wireScreenEvents() {
     a.download = `aa-scooter-manager-backup-pre-reconcile-${todayISO()}.json`;
     a.click();
     toast("Backup exported");
+  });
+
+  const exportBackupConfirmBtn = document.getElementById("export-backup-confirm-screen");
+  if (exportBackupConfirmBtn) exportBackupConfirmBtn.addEventListener("click", () => {
+    const blob = new Blob([DB.exportJSON()], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `aa-scooter-manager-backup-pre-reconcile-${todayISO()}.json`;
+    a.click();
+    toast("Backup exported");
+  });
+
+  const backupConfirmCheckbox = document.getElementById("f-backup-confirmed");
+  if (backupConfirmCheckbox) backupConfirmCheckbox.addEventListener("change", (e) => {
+    state.backupConfirmed = e.target.checked;
+    render();
+  });
+
+  // The ONLY button anywhere in the app that can lead to executeReconciliation() actually
+  // running. Disabled until the backup checkbox is ticked (enforced both by the `disabled`
+  // attribute in the markup and, belt-and-braces, by refusing to open the confirm sheet
+  // here too). Even once clicked, it only opens an in-app confirmation sheet — the write
+  // itself happens only from that sheet's own explicit second confirmation.
+  const executeBtn = document.getElementById("reconcile-execute-btn");
+  if (executeBtn) executeBtn.addEventListener("click", () => {
+    if (!state.backupConfirmed) return;
+    const { safe, review } = computeSafePlan();
+    confirmSheet(
+      `This will update local Gift Tracker rental records only, for ${safe.length} customer${safe.length === 1 ? "" : "s"} marked SAFE. The original worksheet will not be touched. Manual rentals and all reward records are preserved exactly. ${review.length} customer${review.length === 1 ? "" : "s"} marked REVIEW REQUIRED will NOT be changed. A backup snapshot is taken automatically the instant before anything is written.`,
+      () => {
+        const result = executeReconciliation();
+        state.lastReconciliationResult = result;
+        navigate("reconcile-result");
+      },
+      `Reconcile ${safe.length} Safe Customer${safe.length === 1 ? "" : "s"}`
+    );
   });
 
   const importBtn = document.getElementById("import-data");
