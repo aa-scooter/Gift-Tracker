@@ -2823,36 +2823,79 @@ function effectiveCycleBaselineQualified(rw, stats) {
   return Math.max(0, rw.cycleBaselineQualifiedCount - legacyQualifiedBefore2026);
 }
 
+// ============================================================================
+// THE ONE CENTRALIZED OPERATIONAL MODEL — every screen/function that needs a
+// customer's 2026 operational activity goes through customerStats() below, which in turn
+// derives every rental's contribution from THIS single function. No screen independently
+// filters or sums DB.data.rentals for operational purposes — that was the exact bug this
+// replaces (a startDate-only filter that zeroed out any customer whose rental started in
+// 2025 but is still active/ongoing into 2026, like a long-term monthly renter).
+//
+// Three distinct cases per rental, matching the approved design exactly:
+//   1. Rental fully completed before 2026-01-01 → archive only, contributes nothing.
+//   2. Rental starts before 2026-01-01 but overlaps 2026 (still active, or ended in 2026)
+//      → counts as exactly ONE operational visit, contributes ONLY the paid days that fall
+//      within 2026 (calendar-day overlap, clipped to today if still ongoing), and
+//      contributes ZERO revenue — this app has no reliable way to allocate a legacy
+//      boundary-spanning payment between 2025 and 2026, and this is explicitly NOT an
+//      accounting system, so it doesn't try.
+//   3. Rental starts on/after 2026-01-01 → counts normally: recorded paidDays, recorded
+//      revenue, one visit. No clipping needed, nothing to guess.
+// Never mutates the rental record — purely a derived, read-only computation.
+function operationalContribution(rental, todayIso) {
+  const end = rental.endDate || todayIso; // ongoing -> extends through today
+  if (end < LEGACY_CUTOFF_DATE) return null; // archive only
+  const isBoundarySpanning = rental.startDate < LEGACY_CUTOFF_DATE;
+  if (isBoundarySpanning) {
+    const overlapStart = LEGACY_CUTOFF_DATE;
+    const overlapEnd = end > todayIso ? todayIso : end;
+    const days = Math.max(daysBetween(overlapStart, overlapEnd), 0);
+    return { visits: 1, days, revenue: 0, isBoundarySpanning: true };
+  }
+  return { visits: 1, days: Number(rental.paidDays) || 0, revenue: Number(rental.revenue) || 0, isBoundarySpanning: false };
+}
+
 function customerStats(customer) {
   const rentals = customerRentals(customer.id);
   const current = rentals.find((r) => r.status === "active") || null;
   const completed = rentals.filter((r) => r.status === "completed");
 
-  // OPERATIONAL subset — 2026-01-01 onward only. This is what actually drives reward
-  // eligibility/progress and Customer Value economics. `rentals` above stays the FULL
-  // history (all years) for display and recognition purposes — a 2025 rental still shows
-  // up in rental history and still counts toward Rental Visits / "Returning Customer", but
-  // never contributes to any of the operational figures computed below.
-  const operationalRentals = rentals.filter((r) => r.startDate >= LEGACY_CUTOFF_DATE);
+  // ONE pass, through the ONE centralized helper, per the approved overlap model. Per-rental
+  // operational contribution (visits/days/revenue) is computed once and summed here — this
+  // is the single source every operational figure below (and therefore every downstream
+  // screen) derives from. `rentals` above stays the FULL history for display purposes — a
+  // 2025-only (archived) rental still shows up in rental history, just contributes nothing
+  // operationally; a boundary-spanning rental (like an ongoing stay that started in 2025)
+  // correctly counts as one visit with its 2026-only days, per the approved design.
+  const todayIso = todayISO();
+  let rentalCount = 0, paidRentalDays = 0, totalRevenue = 0, qualifiedRentalCount = 0;
+  let boundarySpanningCount = 0;
+  rentals.forEach((r) => {
+    const contrib = operationalContribution(r, todayIso);
+    if (!contrib) return; // archive-only, zero operational contribution
+    rentalCount += contrib.visits;
+    paidRentalDays += contrib.days;
+    totalRevenue += contrib.revenue;
+    if (contrib.isBoundarySpanning) boundarySpanningCount++;
+    // Qualified Rental check runs against the SAME clipped operational values (days/revenue)
+    // as everything else — never against the raw record's all-time fields — so a
+    // boundary-spanning rental with zero operational revenue can still qualify purely on its
+    // genuine 2026 day count, exactly matching how every other operational figure works.
+    const t = qualifiedRentalThreshold(rentalCategory(r));
+    if (contrib.days >= t.days || contrib.revenue >= t.revenue) qualifiedRentalCount++;
+  });
 
-  const paidRentalDays = operationalRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
   const lifetimeRentalDays = rentals.reduce((s, r) => {
-    const end = r.endDate || todayISO();
+    const end = r.endDate || todayIso;
     return s + Math.max(daysBetween(r.startDate, end), Number(r.paidDays) || 0);
   }, 0);
-  const totalRevenue = operationalRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
   const previousBikes = [...new Set(completed.map((r) => rentalCategory(r)))];
-  // Rental Visits = every genuine rental record, ALL history (rentals.length) — recognition,
-  // not a reward threshold. Qualified Rentals = the operational subset substantial enough
-  // (by paid days or paid value) to count toward Ride Upgrade — 2026-onward only.
-  const qualifiedRentals = operationalRentals.filter(isQualifiedRental);
 
   return {
     rentals, current, completed,
-    rentalCount: rentals.length,
-    qualifiedRentalCount: qualifiedRentals.length,
+    rentalCount, qualifiedRentalCount,
     paidRentalDays, lifetimeRentalDays, totalRevenue,
-    previousBikes,
+    previousBikes, boundarySpanningCount,
   };
 }
 
