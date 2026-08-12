@@ -1211,8 +1211,14 @@ const DB = {
     // rental visit here. bookedDays/paidDays for imported rows are both approximated from
     // the episode's actual date span, since the source spreadsheet only ever recorded one
     // start/end pair per row (no separate "booked vs actual" distinction pre-app).
-    const customers = IMPORTED_CUSTOMERS;
-    const rentals = IMPORTED_RENTALS;
+    // DEEP CLONED, never a direct reference — DB.data must never share a mutable array or
+    // object with the canonical IMPORTED_CUSTOMERS/IMPORTED_RENTALS constants. Without this,
+    // pushing or editing a live rental/customer on a freshly-seeded device would silently
+    // mutate the "canonical" reference itself for the rest of that session (confirmed and
+    // proven directly before this fix). sourceRows arrays specifically need a real deep
+    // clone, not a shallow array copy, since a shallow copy still shares those nested arrays.
+    const customers = JSON.parse(JSON.stringify(IMPORTED_CUSTOMERS));
+    const rentals = JSON.parse(JSON.stringify(IMPORTED_RENTALS));
 
     const vehicles = [
       { id: "v1", bikeName: "Aerox Green", modelYear: 2016, plate: "1 กจ 9669 ลำพูน", porRorBorExpiryDate: "2026-10-27", taxExpiryDate: "2026-10-27", taxOverduePending: false, renewalNote: "", taxHistory: [], porRorBorHistory: [], currentKm: 0, nextServiceKm: 3000, status: "active", notes: "" },
@@ -1713,6 +1719,14 @@ function customerFinancialSummary(customer, stats) {
 /* localStorage in any way — it only reads and reports.                    */
 /* ---------------------------------------------------------------------- */
 
+// Three clearly separated scopes, per explicit design correction:
+//   A. IMPORTED HISTORY — live import-sourced records (id starts "imp_r") vs canonical
+//      IMPORTED_RENTALS. This is the ONLY comparison that determines mismatch status.
+//   B. MANUAL RENTALS — legitimate later business records (never "imp_r" prefixed). Shown
+//      separately, NEVER compared to canonical, NEVER counted toward mismatch, NEVER a
+//      reconciliation candidate.
+//   C. FULL CUSTOMER TOTAL — A + B, for business/display context only (e.g. Customer Value),
+//      never used to decide MATCH/MISMATCH.
 function runDataAudit() {
   const canonicalByCustomer = {};
   IMPORTED_RENTALS.forEach((r) => {
@@ -1720,6 +1734,10 @@ function runDataAudit() {
   });
 
   const rows = [];
+  let importMatchCount = 0, importMismatchCount = 0;
+  let customersWithManual = 0, mismatchOnlyBecauseOfManual = 0;
+  let importDiffRevenueTotal = 0, manualRevenueTotal = 0;
+
   IMPORTED_CUSTOMERS.forEach((seedCust) => {
     const custId = seedCust.id;
     const canonicalRentals = canonicalByCustomer[custId] || [];
@@ -1728,32 +1746,57 @@ function runDataAudit() {
     const canonicalRevenue = canonicalRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
     const canonicalIds = new Set(canonicalRentals.map((r) => r.id));
 
-    // "Stored" = whatever is CURRENTLY loaded into DB.data for this customer right now, in
-    // THIS browser — read only, via a plain .filter(), never written back anywhere.
     const storedCust = DB.data.customers.find((c) => c.id === custId);
     const displayName = storedCust ? storedCust.name : seedCust.name;
-    const storedRentals = DB.data.rentals.filter((r) => r.customerId === custId);
-    const storedVisits = storedRentals.length;
-    const storedDays = storedRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
-    const storedRevenue = storedRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+    const allStoredRentals = DB.data.rentals.filter((r) => r.customerId === custId); // read only
 
-    const isMatch = storedVisits === canonicalVisits && storedDays === canonicalDays && storedRevenue === canonicalRevenue;
-    if (isMatch) return; // report only mismatches, per the requested format
+    // SCOPE A — import-sourced only.
+    const importRentals = allStoredRentals.filter((r) => String(r.id).startsWith("imp_r"));
+    const importVisits = importRentals.length;
+    const importDays = importRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+    const importRevenue = importRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+    const importStatus = (importVisits === canonicalVisits && importDays === canonicalDays && importRevenue === canonicalRevenue) ? "MATCH" : "MISMATCH";
+
+    // SCOPE B — manual rentals. Legitimate, later, import-independent. Never compared to
+    // canonical, never contributes to mismatch status, never a reconciliation candidate.
+    const manualRentals = allStoredRentals.filter((r) => !String(r.id).startsWith("imp_r"));
+    const manualVisits = manualRentals.length;
+    const manualDays = manualRentals.reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
+    const manualRevenue = manualRentals.reduce((s, r) => s + (Number(r.revenue) || 0), 0);
+
+    // SCOPE C — full total, for display/business context (e.g. Customer Value), never used
+    // to determine mismatch.
+    const totalVisits = importVisits + manualVisits;
+    const totalDays = importDays + manualDays;
+    const totalRevenue = importRevenue + manualRevenue;
+
+    if (manualVisits > 0) customersWithManual++;
+    if (importStatus === "MATCH") importMatchCount++; else importMismatchCount++;
+    manualRevenueTotal += manualRevenue;
+
+    // For reporting only: would the OLD (flawed) full-total-vs-canonical comparison have
+    // flagged this customer, even though their import-sourced history is actually correct?
+    const oldStyleWasMismatch = totalVisits !== canonicalVisits || totalDays !== canonicalDays || totalRevenue !== canonicalRevenue;
+    if (importStatus === "MATCH" && oldStyleWasMismatch) mismatchOnlyBecauseOfManual++;
+
+    if (importStatus === "MISMATCH") importDiffRevenueTotal += (importRevenue - canonicalRevenue);
+
+    // Only report rows that are genuinely interesting: an import mismatch, or a customer
+    // carrying manual rentals worth showing separately.
+    if (importStatus === "MATCH" && manualVisits === 0) return;
 
     const custRewards = DB.data.rewards.filter((r) => r.customerId === custId);
     const hasRewardHistory = custRewards.some((r) => r.given || r.reserved);
-    // A reward is "at risk" if it's already given/reserved AND it points at a specific
-    // rental record that does NOT exist in the canonical set — meaning a blind swap to
-    // canonical data would orphan that reward's link in any future repair.
     const riskyRewards = custRewards.filter((r) => (r.given || r.reserved) && r.rentalId && !canonicalIds.has(r.rentalId));
 
     rows.push({
       name: displayName,
-      storedVisits, canonicalVisits,
-      storedDays, canonicalDays,
-      storedRevenue, canonicalRevenue,
-      diffRevenue: storedRevenue - canonicalRevenue,
-      excessRecords: storedVisits - canonicalVisits,
+      importVisits, importDays, importRevenue,
+      canonicalVisits, canonicalDays, canonicalRevenue,
+      importStatus,
+      importDiffRevenue: importRevenue - canonicalRevenue,
+      manualVisits, manualDays, manualRevenue,
+      totalVisits, totalDays, totalRevenue,
       hasRewardHistory,
       riskyRewardCount: riskyRewards.length,
       riskLevel: riskyRewards.length > 0 ? "NEEDS REVIEW" : "SAFE TO RECONCILE",
@@ -1761,14 +1804,18 @@ function runDataAudit() {
   });
 
   const totalAudited = IMPORTED_CUSTOMERS.length;
-  const mismatching = rows.length;
-  const matching = totalAudited - mismatching;
-  const totalDiffRevenue = rows.reduce((s, r) => s + r.diffRevenue, 0);
-  const riskCustomers = rows.filter((r) => r.riskyRewardCount > 0).length;
 
   return {
-    totalAudited, matching, mismatching, totalDiffRevenue, riskCustomers,
-    rows: rows.sort((a, b) => Math.abs(b.diffRevenue) - Math.abs(a.diffRevenue)),
+    totalAudited,
+    importMatchCount, importMismatchCount,
+    customersWithManual, mismatchOnlyBecauseOfManual,
+    importDiffRevenueTotal, manualRevenueTotal,
+    // Legacy field names kept so nothing else that reads runDataAudit()'s summary breaks —
+    // "mismatching"/"matching" now mean import-history mismatch/match specifically.
+    matching: importMatchCount, mismatching: importMismatchCount,
+    totalDiffRevenue: importDiffRevenueTotal,
+    riskCustomers: rows.filter((r) => r.riskyRewardCount > 0).length,
+    rows: rows.sort((a, b) => Math.abs((b.importDiffRevenue || 0)) - Math.abs((a.importDiffRevenue || 0))),
   };
 }
 
@@ -2079,56 +2126,71 @@ function renderDataAuditScreen() {
     <header class="screen-header">
       <button class="back-btn" data-goto="settings">‹ Settings</button>
       <h1 class="screen-title" style="margin-top:8px;">Data Audit</h1>
-      <p class="screen-sub">Read-only — compares data currently stored on this device against the canonical data built into this version of the app. Nothing here can change any data.</p>
+      <p class="screen-sub">Read-only. Imported-history mismatch is judged ONLY against live import-sourced records — manual rentals are shown separately and never count toward a mismatch.</p>
     </header>
     <div class="screen-body">
       <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
         <div class="report-tile"><div class="report-tile-value">${audit.totalAudited}</div><div class="report-tile-label">Customers Audited</div></div>
-        <div class="report-tile"><div class="report-tile-value">${audit.matching}</div><div class="report-tile-label">Matching</div></div>
-        <div class="report-tile"><div class="report-tile-value" style="color:${audit.mismatching > 0 ? "var(--red)" : "var(--ink)"};">${audit.mismatching}</div><div class="report-tile-label">Mismatching</div></div>
-        <div class="report-tile"><div class="report-tile-value">${audit.riskCustomers}</div><div class="report-tile-label">Reward-Link Risk</div></div>
+        <div class="report-tile"><div class="report-tile-value">${audit.importMatchCount}</div><div class="report-tile-label">Imported History MATCH</div></div>
+        <div class="report-tile"><div class="report-tile-value" style="color:${audit.importMismatchCount > 0 ? "var(--red)" : "var(--ink)"};">${audit.importMismatchCount}</div><div class="report-tile-label">Imported History MISMATCH</div></div>
+        <div class="report-tile"><div class="report-tile-value">${audit.customersWithManual}</div><div class="report-tile-label">Customers with Manual Rentals</div></div>
       </div>
       <div class="card" style="margin-bottom:16px;">
-        <div class="muted" style="font-size:12.5px;">Total excess/short revenue caused by stale records</div>
-        <div style="font-family:var(--font-display); font-size:22px; font-weight:800; margin-top:4px;">${audit.totalDiffRevenue > 0 ? "+" : ""}${fmtMoney(audit.totalDiffRevenue)}</div>
+        <div class="grid-2">
+          <div><div class="muted" style="font-size:11.5px;">Mismatched only because of manual rentals (import history was actually fine)</div><div style="font-weight:700;">${audit.mismatchOnlyBecauseOfManual}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Genuine imported-history mismatches remaining</div><div style="font-weight:700; color:${audit.importMismatchCount > 0 ? "var(--red)" : "var(--ink)"};">${audit.importMismatchCount}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Genuine imported-history revenue discrepancy</div><div style="font-weight:700;">${audit.importDiffRevenueTotal > 0 ? "+" : ""}${fmtMoney(audit.importDiffRevenueTotal)}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Legitimate manual-rental revenue (never a mismatch)</div><div style="font-weight:700;">${fmtMoney(audit.manualRevenueTotal)}</div></div>
+        </div>
       </div>
 
-      ${audit.mismatching > 0 ? `
+      ${audit.importMismatchCount > 0 ? `
         <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--orange-soft-line);">
           <div style="font-weight:700; margin-bottom:6px;">Source-Row Mapping Diagnostic</div>
-          <p class="muted" style="margin-bottom:12px;">Verifies whether every mismatched customer's live records can be deterministically matched to canonical episodes by source spreadsheet row — never by technical rental ID. Read-only.</p>
+          <p class="muted" style="margin-bottom:12px;">Verifies whether every genuinely mismatched customer's live import-sourced records can be deterministically matched to canonical episodes by source spreadsheet row — never by technical rental ID. Read-only.</p>
           <button class="btn btn-outline btn-block" data-goto="sourcerow-diagnostic">View Source-Row Mapping</button>
         </div>
       ` : ""}
 
-      ${audit.mismatching > 0 ? `
-        <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--orange-soft-line);">
-          <div style="font-weight:700; margin-bottom:6px;">Phase 2 — Reconciliation Preview</div>
-          <p class="muted" style="margin-bottom:12px;">See exactly what a repair would change for each mismatched customer, before any repair exists. This preview cannot write any data — there is no repair button yet.</p>
-          <button class="btn btn-outline btn-block" data-goto="reconcile-preview">View Reconciliation Preview</button>
+      ${audit.importMismatchCount > 0 ? `
+        <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--red);">
+          <div style="font-weight:700; margin-bottom:6px;">Phase 2 — Reconciliation Preview (Temporarily Disabled)</div>
+          <p class="muted">The reconciliation model is being reworked following the manual-rentals audit correction. This path is disabled for now so the old model can't run by accident — it will be re-enabled once the updated model is approved.</p>
         </div>
       ` : ""}
 
       ${audit.rows.length === 0 ? `
-        <div class="empty"><div class="empty-icon">✓</div><h3>No mismatches found</h3><p>Every audited customer's stored data matches the canonical data exactly.</p></div>
+        <div class="empty"><div class="empty-icon">✓</div><h3>No mismatches found</h3><p>Every audited customer's imported history matches the canonical data exactly.</p></div>
       ` : audit.rows.map((r) => `
         <div class="card" style="margin-bottom:12px;">
           <div class="card-row" style="margin-bottom:8px;">
             <div style="font-weight:700; font-size:15px;">${escapeHtml(r.name)}</div>
-            <span class="pill pill-red">MISMATCH</span>
+            <span class="pill ${r.importStatus === "MATCH" ? "pill-green" : "pill-red"}">${r.importStatus === "MATCH" ? "IMPORT MATCH" : "IMPORT MISMATCH"}</span>
           </div>
-          <div class="grid-2" style="margin-bottom:8px;">
-            <div><div class="muted" style="font-size:11px;">Rental Visits</div><div class="mono">${r.storedVisits} → ${r.canonicalVisits}</div></div>
-            <div><div class="muted" style="font-size:11px;">Paid Days</div><div class="mono">${r.storedDays} → ${r.canonicalDays}</div></div>
-            <div><div class="muted" style="font-size:11px;">Lifetime Revenue</div><div class="mono">${fmtMoney(r.storedRevenue)} → ${fmtMoney(r.canonicalRevenue)}</div></div>
-            <div><div class="muted" style="font-size:11px;">Difference</div><div class="mono" style="color:${r.diffRevenue !== 0 ? "var(--red)" : "inherit"};">${r.diffRevenue > 0 ? "+" : ""}${fmtMoney(r.diffRevenue)}</div></div>
+
+          <div class="section-label" style="margin-top:0;">Imported History</div>
+          <div class="grid-2" style="margin-bottom:6px;">
+            <div><div class="muted" style="font-size:11px;">Live Imported</div><div class="mono">${r.importVisits}v / ${r.importDays}d / ${fmtMoney(r.importRevenue)}</div></div>
+            <div><div class="muted" style="font-size:11px;">Canonical</div><div class="mono">${r.canonicalVisits}v / ${r.canonicalDays}d / ${fmtMoney(r.canonicalRevenue)}</div></div>
           </div>
+          ${r.importStatus === "MISMATCH" ? `<div class="reward-note" style="margin-bottom:8px; color:var(--red);">Difference: ${r.importDiffRevenue > 0 ? "+" : ""}${fmtMoney(r.importDiffRevenue)}</div>` : ""}
+
+          ${r.manualVisits > 0 ? `
+            <div class="section-label">Manual Rentals</div>
+            <div class="reward-note" style="margin-bottom:8px;">
+              ${r.manualVisits} visit${r.manualVisits === 1 ? "" : "s"} · ${r.manualDays} paid days · ${fmtMoney(r.manualRevenue)}<br/>
+              <span class="muted">Legitimate manual history — excluded from canonical audit</span>
+            </div>
+          ` : ""}
+
+          <div class="section-label">Full Customer Total</div>
+          <div class="reward-note" style="margin-bottom:8px;">${r.totalVisits} visits · ${r.totalDays} paid days · ${fmtMoney(r.totalRevenue)} lifetime revenue</div>
+
           <div class="status-line" style="margin-bottom:8px;">
-            <span>Excess/short records: <b>${r.excessRecords > 0 ? "+" : ""}${r.excessRecords}</b></span>
             <span>Reward History: <b>${r.hasRewardHistory ? "Yes" : "No"}</b></span>
             <span>Linked rewards at risk: <b>${r.riskyRewardCount}</b></span>
           </div>
-          ${riskPill(r.riskLevel)}
+          ${r.importStatus === "MISMATCH" ? riskPill(r.riskLevel) : ""}
         </div>
       `).join("")}
     </div>
@@ -2372,6 +2434,25 @@ function restoreReconciliationBackup(runId) {
 // checkbox is ticked, and pressing it opens an in-app confirm sheet (never native
 // confirm()) as one more explicit step before executeReconciliation() is ever called.
 function renderReconcileConfirmScreen() {
+  // TEMPORARILY DISABLED — the reconciliation model is being reworked following the
+  // manual-rentals audit correction. This hard guard replaces the entire screen (including
+  // the execute button) with a plain notice, so this path cannot run even if reached
+  // directly by route/bookmark rather than through the (already-removed) Data Audit link.
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="data-audit">‹ Data Audit</button>
+      <h1 class="screen-title" style="margin-top:8px;">Reconciliation Temporarily Disabled</h1>
+    </header>
+    <div class="screen-body">
+      <div class="card" style="border: 1.5px solid var(--red);">
+        <div style="font-weight:700; color:var(--red); margin-bottom:8px;">This step is disabled for now.</div>
+        <p class="muted">The reconciliation model is being reworked following the manual-rentals audit correction. No repair can run from here until the updated model is reviewed and re-enabled.</p>
+      </div>
+    </div>
+  `;
+}
+
+function renderReconcileConfirmScreen_DISABLED_ORIGINAL() {
   const { safe, review } = computeSafePlan();
   const totalStaleRecords = safe.reduce((s, p) => s + p.staleImportRecordsToReplace, 0);
   const totalManualPreserved = safe.reduce((s, p) => s + p.manualRentalsPreserved, 0);
