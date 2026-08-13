@@ -2790,6 +2790,14 @@ function buildManagerSyncPlan(managerData) {
     // Step A — already synced from this exact Manager row before?
     const existingByRow = DB.data.rentals.find((r) => r.mgrRowNumber === parsed.rowNumber);
     if (existingByRow) {
+      // A proposed completed -> active reversal never auto-applies, regardless of what else
+      // changed on the row — reopening a rental Gift Tracker already has as finished is
+      // exactly the kind of change that needs a person to confirm Manager is genuinely the
+      // newer source of truth here, not a stale/blank situation field.
+      if (existingByRow.status === "completed" && parsed.status === "active") {
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Would change this rental's status from "completed" back to "active" (reopen) — not applied automatically. Confirm Manager is genuinely newer before doing this manually.` });
+        return;
+      }
       const changed = existingByRow.startDate !== parsed.startDate || (existingByRow.endDate || "") !== parsed.endDate
         || Number(existingByRow.revenue) !== parsed.revenue || existingByRow.status !== parsed.status
         || (existingByRow.bikeNameRaw || "") !== parsed.bikeNameRaw;
@@ -2864,6 +2872,11 @@ function buildManagerSyncPlan(managerData) {
     }
 
     if (candidateRental) {
+      // Same completed -> active safeguard as Step A above.
+      if (candidateRental.status === "completed" && parsed.status === "active") {
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Would link to an existing rental and change its status from "completed" back to "active" (reopen) — not applied automatically. Confirm Manager is genuinely newer before doing this manually.` });
+        return;
+      }
       // A real existing rental, just never linked to this Manager row before.
       const changed = candidateRental.startDate !== parsed.startDate || (candidateRental.endDate || "") !== parsed.endDate
         || Number(candidateRental.revenue) !== parsed.revenue || candidateRental.status !== parsed.status;
@@ -2876,6 +2889,29 @@ function buildManagerSyncPlan(managerData) {
     if (!existingCustomer && !plan.newCustomers.some((c) => normalizeText(c.name) === normalizeText(parsed.name))) {
       plan.newCustomers.push({ name: parsed.name, nationality: parsed.nationality, passport: parsed.passport });
     }
+  });
+
+  // Cross-row collision protection — checked only once all rows have been processed, since
+  // it requires seeing every row's resolved target before it can tell whether two different
+  // Manager rows landed on the same existing rental. This catches exactly the case where a
+  // historical import already merged several original rows into one canonical episode, but
+  // the live Manager sheet still lists them separately — each row alone looks like a clean
+  // single match, so this can only be caught by comparing across rows. Any rentalId hit by
+  // 2+ Manager rows is pulled out of both updatedRentals and unchanged entirely and moved to
+  // needsReview instead, naming every row number involved.
+  const rentalIdGroups = {};
+  [...plan.updatedRentals, ...plan.unchanged].forEach((entry) => {
+    (rentalIdGroups[entry.rentalId] = rentalIdGroups[entry.rentalId] || []).push(entry);
+  });
+  Object.keys(rentalIdGroups).forEach((rentalId) => {
+    const group = rentalIdGroups[rentalId];
+    if (group.length < 2) return;
+    const rowNumbers = group.map((e) => e.rowNumber).sort((a, b) => a - b);
+    group.forEach((entry) => {
+      plan.needsReview.push({ rowNumber: entry.rowNumber, reason: `Manager rows ${rowNumbers.join(", ")} all resolve to the same existing Gift Tracker rental — likely fragments/continuations of one already-merged historical episode. None applied automatically.` });
+    });
+    plan.updatedRentals = plan.updatedRentals.filter((e) => e.rentalId !== rentalId);
+    plan.unchanged = plan.unchanged.filter((e) => e.rentalId !== rentalId);
   });
 
   return plan;
