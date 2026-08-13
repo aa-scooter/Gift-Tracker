@@ -1516,6 +1516,29 @@ function nowDateTimeLabel() {
   const timePart = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
   return `${datePart} ${timePart}`;
 }
+// Same format as nowDateTimeLabel() but for an arbitrary stored ISO timestamp — used to
+// display "last successful Manager check" without re-deriving the current time.
+function fmtDateTimeLabel(isoTimestamp) {
+  if (!isoTimestamp) return null;
+  const d = new Date(isoTimestamp);
+  if (isNaN(d.getTime())) return null;
+  const datePart = d.toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" });
+  const timePart = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false });
+  return `${datePart} ${timePart}`;
+}
+// Reads Manager sync status fields safely with defaults — never assumes they exist.
+// Existing live users' DB.data.meta predates these fields entirely; this never mutates
+// meta or triggers any write, purely a read-time default. Nothing is written here.
+function getManagerSyncMeta() {
+  const m = DB.data.meta || {};
+  return {
+    lastManagerCheckAt: m.lastManagerCheckAt || null,
+    lastManagerRecordCount: m.lastManagerRecordCount || 0,
+    lastManagerNewCustomerCount: m.lastManagerNewCustomerCount || 0,
+    lastManagerExistingActivityCount: m.lastManagerExistingActivityCount || 0,
+    lastManagerNeedsReviewCount: m.lastManagerNeedsReviewCount || 0,
+  };
+}
 function fmtMoney(n) {
   const v = Number(n) || 0;
   return "฿" + v.toLocaleString("en-US", { maximumFractionDigits: 0 });
@@ -3302,6 +3325,7 @@ function executeManagerSync(plan) {
 
 
 function renderManagerSyncScreen() {
+  const syncMeta = getManagerSyncMeta();
   return `
     <header class="screen-header">
       <button class="back-btn" data-goto="settings">‹ Settings</button>
@@ -3309,6 +3333,19 @@ function renderManagerSyncScreen() {
       <p class="screen-sub">Read-only pull from the Manager/booking system. Manager Live is now the operational source of rental activity for any customer we can safely identify. This app never writes back to that Sheet — only ever fetches. Nothing here runs automatically; it only checks when you press the button.</p>
     </header>
     <div class="screen-body">
+      <div class="card" style="margin-bottom:16px;">
+        <div class="section-label" style="margin-top:0;">Last Successful Check</div>
+        ${syncMeta.lastManagerCheckAt ? `
+          <div style="font-weight:700; margin-bottom:8px;">${escapeHtml(fmtDateTimeLabel(syncMeta.lastManagerCheckAt) || "—")}</div>
+          <div class="grid-2">
+            <div><div class="muted" style="font-size:11px;">Manager Records Received</div><div style="font-weight:700;">${syncMeta.lastManagerRecordCount}</div></div>
+            <div><div class="muted" style="font-size:11px;">New Customers Found</div><div style="font-weight:700;">${syncMeta.lastManagerNewCustomerCount}</div></div>
+            <div><div class="muted" style="font-size:11px;">Existing Customers Updated</div><div style="font-weight:700;">${syncMeta.lastManagerExistingActivityCount}</div></div>
+            <div><div class="muted" style="font-size:11px;">Needing Identity Review</div><div style="font-weight:700; color:${syncMeta.lastManagerNeedsReviewCount > 0 ? "var(--red)" : "var(--ink)"};">${syncMeta.lastManagerNeedsReviewCount}</div></div>
+          </div>
+        ` : `<p class="muted">Never checked yet on this device.</p>`}
+      </div>
+
       ${state.managerSyncStatus === "idle" ? `
         <button class="btn btn-primary btn-block" id="check-manager-updates">Check Now</button>
       ` : ""}
@@ -3329,6 +3366,8 @@ function renderManagerSyncScreen() {
         const p = state.managerSyncPlan;
         const newCustomerCount = p.resolvedCustomers.filter((c) => c.isNew).length;
         const loyaltyPreviews = buildManagerSyncLoyaltyPreview(p);
+        const newPreviews = loyaltyPreviews.filter((lp) => lp.isNew);
+        const existingPreviews = loyaltyPreviews.filter((lp) => !lp.isNew);
         return `
           <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
             <div class="report-tile"><div class="report-tile-value" style="color:var(--green);">${p.resolvedCustomers.length}</div><div class="report-tile-label">Customers Identified</div></div>
@@ -3337,13 +3376,38 @@ function renderManagerSyncScreen() {
             <div class="report-tile"><div class="report-tile-value" style="color:${p.needsReview.length > 0 ? "var(--red)" : "var(--ink)"};">${p.needsReview.length}</div><div class="report-tile-label">Needs Review (identity only)</div></div>
           </div>
 
-          ${loyaltyPreviews.length > 0 ? `
-            <div class="section-title">Loyalty Preview — resulting status from Manager data</div>
-            ${loyaltyPreviews.map((lp) => `
+          ${newPreviews.length > 0 ? `
+            <div class="section-title">New Customers Found (${newPreviews.length}) — tap to see loyalty/gift recommendation</div>
+            ${newPreviews.map((lp) => {
+              const key = normalizeText(lp.name);
+              const expanded = state.managerSyncExpandedNewCustomer === key;
+              return `
+                <div class="card" style="margin-bottom:8px; cursor:pointer;" data-new-customer-toggle="${escapeHtml(key)}">
+                  <div class="card-row">
+                    <div style="font-weight:700;">${escapeHtml(lp.name)}</div>
+                    <span class="pill pill-green">${expanded ? "▲" : "▼"} New</span>
+                  </div>
+                  ${expanded ? `
+                    <div class="grid-2" style="margin-top:8px; margin-bottom:6px;">
+                      <div><div class="muted" style="font-size:11px;">Status</div><div style="font-weight:700;">${escapeHtml(lp.statusLabel)}</div></div>
+                      <div><div class="muted" style="font-size:11px;">Approx. Visits</div><div>${lp.visitCount}</div></div>
+                      <div><div class="muted" style="font-size:11px;">Operational Days</div><div>${lp.operationalDays}</div></div>
+                      <div><div class="muted" style="font-size:11px;">Revenue</div><div>${fmtMoney(lp.revenue2026)}</div></div>
+                    </div>
+                    <div class="muted" style="font-size:11.5px;">Eligible now: ${lp.eligibleRewards.length ? escapeHtml(lp.eligibleRewards.join(", ")) : "none yet"}</div>
+                    <div class="muted" style="font-size:11.5px;">Already given: ${lp.rewardsGiven.length ? escapeHtml(lp.rewardsGiven.join(", ")) : "none"}</div>
+                  ` : ""}
+                </div>
+              `;
+            }).join("")}
+          ` : ""}
+
+          ${existingPreviews.length > 0 ? `
+            <div class="section-title">Existing Customers — Activity Updated</div>
+            ${existingPreviews.map((lp) => `
               <div class="card" style="margin-bottom:10px;">
                 <div class="card-row" style="margin-bottom:6px;">
                   <div style="font-weight:700;">${escapeHtml(lp.name)}</div>
-                  ${lp.isNew ? `<span class="pill pill-green">New Customer Record</span>` : ""}
                 </div>
                 <div class="grid-2" style="margin-bottom:6px;">
                   <div><div class="muted" style="font-size:11px;">Status</div><div style="font-weight:700;">${escapeHtml(lp.statusLabel)}</div></div>
@@ -4159,7 +4223,7 @@ function dashboardStats() {
 /* ROUTER + STATE                                                          */
 /* ---------------------------------------------------------------------- */
 
-const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null, managerSyncStatus: "idle", managerSyncPlan: null, managerSyncError: null, managerSyncResult: null };
+const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null, managerSyncStatus: "idle", managerSyncPlan: null, managerSyncError: null, managerSyncResult: null, managerSyncExpandedNewCustomer: null };
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -4199,6 +4263,7 @@ function renderAppHome() {
     const st = vehicleStatus(v);
     return st.tax.level !== "green" || st.prb.level !== "green";
   }).length;
+  const syncMeta = getManagerSyncMeta();
 
   return `
     <div class="launcher-wrap dark-bg compact">
@@ -4209,6 +4274,9 @@ function renderAppHome() {
           <div class="launcher-compact-sub">Chiang Mai · Internal Operations</div>
         </div>
       </div>
+      <button class="pill pill-neutral" data-goto="manager-sync" style="margin-bottom:14px; display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
+        ${syncMeta.lastManagerCheckAt ? `Manager: Synced ✓ · ${escapeHtml(fmtDateTimeLabel(syncMeta.lastManagerCheckAt) || "")}` : `Manager: Not checked yet`}
+      </button>
       <div class="launcher-cards compact">
         <button class="module-card dark compact" data-goto="customers">
           <div class="module-card-arrow">${ICONS.chevronRight}</div>
@@ -7155,9 +7223,28 @@ function wireScreenEvents() {
         const plan = buildManagerSyncPlan(data);
         state.managerSyncPlan = plan;
         state.managerSyncStatus = "preview";
+
+        // Persist sync-status metadata ONLY on a genuinely successful check (fetch
+        // succeeded AND the plan built without error) — display/status only, never
+        // touches matching or loyalty logic. Adds fields to the EXISTING meta object
+        // rather than replacing it, so this is safe for accounts that predate these
+        // fields entirely.
+        const newCustomerCount = plan.resolvedCustomers.filter((c) => c.isNew).length;
+        const existingActivityCount = plan.resolvedCustomers.filter((c) => !c.isNew).length;
+        if (!DB.data.meta) DB.data.meta = {};
+        DB.data.meta.lastManagerCheckAt = new Date().toISOString();
+        DB.data.meta.lastManagerRecordCount = (data.rows || []).length;
+        DB.data.meta.lastManagerNewCustomerCount = newCustomerCount;
+        DB.data.meta.lastManagerExistingActivityCount = existingActivityCount;
+        DB.data.meta.lastManagerNeedsReviewCount = plan.needsReview.length;
+        DB.save();
+
+        toast(`Manager updated ✓ — ${newCustomerCount} new customer${newCustomerCount === 1 ? "" : "s"} found`);
         render();
       })
       .catch((err) => {
+        // A failed fetch/parse NEVER touches lastManagerCheckAt or any other sync-status
+        // field — whatever was last successfully recorded stays exactly as it was.
         state.managerSyncError = err.message || String(err);
         state.managerSyncStatus = "error";
         render();
@@ -7193,6 +7280,14 @@ function wireScreenEvents() {
     state.managerSyncPlan = null;
     state.managerSyncStatus = "idle";
     render();
+  });
+
+  document.querySelectorAll("[data-new-customer-toggle]").forEach((el) => {
+    el.addEventListener("click", () => {
+      const key = el.getAttribute("data-new-customer-toggle");
+      state.managerSyncExpandedNewCustomer = state.managerSyncExpandedNewCustomer === key ? null : key;
+      render();
+    });
   });
 
   const exportBackupConfirmBtn = document.getElementById("export-backup-confirm-screen");
