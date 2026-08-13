@@ -2783,7 +2783,7 @@ function buildManagerSyncPlan(managerData) {
   (managerData.rows || []).forEach((raw) => {
     const parsed = parseManagerRow(raw);
     if (!parsed) {
-      plan.needsReview.push({ rowNumber: raw.rowNumber, reason: "Missing customer name or a valid start date.", raw: raw.values });
+      plan.needsReview.push({ rowNumber: raw.rowNumber, category: "missing_data", reason: "Missing customer name or a valid start date.", raw: raw.values });
       return;
     }
 
@@ -2795,7 +2795,7 @@ function buildManagerSyncPlan(managerData) {
       // exactly the kind of change that needs a person to confirm Manager is genuinely the
       // newer source of truth here, not a stale/blank situation field.
       if (existingByRow.status === "completed" && parsed.status === "active") {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Would change this rental's status from "completed" back to "active" (reopen) — not applied automatically. Confirm Manager is genuinely newer before doing this manually.` });
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "completed_to_active", reason: `Would change this rental's status from "completed" back to "active" (reopen) — not applied automatically. Confirm Manager is genuinely newer before doing this manually.` });
         return;
       }
       const changed = existingByRow.startDate !== parsed.startDate || (existingByRow.endDate || "") !== parsed.endDate
@@ -2822,7 +2822,7 @@ function buildManagerSyncPlan(managerData) {
     const parsedPassport = normalizePassport(parsed.passport);
     const byPassport = parsedPassport ? DB.data.customers.filter((c) => normalizePassport(c.passport) === parsedPassport) : [];
     if (parsedPassport && byPassport.length > 1) {
-      plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Passport "${parsed.passport}" matches more than one existing customer — cannot safely pick one.` });
+      plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "passport_conflict", reason: `Passport "${parsed.passport}" matches more than one existing customer — cannot safely pick one.` });
       return;
     }
 
@@ -2838,7 +2838,7 @@ function buildManagerSyncPlan(managerData) {
       // If name-matching independently points at a DIFFERENT customer than the passport
       // match, that's a genuine identity conflict — passport must never silently win.
       if (matchingCustomers.length > 0 && !matchingCustomers.some((c) => c.id === passportCustomer.id)) {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Passport matches "${passportCustomer.name}" but the name on this row matches a different existing customer — conflict, not resolved automatically.` });
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "passport_conflict", reason: `Passport matches "${passportCustomer.name}" but the name on this row matches a different existing customer — conflict, not resolved automatically.` });
         return;
       }
       existingCustomer = passportCustomer; // resolves cases plain name-matching alone would miss
@@ -2846,7 +2846,7 @@ function buildManagerSyncPlan(managerData) {
       // No usable passport signal (blank on either side, or no passport match at all) —
       // fall back to name-only matching, exactly as before.
       if (matchingCustomers.length > 1) {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Customer name "${parsed.name}" matches more than one existing customer — cannot safely pick one.` });
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "multiple_customer_match", reason: `Customer name "${parsed.name}" matches more than one existing customer — cannot safely pick one.` });
         return;
       }
       existingCustomer = matchingCustomers[0] || null;
@@ -2865,7 +2865,11 @@ function buildManagerSyncPlan(managerData) {
         return parsed.startDate <= rEnd && pEnd >= r.startDate;
       });
       if (candidates.length > 1) {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Multiple existing rentals for ${parsed.name} overlap this row's dates/bike — cannot safely pick one.` });
+        // If any candidate looks like a zero-day/manual duplicate artifact (paidDays 0 but
+        // real revenue — the same signature Non-Import Rental Review flags), surface that
+        // specifically, since it points at a different root cause than a genuine ambiguity.
+        const zeroDayInvolved = candidates.some((r) => (Number(r.paidDays) || 0) === 0 && (Number(r.revenue) || 0) > 0);
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: zeroDayInvolved ? "zero_day_duplicate" : "multiple_rental_match", reason: `Multiple existing rentals for ${parsed.name} overlap this row's dates/bike — cannot safely pick one.` });
         return;
       }
       candidateRental = candidates[0] || null;
@@ -2874,7 +2878,7 @@ function buildManagerSyncPlan(managerData) {
     if (candidateRental) {
       // Same completed -> active safeguard as Step A above.
       if (candidateRental.status === "completed" && parsed.status === "active") {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Would link to an existing rental and change its status from "completed" back to "active" (reopen) — not applied automatically. Confirm Manager is genuinely newer before doing this manually.` });
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "completed_to_active", reason: `Would link to an existing rental and change its status from "completed" back to "active" (reopen) — not applied automatically. Confirm Manager is genuinely newer before doing this manually.` });
         return;
       }
       // A real existing rental, just never linked to this Manager row before.
@@ -2907,12 +2911,19 @@ function buildManagerSyncPlan(managerData) {
     const group = rentalIdGroups[rentalId];
     if (group.length < 2) return;
     const rowNumbers = group.map((e) => e.rowNumber).sort((a, b) => a - b);
+    const targetRental = DB.data.rentals.find((r) => r.id === rentalId);
+    const zeroDayInvolved = targetRental && (Number(targetRental.paidDays) || 0) === 0 && (Number(targetRental.revenue) || 0) > 0;
     group.forEach((entry) => {
-      plan.needsReview.push({ rowNumber: entry.rowNumber, reason: `Manager rows ${rowNumbers.join(", ")} all resolve to the same existing Gift Tracker rental — likely fragments/continuations of one already-merged historical episode. None applied automatically.` });
+      plan.needsReview.push({ rowNumber: entry.rowNumber, category: zeroDayInvolved ? "zero_day_duplicate" : "cross_row_collision", reason: `Manager rows ${rowNumbers.join(", ")} all resolve to the same existing Gift Tracker rental — likely fragments/continuations of one already-merged historical episode. None applied automatically.` });
     });
     plan.updatedRentals = plan.updatedRentals.filter((e) => e.rentalId !== rentalId);
     plan.unchanged = plan.unchanged.filter((e) => e.rentalId !== rentalId);
   });
+
+  // Safety net: every needsReview entry must carry a category for the breakdown display —
+  // guarantees the category counts always sum exactly to the total, even if a future reason
+  // is ever added without remembering to tag it.
+  plan.needsReview.forEach((entry) => { if (!entry.category) entry.category = "other"; });
 
   return plan;
 }
@@ -3028,10 +3039,40 @@ function renderManagerSyncScreen() {
             ${realUpdates.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <b>${escapeHtml(r.customerName)}</b><br/><span class="muted">${escapeHtml(r.before.status)}, ${r.before.endDate ? fmtDate(r.before.endDate) : "ongoing"}, ${fmtMoney(r.before.revenue)} → ${escapeHtml(r.after.status)}, ${r.after.endDate ? fmtDate(r.after.endDate) : "ongoing"}, ${fmtMoney(r.after.revenue)}</span></div>`).join("")}
           ` : ""}
 
-          ${p.needsReview.length > 0 ? `
-            <div class="section-title">Needs Review (skipped — not applied automatically)</div>
-            ${p.needsReview.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <span class="muted">${escapeHtml(r.reason)}</span></div>`).join("")}
-          ` : ""}
+          ${p.needsReview.length > 0 ? (() => {
+            const CATEGORY_LABELS = {
+              missing_data: "Missing/invalid customer name or start date",
+              multiple_customer_match: "Multiple customer identity matches",
+              passport_conflict: "Passport/name conflict",
+              multiple_rental_match: "Multiple existing rental matches",
+              cross_row_collision: "Cross-row collision (same rental targeted by 2+ rows)",
+              completed_to_active: "Completed → Active safeguard",
+              zero_day_duplicate: "Zero-day/manual duplicate involvement",
+              other: "Other",
+            };
+            const counts = {};
+            p.needsReview.forEach((r) => { counts[r.category] = (counts[r.category] || 0) + 1; });
+            const total = p.needsReview.length;
+            const rows = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
+            return `
+              <div class="section-title">Needs Review Breakdown</div>
+              <div class="card" style="margin-bottom:16px;">
+                ${rows.map((cat) => `
+                  <div class="status-line" style="margin-bottom:6px;">
+                    <span>${escapeHtml(CATEGORY_LABELS[cat] || cat)}</span>
+                    <b>${counts[cat]} <span class="muted" style="font-weight:400;">(${Math.round((counts[cat] / total) * 100)}%)</span></b>
+                  </div>
+                `).join("")}
+                <div class="status-line" style="margin-top:6px; padding-top:6px; border-top: 1px solid var(--line);">
+                  <span class="muted">Total Needs Review</span>
+                  <b>${total}</b>
+                </div>
+              </div>
+
+              <div class="section-title">Needs Review (skipped — not applied automatically)</div>
+              ${p.needsReview.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <span class="pill pill-neutral" style="font-size:10.5px;">${escapeHtml(CATEGORY_LABELS[r.category] || r.category)}</span><br/><span class="muted">${escapeHtml(r.reason)}</span></div>`).join("")}
+            `;
+          })() : ""}
 
           <button class="btn btn-primary btn-block" id="apply-manager-sync" style="margin-top:16px;">Apply Updates</button>
           <button class="btn btn-outline btn-block" id="cancel-manager-sync" style="margin-top:8px;">Cancel</button>
