@@ -3131,310 +3131,99 @@ function isEmptyShadowCustomer(customerId) {
   return rentalCount === 0 && rewardCount === 0;
 }
 
-// Classifies a Manager row's date range against a merged canonical episode's REAL segment
-// coverage — never against a synthetic startDate+paidDays window. A merged episode
-// (sourceRows.length > 1) is NEVER a target for direct field overwrite; this is the only
-// way a Manager row is ever reconciled against one.
-function classifyRowAgainstMergedEpisode(parsed, episode) {
-  if (!episode.segments || episode.segments.length === 0) {
-    return { classification: "no_segment_data" }; // never guess — always Needs Review
+// ============================================================================
+// SIMPLIFIED MANAGER-FIRST LOYALTY MODEL (approved redesign — replaces the previous
+// row-by-row historical reconciliation entirely). Manager Live is the operational source
+// of truth for rental activity. Once a customer is safely identified, ALL of their current
+// Manager rows become their approximate operational rental list — one row, one visit, real
+// dates, real revenue, no cross-checking against old Gift Tracker rental records at all.
+// Needs Review now means exactly one thing: customer identity itself could not be safely
+// established. Ordinary rental-history differences never produce a review item.
+// ============================================================================
+
+// Resolves a Manager-reported name+passport to an existing Gift Tracker customer, a
+// genuinely new customer, or a genuine identity ambiguity — using ONLY the already-approved
+// exact passport/name matching and empty-shadow exception. No fuzzy matching of any kind.
+function resolveCustomerIdentity(name, passport) {
+  const parsedPassport = normalizePassport(passport);
+  const byPassport = parsedPassport ? DB.data.customers.filter((c) => normalizePassport(c.passport) === parsedPassport) : [];
+  const matchingCustomers = DB.data.customers.filter((c) => normalizeText(cleanCustomerDisplayName(c.name)) === normalizeText(cleanCustomerDisplayName(name)));
+
+  let resolvedPassportCustomer = null;
+  if (parsedPassport && byPassport.length > 1) {
+    const withHistory = byPassport.filter((c) => !isEmptyShadowCustomer(c.id));
+    if (withHistory.length === 1) {
+      resolvedPassportCustomer = withHistory[0];
+    } else {
+      return { ambiguous: true, reason: `Passport "${passport}" matches more than one existing customer with real history — identity cannot be safely established.` };
+    }
   }
-  const visits = buildVisitsFromSegments(episode);
-  const todayIso = todayISO();
-  const rowStart = parsed.startDate;
-  const rowEnd = parsed.endDate || parsed.startDate;
 
-  const fullyCovered = visits.some((v) => {
-    const vEnd = v.endDate || todayIso; // an open/active visit covers through today
-    return v.startDate <= rowStart && rowEnd <= vEnd;
-  });
-  if (fullyCovered) return { classification: "already_represented" };
+  if (parsedPassport && (byPassport.length === 1 || resolvedPassportCustomer)) {
+    const passportCustomer = resolvedPassportCustomer || byPassport[0];
+    const conflicting = matchingCustomers.filter((c) => c.id !== passportCustomer.id);
+    const realConflicts = conflicting.filter((c) => !isEmptyShadowCustomer(c.id));
+    if (realConflicts.length > 0) {
+      return { ambiguous: true, reason: `Passport matches "${passportCustomer.name}" but the name also matches a different existing customer with real history — identity cannot be safely established.` };
+    }
+    return { ambiguous: false, customer: passportCustomer, isNew: false };
+  }
 
-  const partiallyOverlaps = visits.some((v) => {
-    const vEnd = v.endDate || todayIso;
-    return rowStart <= vEnd && v.startDate <= rowEnd;
-  });
-  if (partiallyOverlaps) return { classification: "partial_overlap" };
-
-  return { classification: "new_continuation" };
+  if (matchingCustomers.length > 1) {
+    const withHistory = matchingCustomers.filter((c) => !isEmptyShadowCustomer(c.id));
+    if (withHistory.length === 1) return { ambiguous: false, customer: withHistory[0], isNew: false };
+    return { ambiguous: true, reason: `Name "${name}" matches more than one existing customer with real history — identity cannot be safely established.` };
+  }
+  if (matchingCustomers.length === 1) return { ambiguous: false, customer: matchingCustomers[0], isNew: false };
+  return { ambiguous: false, customer: null, isNew: true };
 }
 
+// Groups every parsed Manager row by the real-world person it belongs to (passport first,
+// falling back to cleaned name), resolves each group's identity once, and — for safely
+// identified customers — carries their full row list forward as-is. No per-row comparison
+// against old Gift Tracker rentals anywhere in this function.
 function buildManagerSyncPlan(managerData) {
-  const todayIso = todayISO();
-  const plan = { newCustomers: [], newRentals: [], updatedRentals: [], unchanged: [], needsReview: [] };
+  const plan = { resolvedCustomers: [], needsReview: [] };
+  const groups = {};
 
   (managerData.rows || []).forEach((raw) => {
     const parsed = parseManagerRow(raw);
     if (!parsed) {
-      plan.needsReview.push({ rowNumber: raw.rowNumber, category: "missing_data", reason: "Missing customer name or a valid start date.", raw: raw.values });
+      plan.needsReview.push({ rowNumber: raw.rowNumber, reason: "Missing customer name or a valid start date.", identityIssue: false });
       return;
     }
-
-    // Step A — already synced from this exact Manager row before?
-    const existingByRow = DB.data.rentals.find((r) => r.mgrRowNumber === parsed.rowNumber);
-    if (existingByRow) {
-      // A merged canonical episode is NEVER a target for direct field overwrite, even if it
-      // somehow already carries an mgrRowNumber — always reclassify against its real
-      // segment coverage instead. In normal operation this branch is defensive only, since
-      // Step B below never attaches mgrRowNumber directly to a merged episode.
-      if (existingByRow.sourceRows && existingByRow.sourceRows.length > 1) {
-        const cls = classifyRowAgainstMergedEpisode(parsed, existingByRow);
-        if (cls.classification === "already_represented") {
-          plan.unchanged.push({ rowNumber: parsed.rowNumber, rentalId: existingByRow.id, customerName: parsed.name });
-        } else {
-          plan.needsReview.push({ rowNumber: parsed.rowNumber, category: cls.classification === "no_segment_data" ? "merged_episode_no_segments" : "merged_episode_overlap", reason: `This row is linked to a multi-source historical episode (${existingByRow.sourceRows.length} source rows) — never overwritten directly. ${cls.classification === "no_segment_data" ? "No reconstructed segment data available to verify coverage." : "Overlaps only partially with known coverage — needs a person to confirm."}` });
-        }
-        return;
-      }
-      // A proposed completed -> active reversal never auto-applies, regardless of what else
-      // changed on the row — reopening a rental Gift Tracker already has as finished is
-      // exactly the kind of change that needs a person to confirm Manager is genuinely the
-      // newer source of truth here, not a stale/blank situation field.
-      if (existingByRow.status === "completed" && parsed.status === "active") {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "completed_to_active", reason: `Would change this rental's status from "completed" back to "active" (reopen) — not applied automatically. Confirm Manager is genuinely newer before doing this manually.` });
-        return;
-      }
-      const changed = existingByRow.startDate !== parsed.startDate || (existingByRow.endDate || "") !== parsed.endDate
-        || Number(existingByRow.revenue) !== parsed.revenue || existingByRow.status !== parsed.status
-        || (existingByRow.bikeNameRaw || "") !== parsed.bikeNameRaw;
-      if (changed) {
-        plan.updatedRentals.push({ rowNumber: parsed.rowNumber, rentalId: existingByRow.id, customerName: parsed.name, before: { startDate: existingByRow.startDate, endDate: existingByRow.endDate, revenue: existingByRow.revenue, status: existingByRow.status }, after: { startDate: parsed.startDate, endDate: parsed.endDate, revenue: parsed.revenue, status: parsed.status } });
-      } else {
-        plan.unchanged.push({ rowNumber: parsed.rowNumber, rentalId: existingByRow.id, customerName: parsed.name });
-      }
-      return;
-    }
-
-    // Step B — not yet linked to a Manager row. Could still be an existing
-    // rental (already imported historically, or already logged manually)
-    // that simply hasn't been matched to this row before.
-    //
-    // Customer identity: passport number is a second, high-confidence signal, checked
-    // FIRST — it can resolve cases plain name matching can't (e.g. a historical record
-    // whose name is stored in a different word order than the Manager sheet writes it).
-    // Deliberately NOT fuzzy: exact match only, on a conservatively normalized passport
-    // (trim/case/harmless spaces only). Never used to silently override a genuine name
-    // conflict — see the conflict check below.
-    const parsedPassport = normalizePassport(parsed.passport);
-    const byPassport = parsedPassport ? DB.data.customers.filter((c) => normalizePassport(c.passport) === parsedPassport) : [];
-    let resolvedPassportCustomer = null;
-    if (parsedPassport && byPassport.length > 1) {
-      // Multiple customers share this passport — resolve only if exactly one has real
-      // history and the rest are empty shadow records (rule 3). Otherwise, genuine conflict.
-      const withHistory = byPassport.filter((c) => !isEmptyShadowCustomer(c.id));
-      if (withHistory.length === 1) {
-        resolvedPassportCustomer = withHistory[0];
-      } else {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "passport_conflict", customerIds: byPassport.map((c) => c.id), reason: `Passport "${parsed.passport}" matches more than one existing customer with real history — cannot safely pick one.` });
-        return;
-      }
-    }
-
-    // Compare CLEANED names (honorifics stripped from both sides) — Gift Tracker's own
-    // stored customer names are inconsistent about carrying "Mr./Ms./Mrs./Miss" (some do,
-    // some don't, e.g. Byron's has none while the Manager sheet always writes "Mr."), so raw
-    // normalizeText alone missed real matches and would have created duplicate customers.
-    const matchingCustomers = DB.data.customers.filter((c) => normalizeText(cleanCustomerDisplayName(c.name)) === normalizeText(cleanCustomerDisplayName(parsed.name)));
-
-    let existingCustomer = null;
-    if (parsedPassport && (byPassport.length === 1 || resolvedPassportCustomer)) {
-      const passportCustomer = resolvedPassportCustomer || byPassport[0];
-      // If name-matching independently points at a DIFFERENT customer than the passport
-      // match, that's only a genuine conflict if that other customer has real history —
-      // an empty shadow record never gets to veto a safely-established passport match
-      // (rule 2). Passport still never silently overrides a REAL second person.
-      const conflictingNameMatches = matchingCustomers.filter((c) => c.id !== passportCustomer.id);
-      const realConflicts = conflictingNameMatches.filter((c) => !isEmptyShadowCustomer(c.id));
-      if (realConflicts.length > 0) {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "passport_conflict", customerIds: [passportCustomer.id, ...realConflicts.map((c) => c.id)], reason: `Passport matches "${passportCustomer.name}" but the name on this row also matches a different existing customer with real history — conflict, not resolved automatically.` });
-        return;
-      }
-      existingCustomer = passportCustomer; // resolves cases plain name-matching alone would miss, ignoring any empty shadow name-matches
-    } else {
-      // No usable passport signal (blank on either side, or an unresolved passport conflict
-      // above) — fall back to name-only matching.
-      if (matchingCustomers.length > 1) {
-        // Resolve only if exactly one match has real history and the rest are empty shadow
-        // records (rule 3). Otherwise, genuine ambiguity between two or more real people.
-        const withHistory = matchingCustomers.filter((c) => !isEmptyShadowCustomer(c.id));
-        if (withHistory.length === 1) {
-          existingCustomer = withHistory[0];
-        } else {
-          plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "multiple_customer_match", customerIds: matchingCustomers.map((c) => c.id), reason: `Customer name "${parsed.name}" matches more than one existing customer with real history — cannot safely pick one.` });
-          return;
-        }
-      } else {
-        existingCustomer = matchingCustomers[0] || null;
-      }
-    }
-
-    // Rental-level ambiguity protection, unchanged from before, applied against whichever
-    // customer was safely identified above.
-    let candidateRental = null;
-    if (existingCustomer) {
-      const candidates = DB.data.rentals.filter((r) => {
-        if (r.customerId !== existingCustomer.id) return false;
-        const existingRawBike = r.bikeNameRaw || r.bikeModel;
-        if (normalizeText(existingRawBike) !== normalizeText(parsed.bikeNameRaw)) return false;
-        const rEnd = r.endDate || todayISO(); // an ongoing/active existing rental extends through today, not just its own start date
-        const pEnd = parsed.endDate || parsed.startDate;
-        return parsed.startDate <= rEnd && pEnd >= r.startDate;
-      });
-      if (candidates.length > 1) {
-        // Resolve only when exactly one candidate is genuine and every other candidate is a
-        // PROVEN zero-day artifact (paidDays 0, real revenue — the same signature Non-Import
-        // Rental Review and the artifact-exclusion logic in customerStats() both use). Two or
-        // more genuine-looking candidates stays a real ambiguity, never auto-resolved.
-        const zeroDayArtifacts = candidates.filter((r) => (Number(r.paidDays) || 0) === 0 && (Number(r.revenue) || 0) > 0);
-        const genuine = candidates.filter((r) => !zeroDayArtifacts.includes(r));
-        if (genuine.length === 1 && zeroDayArtifacts.length === candidates.length - 1) {
-          candidateRental = genuine[0];
-        } else {
-          const zeroDayInvolved = zeroDayArtifacts.length > 0;
-          plan.needsReview.push({ rowNumber: parsed.rowNumber, category: zeroDayInvolved ? "zero_day_duplicate" : "multiple_rental_match", reason: `Multiple existing rentals for ${parsed.name} overlap this row's dates/bike — cannot safely pick one.` });
-          return;
-        }
-      } else {
-        candidateRental = candidates[0] || null;
-      }
-    }
-
-    if (candidateRental) {
-      // A merged canonical episode is NEVER a target for direct field overwrite —
-      // classify against its real segment coverage instead of proposing to update its
-      // dates/revenue/status directly.
-      if (candidateRental.sourceRows && candidateRental.sourceRows.length > 1) {
-        const cls = classifyRowAgainstMergedEpisode(parsed, candidateRental);
-        if (cls.classification === "already_represented") {
-          plan.unchanged.push({ rowNumber: parsed.rowNumber, rentalId: candidateRental.id, customerName: parsed.name });
-        } else if (cls.classification === "new_continuation") {
-          // Genuinely beyond known historical coverage — a real NEW rental for the same
-          // customer, never touching the merged episode itself.
-          plan.newRentals.push({ rowNumber: parsed.rowNumber, customerName: parsed.name, customerId: candidateRental.customerId, nationality: parsed.nationality, passport: parsed.passport, bikeNameRaw: parsed.bikeNameRaw, startDate: parsed.startDate, endDate: parsed.endDate, revenue: parsed.revenue, status: parsed.status });
-        } else {
-          plan.needsReview.push({ rowNumber: parsed.rowNumber, category: cls.classification === "no_segment_data" ? "merged_episode_no_segments" : "merged_episode_overlap", reason: `This row overlaps a multi-source historical episode (${candidateRental.sourceRows.length} source rows) for ${parsed.name} — never overwritten directly. ${cls.classification === "no_segment_data" ? "No reconstructed segment data available to verify coverage." : "Overlaps only partially with known coverage — needs a person to confirm."}` });
-        }
-        return;
-      }
-      // Same completed -> active safeguard as Step A above.
-      if (candidateRental.status === "completed" && parsed.status === "active") {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "completed_to_active", reason: `Would link to an existing rental and change its status from "completed" back to "active" (reopen) — not applied automatically. Confirm Manager is genuinely newer before doing this manually.` });
-        return;
-      }
-      // A real existing rental, just never linked to this Manager row before.
-      const changed = candidateRental.startDate !== parsed.startDate || (candidateRental.endDate || "") !== parsed.endDate
-        || Number(candidateRental.revenue) !== parsed.revenue || candidateRental.status !== parsed.status;
-      plan.updatedRentals.push({ rowNumber: parsed.rowNumber, rentalId: candidateRental.id, customerName: parsed.name, linkOnly: !changed, before: { startDate: candidateRental.startDate, endDate: candidateRental.endDate, revenue: candidateRental.revenue, status: candidateRental.status }, after: { startDate: parsed.startDate, endDate: parsed.endDate, revenue: parsed.revenue, status: parsed.status } });
-      return;
-    }
-
-    // Genuinely new rental. New customer too, if none matched by name.
-    plan.newRentals.push({ rowNumber: parsed.rowNumber, customerName: parsed.name, customerId: existingCustomer ? existingCustomer.id : null, nationality: parsed.nationality, passport: parsed.passport, bikeNameRaw: parsed.bikeNameRaw, startDate: parsed.startDate, endDate: parsed.endDate, revenue: parsed.revenue, status: parsed.status });
-    if (!existingCustomer && !plan.newCustomers.some((c) => normalizeText(c.name) === normalizeText(parsed.name))) {
-      plan.newCustomers.push({ name: parsed.name, nationality: parsed.nationality, passport: parsed.passport });
-    }
+    const p = normalizePassport(parsed.passport);
+    const key = p || ("name:" + normalizeText(cleanCustomerDisplayName(parsed.name)));
+    if (!groups[key]) groups[key] = { name: parsed.name, passport: parsed.passport, rows: [] };
+    groups[key].rows.push(parsed);
   });
 
-  // Cross-row collision protection — checked only once all rows have been processed, since
-  // it requires seeing every row's resolved target before it can tell whether two different
-  // Manager rows landed on the same existing rental. This catches exactly the case where a
-  // historical import already merged several original rows into one canonical episode, but
-  // the live Manager sheet still lists them separately — each row alone looks like a clean
-  // single match, so this can only be caught by comparing across rows. Any rentalId hit by
-  // 2+ Manager rows is pulled out of both updatedRentals and unchanged entirely and moved to
-  // needsReview instead, naming every row number involved.
-  const rentalIdGroups = {};
-  [...plan.updatedRentals, ...plan.unchanged].forEach((entry) => {
-    (rentalIdGroups[entry.rentalId] = rentalIdGroups[entry.rentalId] || []).push(entry);
-  });
-  Object.keys(rentalIdGroups).forEach((rentalId) => {
-    const group = rentalIdGroups[rentalId];
-    if (group.length < 2) return;
-    const rowNumbers = group.map((e) => e.rowNumber).sort((a, b) => a - b);
-    const targetRental = DB.data.rentals.find((r) => r.id === rentalId);
-    const zeroDayInvolved = targetRental && (Number(targetRental.paidDays) || 0) === 0 && (Number(targetRental.revenue) || 0) > 0;
-    group.forEach((entry) => {
-      plan.needsReview.push({ rowNumber: entry.rowNumber, category: zeroDayInvolved ? "zero_day_duplicate" : "cross_row_collision", reason: `Manager rows ${rowNumbers.join(", ")} all resolve to the same existing Gift Tracker rental — likely fragments/continuations of one already-merged historical episode. None applied automatically.` });
+  Object.values(groups).forEach((group) => {
+    const resolved = resolveCustomerIdentity(group.name, group.passport);
+    if (resolved.ambiguous) {
+      plan.needsReview.push({ rowNumber: group.rows.map((r) => r.rowNumber).join(", "), reason: resolved.reason, identityIssue: true, name: group.name });
+      return;
+    }
+    plan.resolvedCustomers.push({
+      customerId: resolved.customer ? resolved.customer.id : null,
+      customerName: resolved.customer ? resolved.customer.name : group.name,
+      isNew: resolved.isNew,
+      nationality: group.rows[0].nationality, passport: group.passport,
+      rows: group.rows,
     });
-    plan.updatedRentals = plan.updatedRentals.filter((e) => e.rentalId !== rentalId);
-    plan.unchanged = plan.unchanged.filter((e) => e.rentalId !== rentalId);
   });
-
-  // Safety net: every needsReview entry must carry a category for the breakdown display —
-  // guarantees the category counts always sum exactly to the total, even if a future reason
-  // is ever added without remembering to tag it.
-  plan.needsReview.forEach((entry) => { if (!entry.category) entry.category = "other"; });
 
   return plan;
 }
 
-// Builds the per-customer Loyalty Preview: for every customer touched by a safely resolved
-// new or updated rental, simulates what their rentals array WOULD look like after the sync,
-// then runs the real, unmodified customerStats() / computeCustomerStatus() / getSuggestions()
-// against that simulation — never a separate/simplified copy of the loyalty logic. Purely
-// additive to DB.data.rentals in memory only; nothing here is written, and DB.data itself is
-// never touched. Rewards are read from the customer's REAL existing reward history (never
-// simulated), since this plan never proposes changing rewards.
-function buildManagerSyncLoyaltyPreview(plan) {
-  const affectedCustomerIds = new Set();
-  plan.newRentals.forEach((r) => { if (r.customerId) affectedCustomerIds.add(r.customerId); });
-  plan.updatedRentals.forEach((r) => {
-    const rental = DB.data.rentals.find((x) => x.id === r.rentalId);
-    if (rental) affectedCustomerIds.add(rental.customerId);
-  });
-
-  const previews = [];
-
-  // Existing customers first.
-  affectedCustomerIds.forEach((customerId) => {
-    const customer = DB.data.customers.find((c) => c.id === customerId);
-    if (!customer) return;
-    const realRentals = customerRentals(customerId).map((r) => ({ ...r })); // clone, never mutate DB.data
-    const byId = {};
-    realRentals.forEach((r) => { byId[r.id] = r; });
-    plan.updatedRentals.filter((u) => {
-      const rental = DB.data.rentals.find((x) => x.id === u.rentalId);
-      return rental && rental.customerId === customerId;
-    }).forEach((u) => {
-      const r = byId[u.rentalId];
-      if (!r) return;
-      r.startDate = u.after.startDate; r.endDate = u.after.endDate || null;
-      r.revenue = u.after.revenue; r.status = u.after.status;
-      r.paidDays = Math.max(daysBetween(r.startDate, r.endDate || todayISO()), 0);
-      r.bookedDays = r.paidDays;
-    });
-    plan.newRentals.filter((n) => n.customerId === customerId).forEach((n) => {
-      const paidDays = Math.max(daysBetween(n.startDate, n.endDate || todayISO()), 0);
-      realRentals.push({ id: "mgr_r" + n.rowNumber, mgrRowNumber: n.rowNumber, customerId, bikeModel: n.bikeNameRaw, bikeNameRaw: n.bikeNameRaw, plate: "", startDate: n.startDate, endDate: n.endDate || null, bookedDays: paidDays, paidDays, revenue: n.revenue, status: n.status });
-    });
-
-    const stats = customerStats(customer, realRentals);
-    const status = computeCustomerStatus(customer, stats);
-    const suggestions = getSuggestions(customer, stats);
-    previews.push(buildLoyaltyPreviewEntry(customer.name, stats, status, suggestions));
-  });
-
-  // Genuinely new customers — no DB.data.customers record exists yet, so a temporary
-  // preview-only customer object is used purely for this calculation.
-  const newCustomerNames = new Set();
-  plan.newRentals.filter((r) => !r.customerId).forEach((r) => {
-    const key = normalizeText(r.customerName);
-    if (newCustomerNames.has(key)) return;
-    newCustomerNames.add(key);
-    const previewCustomer = { id: "preview-only-" + key, name: r.customerName };
-    const rentalsForThisNewCustomer = plan.newRentals.filter((n) => !n.customerId && normalizeText(n.customerName) === key).map((n) => {
-      const paidDays = Math.max(daysBetween(n.startDate, n.endDate || todayISO()), 0);
-      return { id: "mgr_r" + n.rowNumber, mgrRowNumber: n.rowNumber, customerId: previewCustomer.id, bikeModel: n.bikeNameRaw, bikeNameRaw: n.bikeNameRaw, plate: "", startDate: n.startDate, endDate: n.endDate || null, bookedDays: paidDays, paidDays, revenue: n.revenue, status: n.status };
-    });
-    const stats = customerStats(previewCustomer, rentalsForThisNewCustomer);
-    const status = computeCustomerStatus(previewCustomer, stats);
-    const suggestions = getSuggestions(previewCustomer, stats);
-    previews.push(buildLoyaltyPreviewEntry(previewCustomer.name, stats, status, suggestions));
-  });
-
-  return previews;
-}
-
+// Builds the per-customer Loyalty Preview for the simplified model — runs the real,
+// unmodified customerStats()/computeCustomerStatus()/getSuggestions() against a simulated
+// rentals array where this customer's Manager rows are the ONLY operational rentals
+// (matching exactly what executeManagerSync() would produce), while any of their legacy
+// Gift Tracker rentals remain present but excluded from the sums — same rule
+// customerStats() itself applies once real Manager data exists. Nothing is written.
+// Shared shape-builder for a single customer's loyalty preview row — extracts eligible vs.
+// already-given rewards from getSuggestions()'s real output, never a simplified copy.
 function buildLoyaltyPreviewEntry(name, stats, status, suggestions) {
   const rewardsGiven = suggestions.filter((s) => s.reward && s.reward.given).map((s) => s.title);
   const eligible = suggestions.filter((s) => !(s.reward && s.reward.given) && s.eligible).map((s) => s.title);
@@ -3445,73 +3234,79 @@ function buildLoyaltyPreviewEntry(name, stats, status, suggestions) {
   };
 }
 
-// The actual write. Builds every change in memory first, validates, then
-// calls DB.save() once. Only ever touches DB.data.customers and
-// DB.data.rentals — never DB.data.rewards, never Vehicle Renewal, never
-// Settings. New rentals get a deterministic id ("mgr_r" + row number) so
-// re-running a sync naturally recognizes the same row via mgrRowNumber
-// even before checking anything else.
+function buildManagerSyncLoyaltyPreview(plan) {
+  return plan.resolvedCustomers.map((rc) => {
+    const customer = rc.customerId ? DB.data.customers.find((c) => c.id === rc.customerId) : { id: "preview-only-" + normalizeText(rc.customerName), name: rc.customerName };
+    const legacyRentals = rc.customerId ? customerRentals(rc.customerId) : [];
+    const managerRentals = rc.rows.map((row) => {
+      const paidDays = Math.max(daysBetween(row.startDate, row.endDate || todayISO()), 0);
+      return { id: "mgr_r" + row.rowNumber, mgrRowNumber: row.rowNumber, customerId: customer.id, bikeModel: row.bikeNameRaw, bikeNameRaw: row.bikeNameRaw, plate: "", startDate: row.startDate, endDate: row.endDate || null, bookedDays: paidDays, paidDays, revenue: row.revenue, status: row.status };
+    });
+    const simulatedRentals = [...legacyRentals, ...managerRentals];
+    const stats = customerStats(customer, simulatedRentals);
+    const status = computeCustomerStatus(customer, stats);
+    const suggestions = getSuggestions(customer, stats);
+    return { ...buildLoyaltyPreviewEntry(rc.customerName, stats, status, suggestions), isNew: rc.isNew, visitCount: rc.rows.length };
+  });
+}
+
+// The actual write. For each safely resolved customer: create the customer if genuinely
+// new, then upsert one rental per Manager row (id = "mgr_r" + row number, so re-running the
+// sync naturally updates the same records rather than duplicating them). Legacy Gift
+// Tracker rentals for that customer are never touched, deleted, or modified — they remain
+// exactly as they were, simply excluded from operational sums by customerStats() once
+// Manager-linked rentals exist for that customer. Rewards are never touched here.
 function executeManagerSync(plan) {
   const beforeRewards = JSON.stringify(DB.data.rewards);
   const beforeVehicles = JSON.stringify(DB.data.vehicles);
 
-  const customerIdByName = {};
-  plan.newCustomers.forEach((nc) => {
-    const id = uid("c");
-    DB.data.customers.push({ id, name: nc.name, mergedNames: [], nationality: nc.nationality || "", passport: nc.passport || null, phone: "", notes: "", firstSeen: todayISO(), source: "manager_sync" });
-    customerIdByName[normalizeText(nc.name)] = id;
-  });
+  let customersCreated = 0, rentalsCreated = 0, rentalsUpdated = 0;
 
-  plan.newRentals.forEach((nr) => {
-    const customerId = nr.customerId || customerIdByName[normalizeText(nr.customerName)];
-    if (!customerId) return; // should never happen — belt and braces, never crash a sync over one bad row
-    const paidDays = Math.max(daysBetween(nr.startDate, nr.endDate || todayISO()), 0);
-    DB.data.rentals.push({
-      id: "mgr_r" + nr.rowNumber, mgrRowNumber: nr.rowNumber, customerId,
-      bikeModel: nr.bikeNameRaw, bikeNameRaw: nr.bikeNameRaw, plate: "",
-      startDate: nr.startDate, endDate: nr.endDate || null,
-      bookedDays: paidDays, paidDays, revenue: nr.revenue, status: nr.status,
+  plan.resolvedCustomers.forEach((rc) => {
+    let customerId = rc.customerId;
+    if (!customerId) {
+      customerId = uid("c");
+      DB.data.customers.push({ id: customerId, name: rc.customerName, mergedNames: [], nationality: rc.nationality || "", passport: rc.passport || null, phone: "", notes: "", firstSeen: todayISO(), source: "manager_sync" });
+      customersCreated++;
+    }
+    rc.rows.forEach((row) => {
+      const paidDays = Math.max(daysBetween(row.startDate, row.endDate || todayISO()), 0);
+      const rentalId = "mgr_r" + row.rowNumber;
+      const existing = DB.data.rentals.find((r) => r.id === rentalId);
+      if (existing) {
+        existing.startDate = row.startDate; existing.endDate = row.endDate || null;
+        existing.revenue = row.revenue; existing.status = row.status;
+        existing.bikeModel = row.bikeNameRaw; existing.bikeNameRaw = row.bikeNameRaw;
+        existing.bookedDays = paidDays; existing.paidDays = paidDays;
+        existing.customerId = customerId; existing.mgrRowNumber = row.rowNumber;
+        rentalsUpdated++;
+      } else {
+        DB.data.rentals.push({ id: rentalId, mgrRowNumber: row.rowNumber, customerId, bikeModel: row.bikeNameRaw, bikeNameRaw: row.bikeNameRaw, plate: "", startDate: row.startDate, endDate: row.endDate || null, bookedDays: paidDays, paidDays, revenue: row.revenue, status: row.status });
+        rentalsCreated++;
+      }
     });
   });
 
-  plan.updatedRentals.forEach((ur) => {
-    const rental = DB.data.rentals.find((r) => r.id === ur.rentalId);
-    if (!rental) return;
-    rental.mgrRowNumber = ur.rowNumber;
-    if (!ur.linkOnly) {
-      rental.startDate = ur.after.startDate;
-      rental.endDate = ur.after.endDate || null;
-      rental.revenue = ur.after.revenue;
-      rental.status = ur.after.status;
-      rental.paidDays = Math.max(daysBetween(rental.startDate, rental.endDate || todayISO()), 0);
-      rental.bookedDays = rental.paidDays;
-    }
-  });
-
   if (JSON.stringify(DB.data.rewards) !== beforeRewards || JSON.stringify(DB.data.vehicles) !== beforeVehicles) {
-    // Should be structurally impossible given the code above, but never save
-    // if this guard somehow trips.
     return { success: false, reason: "Aborted — unexpected change detected outside customers/rentals." };
   }
 
   DB.save();
   return {
     success: true,
-    customersCreated: plan.newCustomers.length,
-    rentalsCreated: plan.newRentals.length,
-    rentalsUpdated: plan.updatedRentals.filter((r) => !r.linkOnly).length,
-    rentalsLinkedOnly: plan.updatedRentals.filter((r) => r.linkOnly).length,
-    unchanged: plan.unchanged.length,
+    customersCreated, rentalsCreated, rentalsUpdated,
+    customersProcessed: plan.resolvedCustomers.length,
     needsReview: plan.needsReview.length,
   };
 }
+
 
 function renderManagerSyncScreen() {
   return `
     <header class="screen-header">
       <button class="back-btn" data-goto="settings">‹ Settings</button>
       <h1 class="screen-title" style="margin-top:8px;">Check for Updates from Manager</h1>
-      <p class="screen-sub">Read-only pull from the Manager/booking system. This app never writes back to that Sheet — only ever fetches. Nothing here runs automatically; it only checks when you press the button.</p>
+      <p class="screen-sub">Read-only pull from the Manager/booking system. Manager Live is now the operational source of rental activity for any customer we can safely identify. This app never writes back to that Sheet — only ever fetches. Nothing here runs automatically; it only checks when you press the button.</p>
     </header>
     <div class="screen-body">
       ${state.managerSyncStatus === "idle" ? `
@@ -3532,85 +3327,40 @@ function renderManagerSyncScreen() {
 
       ${state.managerSyncStatus === "preview" && state.managerSyncPlan ? (() => {
         const p = state.managerSyncPlan;
-        const realUpdates = p.updatedRentals.filter((r) => !r.linkOnly);
-        const linkOnly = p.updatedRentals.filter((r) => r.linkOnly);
+        const newCustomerCount = p.resolvedCustomers.filter((c) => c.isNew).length;
+        const loyaltyPreviews = buildManagerSyncLoyaltyPreview(p);
         return `
           <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
-            <div class="report-tile"><div class="report-tile-value" style="color:var(--green);">${p.newRentals.length}</div><div class="report-tile-label">New Rentals</div></div>
-            <div class="report-tile"><div class="report-tile-value">${realUpdates.length}</div><div class="report-tile-label">Updated Rentals</div></div>
-            <div class="report-tile"><div class="report-tile-value">${p.unchanged.length + linkOnly.length}</div><div class="report-tile-label">Unchanged</div></div>
-            <div class="report-tile"><div class="report-tile-value" style="color:${p.needsReview.length > 0 ? "var(--red)" : "var(--ink)"};">${p.needsReview.length}</div><div class="report-tile-label">Needs Review</div></div>
-          </div>
-          <div class="card" style="margin-bottom:16px;">
-            <div class="muted" style="font-size:12.5px;">New customers to be created</div>
-            <div style="font-weight:700; margin-top:4px;">${p.newCustomers.length}</div>
+            <div class="report-tile"><div class="report-tile-value" style="color:var(--green);">${p.resolvedCustomers.length}</div><div class="report-tile-label">Customers Identified</div></div>
+            <div class="report-tile"><div class="report-tile-value">${newCustomerCount}</div><div class="report-tile-label">New Customers</div></div>
+            <div class="report-tile"><div class="report-tile-value">${p.resolvedCustomers.reduce((s, c) => s + c.rows.length, 0)}</div><div class="report-tile-label">Manager Rows Processed</div></div>
+            <div class="report-tile"><div class="report-tile-value" style="color:${p.needsReview.length > 0 ? "var(--red)" : "var(--ink)"};">${p.needsReview.length}</div><div class="report-tile-label">Needs Review (identity only)</div></div>
           </div>
 
-          ${p.newRentals.length > 0 ? `
-            <div class="section-title">New Rentals</div>
-            ${p.newRentals.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <b>${escapeHtml(r.customerName)}</b> · ${escapeHtml(r.bikeNameRaw)} · ${fmtDate(r.startDate)} → ${r.endDate ? fmtDate(r.endDate) : "ongoing"} · ${fmtMoney(r.revenue)}</div>`).join("")}
-          ` : ""}
-
-          ${realUpdates.length > 0 ? `
-            <div class="section-title">Updated Rentals</div>
-            ${realUpdates.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <b>${escapeHtml(r.customerName)}</b><br/><span class="muted">${escapeHtml(r.before.status)}, ${r.before.endDate ? fmtDate(r.before.endDate) : "ongoing"}, ${fmtMoney(r.before.revenue)} → ${escapeHtml(r.after.status)}, ${r.after.endDate ? fmtDate(r.after.endDate) : "ongoing"}, ${fmtMoney(r.after.revenue)}</span></div>`).join("")}
-          ` : ""}
-
-          ${(() => {
-            const loyaltyPreviews = buildManagerSyncLoyaltyPreview(p);
-            if (loyaltyPreviews.length === 0) return "";
-            return `
-              <div class="section-title">Loyalty Preview — resulting status after this sync</div>
-              ${loyaltyPreviews.map((lp) => `
-                <div class="card" style="margin-bottom:10px;">
-                  <div style="font-weight:700; margin-bottom:6px;">${escapeHtml(lp.name)}</div>
-                  <div class="grid-2" style="margin-bottom:6px;">
-                    <div><div class="muted" style="font-size:11px;">Status</div><div style="font-weight:700;">${escapeHtml(lp.statusLabel)}</div></div>
-                    <div><div class="muted" style="font-size:11px;">Operational Days</div><div>${lp.operationalDays}</div></div>
-                    <div><div class="muted" style="font-size:11px;">Visits</div><div>${lp.visits}</div></div>
-                    <div><div class="muted" style="font-size:11px;">2026 Revenue</div><div>${fmtMoney(lp.revenue2026)}</div></div>
-                  </div>
-                  <div class="muted" style="font-size:11.5px;">Eligible: ${lp.eligibleRewards.length ? escapeHtml(lp.eligibleRewards.join(", ")) : "none yet"}</div>
-                  <div class="muted" style="font-size:11.5px;">Already given: ${lp.rewardsGiven.length ? escapeHtml(lp.rewardsGiven.join(", ")) : "none"}</div>
+          ${loyaltyPreviews.length > 0 ? `
+            <div class="section-title">Loyalty Preview — resulting status from Manager data</div>
+            ${loyaltyPreviews.map((lp) => `
+              <div class="card" style="margin-bottom:10px;">
+                <div class="card-row" style="margin-bottom:6px;">
+                  <div style="font-weight:700;">${escapeHtml(lp.name)}</div>
+                  ${lp.isNew ? `<span class="pill pill-green">New Customer Record</span>` : ""}
                 </div>
-              `).join("")}
-            `;
-          })()}
-
-          ${p.needsReview.length > 0 ? (() => {
-            const CATEGORY_LABELS = {
-              missing_data: "Missing/invalid customer name or start date",
-              multiple_customer_match: "Multiple customer identity matches",
-              passport_conflict: "Passport/name conflict",
-              multiple_rental_match: "Multiple existing rental matches",
-              cross_row_collision: "Cross-row collision (same rental targeted by 2+ rows)",
-              completed_to_active: "Completed → Active safeguard",
-              zero_day_duplicate: "Zero-day/manual duplicate involvement",
-              other: "Other",
-            };
-            const counts = {};
-            p.needsReview.forEach((r) => { counts[r.category] = (counts[r.category] || 0) + 1; });
-            const total = p.needsReview.length;
-            const rows = Object.keys(counts).sort((a, b) => counts[b] - counts[a]);
-            return `
-              <div class="section-title">Needs Review Breakdown</div>
-              <div class="card" style="margin-bottom:16px;">
-                ${rows.map((cat) => `
-                  <div class="status-line" style="margin-bottom:6px;">
-                    <span>${escapeHtml(CATEGORY_LABELS[cat] || cat)}</span>
-                    <b>${counts[cat]} <span class="muted" style="font-weight:400;">(${Math.round((counts[cat] / total) * 100)}%)</span></b>
-                  </div>
-                `).join("")}
-                <div class="status-line" style="margin-top:6px; padding-top:6px; border-top: 1px solid var(--line);">
-                  <span class="muted">Total Needs Review</span>
-                  <b>${total}</b>
+                <div class="grid-2" style="margin-bottom:6px;">
+                  <div><div class="muted" style="font-size:11px;">Status</div><div style="font-weight:700;">${escapeHtml(lp.statusLabel)}</div></div>
+                  <div><div class="muted" style="font-size:11px;">Approx. Visits</div><div>${lp.visitCount}</div></div>
+                  <div><div class="muted" style="font-size:11px;">Operational Days</div><div>${lp.operationalDays}</div></div>
+                  <div><div class="muted" style="font-size:11px;">Revenue</div><div>${fmtMoney(lp.revenue2026)}</div></div>
                 </div>
+                <div class="muted" style="font-size:11.5px;">Eligible now: ${lp.eligibleRewards.length ? escapeHtml(lp.eligibleRewards.join(", ")) : "none yet"}</div>
+                <div class="muted" style="font-size:11.5px;">Already given: ${lp.rewardsGiven.length ? escapeHtml(lp.rewardsGiven.join(", ")) : "none"}</div>
               </div>
+            `).join("")}
+          ` : ""}
 
-              <div class="section-title">Needs Review (skipped — not applied automatically)</div>
-              ${p.needsReview.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <span class="pill pill-neutral" style="font-size:10.5px;">${escapeHtml(CATEGORY_LABELS[r.category] || r.category)}</span><br/><span class="muted">${escapeHtml(r.reason)}</span></div>`).join("")}
-            `;
-          })() : ""}
+          ${p.needsReview.length > 0 ? `
+            <div class="section-title">Needs Review — identity could not be safely established</div>
+            ${p.needsReview.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row(s) ${escapeHtml(String(r.rowNumber))}${r.name ? " · <b>" + escapeHtml(r.name) + "</b>" : ""}<br/><span class="muted">${escapeHtml(r.reason)}</span></div>`).join("")}
+          ` : ""}
 
           <button class="btn btn-primary btn-block" id="apply-manager-sync" style="margin-top:16px;">Apply Updates</button>
           <button class="btn btn-outline btn-block" id="cancel-manager-sync" style="margin-top:8px;">Cancel</button>
@@ -3623,10 +3373,10 @@ function renderManagerSyncScreen() {
           <div class="card" style="border: 1.5px solid var(--green);">
             <div style="font-weight:700; color:var(--green); margin-bottom:8px;">Sync complete</div>
             <div class="grid-2">
+              <div><div class="muted" style="font-size:11.5px;">Customers processed</div><div style="font-weight:700;">${r.customersProcessed}</div></div>
               <div><div class="muted" style="font-size:11.5px;">New customers</div><div style="font-weight:700;">${r.customersCreated}</div></div>
-              <div><div class="muted" style="font-size:11.5px;">New rentals</div><div style="font-weight:700;">${r.rentalsCreated}</div></div>
-              <div><div class="muted" style="font-size:11.5px;">Updated rentals</div><div style="font-weight:700;">${r.rentalsUpdated}</div></div>
-              <div><div class="muted" style="font-size:11.5px;">Unchanged</div><div style="font-weight:700;">${r.unchanged + r.rentalsLinkedOnly}</div></div>
+              <div><div class="muted" style="font-size:11.5px;">Rentals created</div><div style="font-weight:700;">${r.rentalsCreated}</div></div>
+              <div><div class="muted" style="font-size:11.5px;">Rentals updated</div><div style="font-weight:700;">${r.rentalsUpdated}</div></div>
               <div><div class="muted" style="font-size:11.5px;">Needing review (skipped)</div><div style="font-weight:700;">${r.needsReview}</div></div>
             </div>
           </div>
@@ -3881,13 +3631,24 @@ function customerStats(customer, simulatedRentals) {
   const current = rentals.find((r) => r.status === "active") || null;
   const completed = rentals.filter((r) => r.status === "completed");
 
+  // MANAGER SUPERSEDES LEGACY: if this customer has ANY Manager-linked rental
+  // (mgrRowNumber present), Manager Live is now their operational source of truth — ONLY
+  // Manager-linked rentals count toward loyalty. Legacy Gift Tracker rentals stay fully
+  // visible in `rentals` above (archive/history), they just stop being summed, so an old
+  // duplicate/historical record can never double-count alongside real current Manager
+  // activity. A customer with no Manager data at all is completely unaffected by this and
+  // continues exactly as before, segments and all.
+  const hasManagerData = rentals.some((r) => r.mgrRowNumber !== undefined && r.mgrRowNumber !== null);
+  const operationalSource = hasManagerData ? rentals.filter((r) => r.mgrRowNumber !== undefined && r.mgrRowNumber !== null) : rentals;
+
   // A SEPARATE array, used ONLY for the operational summing loop below — a merged canonical
   // rental (one with `segments`) is expanded into its real visit blocks here, and ONLY
   // here. Non-merged rentals pass through unchanged. This is what "operational loyalty
   // calculations use the reconstructed real segments" actually means: the calculation
   // layer sees real visits; the display/history/reward-linking layer still sees the one
-  // real canonical record it always has.
-  const forCalculation = rentals.flatMap((r) => (r.segments ? buildVisitsFromSegments(r) : [r]));
+  // real canonical record it always has. (Manager-linked rentals never carry `segments`, so
+  // this expansion is a no-op once Manager data supersedes legacy for a customer.)
+  const forCalculation = operationalSource.flatMap((r) => (r.segments ? buildVisitsFromSegments(r) : [r]));
   const artifactRentalIds = computeArtifactRentalIds(forCalculation);
 
   // ONE pass, through the ONE centralized helper, per the approved overlap model. Per-rental
@@ -7407,9 +7168,10 @@ function wireScreenEvents() {
   if (applyManagerSyncBtn) applyManagerSyncBtn.addEventListener("click", () => {
     const plan = state.managerSyncPlan;
     if (!plan) return;
-    const realUpdates = plan.updatedRentals.filter((r) => !r.linkOnly).length;
+    const newCustomerCount = plan.resolvedCustomers.filter((c) => c.isNew).length;
+    const totalRows = plan.resolvedCustomers.reduce((s, c) => s + c.rows.length, 0);
     confirmSheet(
-      `This will add ${plan.newRentals.length} new rental(s) and ${plan.newCustomers.length} new customer(s), and update ${realUpdates} existing rental(s), based on the Manager system. Reward records are never touched. This app never writes back to the Manager Sheet.`,
+      `This will use Manager Live rental data as the operational source for ${plan.resolvedCustomers.length} identified customer(s) (${newCustomerCount} new), covering ${totalRows} Manager row(s). Legacy Gift Tracker history stays archived, not deleted. Reward records are never touched. This app never writes back to the Manager Sheet.`,
       () => {
         const result = executeManagerSync(plan);
         if (result.success) {
