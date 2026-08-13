@@ -67,6 +67,12 @@ const LEGACY_CUTOFF_DATE = "2026-01-01";
 // different question (when Welcome/Journey Gift specifically became available) and stays
 // staff-editable exactly as before.
 
+// The confirmed, live, read-only endpoint on the AA Scooters Manager/booking system's
+// Apps Script backend, added specifically for this app (never affects the Manager system's
+// own pages or actions). GET only — this app never sends anything to it. Deployment
+// verified live and returning correctly-shaped JSON before this was wired in.
+const MANAGER_SYNC_URL = "https://script.google.com/macros/s/AKfycbztdtViH9qFCZ755EefaZqiZWzKK_yTOWkwaFLqZJm271wzDIVMgGoaYGFaSrd20OGsnQ/exec?action=giftTrackerRentals2026";
+
 // Premium Ride Experience / VIP Extra Day both use the same cycle mechanic: 180+ cumulative
 // PAID days (an active rental counts in full — no requirement to return first) since the
 // last time that specific reward was used. Lifetime paid days never reset; this does.
@@ -2729,6 +2735,294 @@ function renderReconcileResultScreen() {
 }
 
 /* ---------------------------------------------------------------------- */
+/* MANAGER SYNC — staff-triggered, read-only pull from the AA Scooters      */
+/* Manager/booking system's Apps Script endpoint (MANAGER_SYNC_URL). This   */
+/* app NEVER writes back to that Sheet — only ever a GET. The Manager       */
+/* system remains the single source of truth for customer/rental identity; */
+/* this only ever reads from it, on demand, never on a timer. Reward        */
+/* records are never touched by anything in this section.                  */
+/* ---------------------------------------------------------------------- */
+
+// Turns one raw Manager row (fixed column positions, confirmed against the
+// live endpoint — see MANAGER_SYNC_URL) into a normalized shape. Positional,
+// not header-text-based, since a couple of the real headers are blank or
+// inconsistently spaced. Returns null for a row too incomplete to use
+// (blank name or unparseable start date) rather than guessing at it.
+function parseManagerRow(row) {
+  const v = row.values || [];
+  const name = String(v[2] || "").trim();
+  const startDate = parseDateLoose(v[7]);
+  if (!name || !startDate) return null; // incomplete/junk row — flagged NEEDS REVIEW by the caller, never silently dropped
+  const nationality = String(v[3] || "").trim();
+  const passport = String(v[4] || "").trim();
+  const bikeNameRaw = String(v[5] || "").trim();
+  const endDateRaw = String(v[8] || "").trim();
+  const endDate = endDateRaw ? parseDateLoose(v[8]) : "";
+  const revenue = Number(String(v[11] == null ? "" : v[11]).replace(/[^\d.-]/g, "")) || 0;
+  const situation = String(v[13] || "").trim();
+  const status = situation.toLowerCase() === "returned" ? "completed" : "active";
+  return { rowNumber: row.rowNumber, name, nationality, passport, bikeNameRaw, startDate, endDate, revenue, status };
+}
+
+// Pure, read-only. Fetches nothing itself — takes already-fetched Manager
+// rows and compares them against current DB.data, producing a plan of what
+// a sync WOULD do. Never mutates DB.data. Mirrors the same customer-name +
+// raw-bike-identity + date-overlap matching already fixed for the CSV
+// importer, so the same duplicate-prevention guarantee applies here too.
+// Conservative passport normalization for Manager Sync identity matching — trim, case-
+// insensitive, harmless internal spaces removed. No partial/fuzzy matching of any kind.
+function normalizePassport(p) {
+  if (!p) return "";
+  return String(p).trim().toUpperCase().replace(/\s+/g, "");
+}
+
+function buildManagerSyncPlan(managerData) {
+  const todayIso = todayISO();
+  const plan = { newCustomers: [], newRentals: [], updatedRentals: [], unchanged: [], needsReview: [] };
+
+  (managerData.rows || []).forEach((raw) => {
+    const parsed = parseManagerRow(raw);
+    if (!parsed) {
+      plan.needsReview.push({ rowNumber: raw.rowNumber, reason: "Missing customer name or a valid start date.", raw: raw.values });
+      return;
+    }
+
+    // Step A — already synced from this exact Manager row before?
+    const existingByRow = DB.data.rentals.find((r) => r.mgrRowNumber === parsed.rowNumber);
+    if (existingByRow) {
+      const changed = existingByRow.startDate !== parsed.startDate || (existingByRow.endDate || "") !== parsed.endDate
+        || Number(existingByRow.revenue) !== parsed.revenue || existingByRow.status !== parsed.status
+        || (existingByRow.bikeNameRaw || "") !== parsed.bikeNameRaw;
+      if (changed) {
+        plan.updatedRentals.push({ rowNumber: parsed.rowNumber, rentalId: existingByRow.id, customerName: parsed.name, before: { startDate: existingByRow.startDate, endDate: existingByRow.endDate, revenue: existingByRow.revenue, status: existingByRow.status }, after: { startDate: parsed.startDate, endDate: parsed.endDate, revenue: parsed.revenue, status: parsed.status } });
+      } else {
+        plan.unchanged.push({ rowNumber: parsed.rowNumber, rentalId: existingByRow.id, customerName: parsed.name });
+      }
+      return;
+    }
+
+    // Step B — not yet linked to a Manager row. Could still be an existing
+    // rental (already imported historically, or already logged manually)
+    // that simply hasn't been matched to this row before.
+    //
+    // Customer identity: passport number is a second, high-confidence signal, checked
+    // FIRST — it can resolve cases plain name matching can't (e.g. a historical record
+    // whose name is stored in a different word order than the Manager sheet writes it).
+    // Deliberately NOT fuzzy: exact match only, on a conservatively normalized passport
+    // (trim/case/harmless spaces only). Never used to silently override a genuine name
+    // conflict — see the conflict check below.
+    const parsedPassport = normalizePassport(parsed.passport);
+    const byPassport = parsedPassport ? DB.data.customers.filter((c) => normalizePassport(c.passport) === parsedPassport) : [];
+    if (parsedPassport && byPassport.length > 1) {
+      plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Passport "${parsed.passport}" matches more than one existing customer — cannot safely pick one.` });
+      return;
+    }
+
+    // Compare CLEANED names (honorifics stripped from both sides) — Gift Tracker's own
+    // stored customer names are inconsistent about carrying "Mr./Ms./Mrs./Miss" (some do,
+    // some don't, e.g. Byron's has none while the Manager sheet always writes "Mr."), so raw
+    // normalizeText alone missed real matches and would have created duplicate customers.
+    const matchingCustomers = DB.data.customers.filter((c) => normalizeText(cleanCustomerDisplayName(c.name)) === normalizeText(cleanCustomerDisplayName(parsed.name)));
+
+    let existingCustomer = null;
+    if (parsedPassport && byPassport.length === 1) {
+      const passportCustomer = byPassport[0];
+      // If name-matching independently points at a DIFFERENT customer than the passport
+      // match, that's a genuine identity conflict — passport must never silently win.
+      if (matchingCustomers.length > 0 && !matchingCustomers.some((c) => c.id === passportCustomer.id)) {
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Passport matches "${passportCustomer.name}" but the name on this row matches a different existing customer — conflict, not resolved automatically.` });
+        return;
+      }
+      existingCustomer = passportCustomer; // resolves cases plain name-matching alone would miss
+    } else {
+      // No usable passport signal (blank on either side, or no passport match at all) —
+      // fall back to name-only matching, exactly as before.
+      if (matchingCustomers.length > 1) {
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Customer name "${parsed.name}" matches more than one existing customer — cannot safely pick one.` });
+        return;
+      }
+      existingCustomer = matchingCustomers[0] || null;
+    }
+
+    // Rental-level ambiguity protection, unchanged from before, applied against whichever
+    // customer was safely identified above.
+    let candidateRental = null;
+    if (existingCustomer) {
+      const candidates = DB.data.rentals.filter((r) => {
+        if (r.customerId !== existingCustomer.id) return false;
+        const existingRawBike = r.bikeNameRaw || r.bikeModel;
+        if (normalizeText(existingRawBike) !== normalizeText(parsed.bikeNameRaw)) return false;
+        const rEnd = r.endDate || r.startDate;
+        const pEnd = parsed.endDate || parsed.startDate;
+        return parsed.startDate <= rEnd && pEnd >= r.startDate;
+      });
+      if (candidates.length > 1) {
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, reason: `Multiple existing rentals for ${parsed.name} overlap this row's dates/bike — cannot safely pick one.` });
+        return;
+      }
+      candidateRental = candidates[0] || null;
+    }
+
+    if (candidateRental) {
+      // A real existing rental, just never linked to this Manager row before.
+      const changed = candidateRental.startDate !== parsed.startDate || (candidateRental.endDate || "") !== parsed.endDate
+        || Number(candidateRental.revenue) !== parsed.revenue || candidateRental.status !== parsed.status;
+      plan.updatedRentals.push({ rowNumber: parsed.rowNumber, rentalId: candidateRental.id, customerName: parsed.name, linkOnly: !changed, before: { startDate: candidateRental.startDate, endDate: candidateRental.endDate, revenue: candidateRental.revenue, status: candidateRental.status }, after: { startDate: parsed.startDate, endDate: parsed.endDate, revenue: parsed.revenue, status: parsed.status } });
+      return;
+    }
+
+    // Genuinely new rental. New customer too, if none matched by name.
+    plan.newRentals.push({ rowNumber: parsed.rowNumber, customerName: parsed.name, customerId: existingCustomer ? existingCustomer.id : null, nationality: parsed.nationality, passport: parsed.passport, bikeNameRaw: parsed.bikeNameRaw, startDate: parsed.startDate, endDate: parsed.endDate, revenue: parsed.revenue, status: parsed.status });
+    if (!existingCustomer && !plan.newCustomers.some((c) => normalizeText(c.name) === normalizeText(parsed.name))) {
+      plan.newCustomers.push({ name: parsed.name, nationality: parsed.nationality, passport: parsed.passport });
+    }
+  });
+
+  return plan;
+}
+
+// The actual write. Builds every change in memory first, validates, then
+// calls DB.save() once. Only ever touches DB.data.customers and
+// DB.data.rentals — never DB.data.rewards, never Vehicle Renewal, never
+// Settings. New rentals get a deterministic id ("mgr_r" + row number) so
+// re-running a sync naturally recognizes the same row via mgrRowNumber
+// even before checking anything else.
+function executeManagerSync(plan) {
+  const beforeRewards = JSON.stringify(DB.data.rewards);
+  const beforeVehicles = JSON.stringify(DB.data.vehicles);
+
+  const customerIdByName = {};
+  plan.newCustomers.forEach((nc) => {
+    const id = uid("c");
+    DB.data.customers.push({ id, name: nc.name, mergedNames: [], nationality: nc.nationality || "", passport: nc.passport || null, phone: "", notes: "", firstSeen: todayISO(), source: "manager_sync" });
+    customerIdByName[normalizeText(nc.name)] = id;
+  });
+
+  plan.newRentals.forEach((nr) => {
+    const customerId = nr.customerId || customerIdByName[normalizeText(nr.customerName)];
+    if (!customerId) return; // should never happen — belt and braces, never crash a sync over one bad row
+    const paidDays = Math.max(daysBetween(nr.startDate, nr.endDate || todayISO()), 0);
+    DB.data.rentals.push({
+      id: "mgr_r" + nr.rowNumber, mgrRowNumber: nr.rowNumber, customerId,
+      bikeModel: nr.bikeNameRaw, bikeNameRaw: nr.bikeNameRaw, plate: "",
+      startDate: nr.startDate, endDate: nr.endDate || null,
+      bookedDays: paidDays, paidDays, revenue: nr.revenue, status: nr.status,
+    });
+  });
+
+  plan.updatedRentals.forEach((ur) => {
+    const rental = DB.data.rentals.find((r) => r.id === ur.rentalId);
+    if (!rental) return;
+    rental.mgrRowNumber = ur.rowNumber;
+    if (!ur.linkOnly) {
+      rental.startDate = ur.after.startDate;
+      rental.endDate = ur.after.endDate || null;
+      rental.revenue = ur.after.revenue;
+      rental.status = ur.after.status;
+      rental.paidDays = Math.max(daysBetween(rental.startDate, rental.endDate || todayISO()), 0);
+      rental.bookedDays = rental.paidDays;
+    }
+  });
+
+  if (JSON.stringify(DB.data.rewards) !== beforeRewards || JSON.stringify(DB.data.vehicles) !== beforeVehicles) {
+    // Should be structurally impossible given the code above, but never save
+    // if this guard somehow trips.
+    return { success: false, reason: "Aborted — unexpected change detected outside customers/rentals." };
+  }
+
+  DB.save();
+  return {
+    success: true,
+    customersCreated: plan.newCustomers.length,
+    rentalsCreated: plan.newRentals.length,
+    rentalsUpdated: plan.updatedRentals.filter((r) => !r.linkOnly).length,
+    rentalsLinkedOnly: plan.updatedRentals.filter((r) => r.linkOnly).length,
+    unchanged: plan.unchanged.length,
+    needsReview: plan.needsReview.length,
+  };
+}
+
+function renderManagerSyncScreen() {
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="settings">‹ Settings</button>
+      <h1 class="screen-title" style="margin-top:8px;">Check for Updates from Manager</h1>
+      <p class="screen-sub">Read-only pull from the Manager/booking system. This app never writes back to that Sheet — only ever fetches. Nothing here runs automatically; it only checks when you press the button.</p>
+    </header>
+    <div class="screen-body">
+      ${state.managerSyncStatus === "idle" ? `
+        <button class="btn btn-primary btn-block" id="check-manager-updates">Check Now</button>
+      ` : ""}
+
+      ${state.managerSyncStatus === "fetching" ? `
+        <div class="card"><p class="muted">Checking the Manager system…</p></div>
+      ` : ""}
+
+      ${state.managerSyncStatus === "error" ? `
+        <div class="card" style="border: 1.5px solid var(--red);">
+          <div style="font-weight:700; color:var(--red); margin-bottom:8px;">Couldn't reach the Manager system</div>
+          <p class="muted">${escapeHtml(state.managerSyncError || "Unknown error.")}</p>
+        </div>
+        <button class="btn btn-outline btn-block" id="check-manager-updates" style="margin-top:12px;">Try Again</button>
+      ` : ""}
+
+      ${state.managerSyncStatus === "preview" && state.managerSyncPlan ? (() => {
+        const p = state.managerSyncPlan;
+        const realUpdates = p.updatedRentals.filter((r) => !r.linkOnly);
+        const linkOnly = p.updatedRentals.filter((r) => r.linkOnly);
+        return `
+          <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
+            <div class="report-tile"><div class="report-tile-value" style="color:var(--green);">${p.newRentals.length}</div><div class="report-tile-label">New Rentals</div></div>
+            <div class="report-tile"><div class="report-tile-value">${realUpdates.length}</div><div class="report-tile-label">Updated Rentals</div></div>
+            <div class="report-tile"><div class="report-tile-value">${p.unchanged.length + linkOnly.length}</div><div class="report-tile-label">Unchanged</div></div>
+            <div class="report-tile"><div class="report-tile-value" style="color:${p.needsReview.length > 0 ? "var(--red)" : "var(--ink)"};">${p.needsReview.length}</div><div class="report-tile-label">Needs Review</div></div>
+          </div>
+          <div class="card" style="margin-bottom:16px;">
+            <div class="muted" style="font-size:12.5px;">New customers to be created</div>
+            <div style="font-weight:700; margin-top:4px;">${p.newCustomers.length}</div>
+          </div>
+
+          ${p.newRentals.length > 0 ? `
+            <div class="section-title">New Rentals</div>
+            ${p.newRentals.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <b>${escapeHtml(r.customerName)}</b> · ${escapeHtml(r.bikeNameRaw)} · ${fmtDate(r.startDate)} → ${r.endDate ? fmtDate(r.endDate) : "ongoing"} · ${fmtMoney(r.revenue)}</div>`).join("")}
+          ` : ""}
+
+          ${realUpdates.length > 0 ? `
+            <div class="section-title">Updated Rentals</div>
+            ${realUpdates.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <b>${escapeHtml(r.customerName)}</b><br/><span class="muted">${escapeHtml(r.before.status)}, ${r.before.endDate ? fmtDate(r.before.endDate) : "ongoing"}, ${fmtMoney(r.before.revenue)} → ${escapeHtml(r.after.status)}, ${r.after.endDate ? fmtDate(r.after.endDate) : "ongoing"}, ${fmtMoney(r.after.revenue)}</span></div>`).join("")}
+          ` : ""}
+
+          ${p.needsReview.length > 0 ? `
+            <div class="section-title">Needs Review (skipped — not applied automatically)</div>
+            ${p.needsReview.map((r) => `<div class="reward-note" style="margin-bottom:6px;">Row ${r.rowNumber} · <span class="muted">${escapeHtml(r.reason)}</span></div>`).join("")}
+          ` : ""}
+
+          <button class="btn btn-primary btn-block" id="apply-manager-sync" style="margin-top:16px;">Apply Updates</button>
+          <button class="btn btn-outline btn-block" id="cancel-manager-sync" style="margin-top:8px;">Cancel</button>
+        `;
+      })() : ""}
+
+      ${state.managerSyncStatus === "done" && state.managerSyncResult ? (() => {
+        const r = state.managerSyncResult;
+        return `
+          <div class="card" style="border: 1.5px solid var(--green);">
+            <div style="font-weight:700; color:var(--green); margin-bottom:8px;">Sync complete</div>
+            <div class="grid-2">
+              <div><div class="muted" style="font-size:11.5px;">New customers</div><div style="font-weight:700;">${r.customersCreated}</div></div>
+              <div><div class="muted" style="font-size:11.5px;">New rentals</div><div style="font-weight:700;">${r.rentalsCreated}</div></div>
+              <div><div class="muted" style="font-size:11.5px;">Updated rentals</div><div style="font-weight:700;">${r.rentalsUpdated}</div></div>
+              <div><div class="muted" style="font-size:11.5px;">Unchanged</div><div style="font-weight:700;">${r.unchanged + r.rentalsLinkedOnly}</div></div>
+              <div><div class="muted" style="font-size:11.5px;">Needing review (skipped)</div><div style="font-weight:700;">${r.needsReview}</div></div>
+            </div>
+          </div>
+          <button class="btn btn-outline btn-block" id="check-manager-updates" style="margin-top:16px;">Check Again</button>
+        `;
+      })() : ""}
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------------- */
 /* CSV IMPORT — Google Sheets/CSV is only ever an import & backup source. */
 /* Nothing in the app depends on a live connection to a spreadsheet.      */
 /* ---------------------------------------------------------------------- */
@@ -3372,7 +3666,7 @@ function dashboardStats() {
 /* ROUTER + STATE                                                          */
 /* ---------------------------------------------------------------------- */
 
-const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null };
+const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null, managerSyncStatus: "idle", managerSyncPlan: null, managerSyncError: null, managerSyncResult: null };
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -4862,9 +5156,17 @@ function renderSettings() {
 
       <div class="section-title">Import Existing Data</div>
       <div class="card">
-        <p class="muted" style="margin-bottom:12px;">Bring in customers, rentals, or vehicles from a spreadsheet (e.g. exported from Google Sheets as CSV). This app never reads live from a spreadsheet — import is a one-time or occasional action, and everything then runs from this device's own database. Existing records are matched first; nothing is overwritten without your say-so.</p>
+        <p class="muted" style="margin-bottom:12px;">Bring in customers, rentals, or vehicles from a spreadsheet (e.g. exported from Google Sheets as CSV). This is always a one-time or occasional manual action — nothing here runs automatically. Existing records are matched first; nothing is overwritten without your say-so.</p>
         <div class="btn-row">
           <button class="btn btn-orange btn-sm" id="start-import">Import from CSV…</button>
+        </div>
+      </div>
+
+      <div class="section-title">Manager System</div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px;">Check for new or updated 2026 customer/rental records from the AA Scooters Manager/booking system. Read-only — this app never writes back to that Sheet. Only checks when you press the button, never automatically.</p>
+        <div class="btn-row">
+          <button class="btn btn-orange btn-sm" data-goto="manager-sync">Check for Updates from Manager…</button>
         </div>
       </div>
 
@@ -6105,6 +6407,7 @@ function render() {
     case "reconcile-preview": html = renderReconcilePreviewScreen(); break;
     case "sourcerow-diagnostic": html = renderSourceRowDiagnosticScreen(); break;
     case "nonimport-review": html = renderNonImportClassificationScreen(); break;
+    case "manager-sync": html = renderManagerSyncScreen(); break;
     case "reconcile-confirm": html = renderReconcileConfirmScreen(); break;
     case "reconcile-result": html = renderReconcileResultScreen(); break;
     case "import": html = renderImportScreen(); break;
@@ -6337,6 +6640,63 @@ function wireScreenEvents() {
     a.download = `aa-scooter-manager-backup-pre-reconcile-${todayISO()}.json`;
     a.click();
     toast("Backup exported");
+  });
+
+  // Manager Sync — staff-triggered only, fires exclusively from this click handler.
+  // Nothing anywhere else in the app calls fetch() on MANAGER_SYNC_URL, and there is no
+  // timer of any kind driving this.
+  const checkManagerBtn = document.getElementById("check-manager-updates");
+  if (checkManagerBtn) checkManagerBtn.addEventListener("click", () => {
+    state.managerSyncStatus = "fetching";
+    state.managerSyncError = null;
+    render();
+    fetch(MANAGER_SYNC_URL)
+      .then((res) => {
+        if (!res.ok) throw new Error("Server responded with status " + res.status);
+        return res.json();
+      })
+      .then((data) => {
+        if (!data || data.success !== true) throw new Error((data && data.error) || "Unexpected response shape.");
+        const plan = buildManagerSyncPlan(data);
+        state.managerSyncPlan = plan;
+        state.managerSyncStatus = "preview";
+        render();
+      })
+      .catch((err) => {
+        state.managerSyncError = err.message || String(err);
+        state.managerSyncStatus = "error";
+        render();
+      });
+  });
+
+  const applyManagerSyncBtn = document.getElementById("apply-manager-sync");
+  if (applyManagerSyncBtn) applyManagerSyncBtn.addEventListener("click", () => {
+    const plan = state.managerSyncPlan;
+    if (!plan) return;
+    const realUpdates = plan.updatedRentals.filter((r) => !r.linkOnly).length;
+    confirmSheet(
+      `This will add ${plan.newRentals.length} new rental(s) and ${plan.newCustomers.length} new customer(s), and update ${realUpdates} existing rental(s), based on the Manager system. Reward records are never touched. This app never writes back to the Manager Sheet.`,
+      () => {
+        const result = executeManagerSync(plan);
+        if (result.success) {
+          state.managerSyncResult = result;
+          state.managerSyncStatus = "done";
+          state.managerSyncPlan = null;
+        } else {
+          state.managerSyncError = result.reason;
+          state.managerSyncStatus = "error";
+        }
+        render();
+      },
+      "Apply Updates"
+    );
+  });
+
+  const cancelManagerSyncBtn = document.getElementById("cancel-manager-sync");
+  if (cancelManagerSyncBtn) cancelManagerSyncBtn.addEventListener("click", () => {
+    state.managerSyncPlan = null;
+    state.managerSyncStatus = "idle";
+    render();
   });
 
   const exportBackupConfirmBtn = document.getElementById("export-backup-confirm-screen");
