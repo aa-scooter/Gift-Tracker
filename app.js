@@ -2115,6 +2115,175 @@ function renderNonImportClassificationScreen() {
   `;
 }
 
+/* ---------------------------------------------------------------------- */
+/* CUSTOMER IDENTITY DIAGNOSTIC (READ-ONLY). Scans DB.data.customers for   */
+/* duplicate passport numbers and duplicate cleaned names — the one thing  */
+/* no existing diagnostic in this app currently covers (Non-Import Rental  */
+/* Review, Data Audit, and Source-Row Mapping all operate on rentals, not  */
+/* customer identity). No merge/delete/edit action exists anywhere here.   */
+/* ---------------------------------------------------------------------- */
+
+function buildCustomerIdentityDiagnostic() {
+  const allCustomers = DB.data.customers;
+
+  const byPassport = {};
+  allCustomers.forEach((c) => {
+    const p = normalizePassport(c.passport);
+    if (p) (byPassport[p] = byPassport[p] || []).push(c);
+  });
+  const rawPassportGroups = Object.entries(byPassport).filter(([, cs]) => cs.length > 1);
+
+  const byName = {};
+  allCustomers.forEach((c) => {
+    const n = normalizeText(cleanCustomerDisplayName(c.name));
+    (byName[n] = byName[n] || []).push(c);
+  });
+  const rawNameGroups = Object.entries(byName).filter(([, cs]) => cs.length > 1);
+
+  function detailFor(c) {
+    const rentals = DB.data.rentals.filter((r) => r.customerId === c.id);
+    const rewards = DB.data.rewards.filter((r) => r.customerId === c.id);
+    const importCount = rentals.filter((r) => String(r.id).startsWith("imp_r")).length;
+    const nonImportCount = rentals.length - importCount;
+    const hasMgrRowNumber = rentals.some((r) => r.mgrRowNumber !== undefined && r.mgrRowNumber !== null);
+    let sourceType;
+    if (rentals.length === 0) sourceType = "none";
+    else if (importCount > 0 && nonImportCount > 0) sourceType = "mixed";
+    else if (importCount > 0) sourceType = "imported";
+    else sourceType = "manual";
+    return {
+      id: c.id, name: c.name, passport: c.passport || null,
+      rentalCount: rentals.length, rewardCount: rewards.length,
+      sourceType, hasMgrRowNumber,
+    };
+  }
+
+  function classifyGroup(details) {
+    const withHistory = details.filter((d) => d.rentalCount > 0 || d.rewardCount > 0);
+    if (withHistory.length === 0) return "shadow_empty_all"; // all copies empty — likely accidental duplicates, safest to clean up
+    if (withHistory.length === 1) return "shadow_empty_one"; // one real record, rest are empty shadows — very likely deterministically cleanable
+    // 2+ copies each have real history — cannot safely auto-resolve, always human review
+    const identicalLooking = withHistory.every((d) => d.rentalCount === withHistory[0].rentalCount && d.rewardCount === withHistory[0].rewardCount && d.sourceType === withHistory[0].sourceType);
+    return identicalLooking ? "both_meaningful_similar" : "both_meaningful_different";
+  }
+
+  const passportGroups = rawPassportGroups.map(([passport, cs]) => {
+    const details = cs.map(detailFor);
+    return { passport, customers: details, classification: classifyGroup(details) };
+  });
+  const nameGroups = rawNameGroups.map(([name, cs]) => {
+    const details = cs.map(detailFor);
+    return { name, customers: details, classification: classifyGroup(details) };
+  });
+
+  const affectedCustomerIds = new Set();
+  passportGroups.forEach((g) => g.customers.forEach((c) => affectedCustomerIds.add(c.id)));
+  nameGroups.forEach((g) => g.customers.forEach((c) => affectedCustomerIds.add(c.id)));
+
+  const allGroups = [...passportGroups, ...nameGroups];
+  const deterministicCount = allGroups.filter((g) => g.classification === "shadow_empty_all" || g.classification === "shadow_empty_one").length;
+  const humanReviewCount = allGroups.filter((g) => g.classification === "both_meaningful_similar" || g.classification === "both_meaningful_different").length;
+
+  return {
+    totalCustomers: allCustomers.length,
+    passportGroups, nameGroups,
+    affectedCustomerCount: affectedCustomerIds.size,
+    affectedCustomerIds: [...affectedCustomerIds],
+    deterministicCount, humanReviewCount,
+  };
+}
+
+// Cross-references the identity diagnostic above against a Manager Sync plan's Needs
+// Review entries (passport_conflict / multiple_customer_match specifically), using the
+// customerIds now captured on those entries. Purely read-only — just counts overlap.
+function crossReferenceIdentityWithManagerSync(identityDiagnostic, syncPlan) {
+  if (!syncPlan) return null;
+  const groupedCustomerIds = new Set(identityDiagnostic.affectedCustomerIds);
+  const relevant = syncPlan.needsReview.filter((r) => r.category === "passport_conflict" || r.category === "multiple_customer_match");
+  const explained = relevant.filter((r) => (r.customerIds || []).some((id) => groupedCustomerIds.has(id)));
+  return { totalRelevant: relevant.length, explainedByIdentityGroups: explained.length };
+}
+
+function renderCustomerIdentityDiagnosticScreen() {
+  const diag = buildCustomerIdentityDiagnostic();
+  const crossRef = crossReferenceIdentityWithManagerSync(diag, state.managerSyncPlan);
+
+  const classLabel = {
+    shadow_empty_all: "All copies empty — likely accidental duplicates",
+    shadow_empty_one: "One real record + empty shadow(s) — likely deterministically cleanable",
+    both_meaningful_similar: "Two+ records both have history, look similar — human review",
+    both_meaningful_different: "Two+ records both have history, differ — human review",
+  };
+  const classColor = {
+    shadow_empty_all: "var(--green)", shadow_empty_one: "var(--green)",
+    both_meaningful_similar: "var(--red)", both_meaningful_different: "var(--red)",
+  };
+
+  const renderCustomerRow = (c) => `
+    <div class="reward-note" style="margin-bottom:4px;">
+      <b>${escapeHtml(c.name)}</b> (${escapeHtml(c.id)})<br/>
+      <span class="muted">Passport: ${c.passport ? escapeHtml(c.passport) : "—"} · Rentals: ${c.rentalCount} (${c.sourceType}) · Rewards: ${c.rewardCount} · mgrRowNumber present: ${c.hasMgrRowNumber ? "Yes" : "No"}</span>
+    </div>
+  `;
+
+  const renderGroup = (g, keyLabel, keyValue) => `
+    <div class="card" style="margin-bottom:12px;">
+      <div class="card-row" style="margin-bottom:8px;">
+        <div style="font-weight:700; font-size:14px;">${escapeHtml(keyLabel)}: ${escapeHtml(keyValue)}</div>
+        <span class="pill" style="background:${classColor[g.classification]}; color:#fff;">${escapeHtml(classLabel[g.classification])}</span>
+      </div>
+      ${g.customers.map(renderCustomerRow).join("")}
+    </div>
+  `;
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="data-audit">‹ Data Audit</button>
+      <h1 class="screen-title" style="margin-top:8px;">Customer Identity Diagnostic</h1>
+      <p class="screen-sub">Read-only. Scans stored customer records for duplicate passports and duplicate cleaned names. No merge, delete, or edit action exists on this screen.</p>
+    </header>
+    <div class="screen-body">
+      <div class="report-grid" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="report-tile"><div class="report-tile-value">${diag.totalCustomers}</div><div class="report-tile-label">Total Customers</div></div>
+        <div class="report-tile"><div class="report-tile-value">${diag.affectedCustomerCount}</div><div class="report-tile-label">Customers Affected</div></div>
+        <div class="report-tile"><div class="report-tile-value">${diag.passportGroups.length}</div><div class="report-tile-label">Duplicate Passport Groups</div></div>
+        <div class="report-tile"><div class="report-tile-value">${diag.nameGroups.length}</div><div class="report-tile-label">Duplicate Name Groups</div></div>
+      </div>
+      <div class="card" style="margin-bottom:16px;">
+        <div class="grid-2">
+          <div><div class="muted" style="font-size:11.5px;">Look deterministically cleanable</div><div style="font-weight:700; color:var(--green);">${diag.deterministicCount}</div></div>
+          <div><div class="muted" style="font-size:11.5px;">Require human review</div><div style="font-weight:700; color:var(--red);">${diag.humanReviewCount}</div></div>
+        </div>
+      </div>
+
+      ${crossRef ? `
+        <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--orange-soft-line);">
+          <div style="font-weight:700; margin-bottom:6px;">Cross-Reference with Manager Sync</div>
+          <p class="muted">Of ${crossRef.totalRelevant} current Needs Review rows in the Passport/name conflict and Multiple customer identity match categories, <b>${crossRef.explainedByIdentityGroups}</b> involve a customer that also appears in one of the duplicate groups below.</p>
+        </div>
+      ` : `
+        <div class="card" style="margin-bottom:16px;">
+          <p class="muted">No current Manager Sync plan in memory to cross-reference against — run "Check Now" on Manager Sync first if you want that comparison.</p>
+        </div>
+      `}
+
+      ${diag.passportGroups.length > 0 ? `
+        <div class="section-title">Duplicate Passport Groups</div>
+        ${diag.passportGroups.map((g) => renderGroup(g, "Passport", g.passport)).join("")}
+      ` : ""}
+
+      ${diag.nameGroups.length > 0 ? `
+        <div class="section-title">Duplicate Name Groups</div>
+        ${diag.nameGroups.map((g) => renderGroup(g, "Name", g.name)).join("")}
+      ` : ""}
+
+      ${diag.passportGroups.length === 0 && diag.nameGroups.length === 0 ? `
+        <div class="empty"><div class="empty-icon">✓</div><h3>No duplicates found</h3></div>
+      ` : ""}
+    </div>
+  `;
+}
+
 // Read-only screen for the source-row mapping diagnostic. Nothing here writes anything —
 // it only displays buildSourceRowMappingDiagnostic()'s output.
 function renderSourceRowDiagnosticScreen() {
@@ -2331,6 +2500,13 @@ function renderDataAuditScreen() {
           <button class="btn btn-outline btn-block" data-goto="nonimport-review">Review Non-Import Rentals</button>
         </div>
       ` : ""}
+
+      <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--orange-soft-line);">
+        <div style="font-weight:700; margin-bottom:6px;">Customer Identity Diagnostic</div>
+        <p class="muted" style="margin-bottom:12px;">Scans stored customer records for duplicate passport numbers and duplicate cleaned names — no existing screen checks this. Read-only, no merge/delete/edit action.</p>
+        <button class="btn btn-outline btn-block" data-goto="customer-identity-diagnostic">View Customer Identity Diagnostic</button>
+      </div>
+
 
       ${audit.importMismatchCount > 0 ? `
         <div class="card" style="margin-bottom:16px; border: 1.5px dashed var(--red);">
@@ -2822,7 +2998,7 @@ function buildManagerSyncPlan(managerData) {
     const parsedPassport = normalizePassport(parsed.passport);
     const byPassport = parsedPassport ? DB.data.customers.filter((c) => normalizePassport(c.passport) === parsedPassport) : [];
     if (parsedPassport && byPassport.length > 1) {
-      plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "passport_conflict", reason: `Passport "${parsed.passport}" matches more than one existing customer — cannot safely pick one.` });
+      plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "passport_conflict", customerIds: byPassport.map((c) => c.id), reason: `Passport "${parsed.passport}" matches more than one existing customer — cannot safely pick one.` });
       return;
     }
 
@@ -2838,7 +3014,7 @@ function buildManagerSyncPlan(managerData) {
       // If name-matching independently points at a DIFFERENT customer than the passport
       // match, that's a genuine identity conflict — passport must never silently win.
       if (matchingCustomers.length > 0 && !matchingCustomers.some((c) => c.id === passportCustomer.id)) {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "passport_conflict", reason: `Passport matches "${passportCustomer.name}" but the name on this row matches a different existing customer — conflict, not resolved automatically.` });
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "passport_conflict", customerIds: [passportCustomer.id, ...matchingCustomers.map((c) => c.id)], reason: `Passport matches "${passportCustomer.name}" but the name on this row matches a different existing customer — conflict, not resolved automatically.` });
         return;
       }
       existingCustomer = passportCustomer; // resolves cases plain name-matching alone would miss
@@ -2846,7 +3022,7 @@ function buildManagerSyncPlan(managerData) {
       // No usable passport signal (blank on either side, or no passport match at all) —
       // fall back to name-only matching, exactly as before.
       if (matchingCustomers.length > 1) {
-        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "multiple_customer_match", reason: `Customer name "${parsed.name}" matches more than one existing customer — cannot safely pick one.` });
+        plan.needsReview.push({ rowNumber: parsed.rowNumber, category: "multiple_customer_match", customerIds: matchingCustomers.map((c) => c.id), reason: `Customer name "${parsed.name}" matches more than one existing customer — cannot safely pick one.` });
         return;
       }
       existingCustomer = matchingCustomers[0] || null;
@@ -6484,6 +6660,7 @@ function render() {
     case "reconcile-preview": html = renderReconcilePreviewScreen(); break;
     case "sourcerow-diagnostic": html = renderSourceRowDiagnosticScreen(); break;
     case "nonimport-review": html = renderNonImportClassificationScreen(); break;
+    case "customer-identity-diagnostic": html = renderCustomerIdentityDiagnosticScreen(); break;
     case "manager-sync": html = renderManagerSyncScreen(); break;
     case "reconcile-confirm": html = renderReconcileConfirmScreen(); break;
     case "reconcile-result": html = renderReconcileResultScreen(); break;
