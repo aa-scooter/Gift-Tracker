@@ -27,9 +27,7 @@
   BEHAVIOR
   --------
   GET /api/loyalty-rewards
-    Returns { rewards: [...] }. On first-ever call, if loyalty_rewards.json
-    doesn't exist yet in the Drive folder, this creates it as an empty array
-    and returns that. From then on, Drive is the source of truth.
+    Returns { rewards: [...] }.
 
   POST /api/loyalty-rewards
     Body: { rewards: [...] } (required)
@@ -43,31 +41,30 @@
   the DB.save()-for-rewards wiring) is what keeps that window small, not this
   endpoint.
 
-  LOOKUP METHOD -- listChildren, not findByName, plus a retry loop
-  ------------------------------------------------------------------
-  driveAuth.js's findByName() does a `name = '...'` query, which goes through
-  Drive's search index -- confirmed (2026-08-21) to lag well behind reality
-  for a file just freshly shared with this service account: the file was
-  immediately visible via a plain "list everything in this folder" call, but
-  a name-filtered search still missed it 90+ seconds later. listChildren()
-  (a direct parent/child graph lookup, not an index search) is far more
-  reliable, but NOT perfectly so -- same-day testing also caught listChildren
-  itself failing to see a file for 30+ seconds immediately after that exact
-  file was updated (content PATCHed) by this same service account moments
-  earlier. So this endpoint retries the listChildren lookup a few times with
-  a short delay before giving up, to ride out that shorter-lived lag too.
+  WHY A HARDCODED FILE ID, NOT A NAME LOOKUP
+  --------------------------------------------
+  Earlier versions of this endpoint located loyalty_rewards.json by name every
+  request -- first via driveAuth.js's findByName() (a `name = '...'` search
+  query), then via listChildren() (a plain parent/child listing) after
+  findByName() was caught missing a freshly-shared file for 90+ seconds.
+  listChildren() turned out to have the same class of problem: same-day
+  testing (2026-08-21) caught it intermittently failing to see this exact
+  file for 30+ seconds AFTER a successful read/write of that same file,
+  moments apart, with no pattern to when it would or wouldn't see it -- a
+  handful of retries with short delays was not reliably enough to ride it
+  out. That pointed at Drive's list/search paths being eventually consistent
+  for a file shared with (not owned by) this service account, in a way a
+  short retry loop inside one ~10s serverless invocation can't fully absorb.
 
-  GET's not-found fallback used to call createFile() when the lookup came up
-  empty. That is now known to be actively harmful: this service account has
-  no Drive storage quota of its own and createFile() always 403s for it
-  (see loyalty_rewards.json's creation history -- it had to be created once,
-  manually, from a real Google account). So if the retried lookup still can't
-  see the file, GET no longer tries to create it -- it logs a warning and
-  returns an empty list instead of turning a transient listing lag into a
-  hard 500 for every device pulling rewards at a bad moment. POST keeps a
-  createFile() fallback for the genuine one-time-ever case (file deleted or
-  truly never created), since a POST that can't persist really should fail
-  loudly rather than silently drop a reward.
+  Direct id-based access (files.get / files.update by id, i.e. downloadFile()/
+  updateFile() below) does not go through list or search at all -- it reads
+  the object directly by its primary key, which Drive serves consistently.
+  So this endpoint hardcodes the file's id (captured once, when the file was
+  created -- see loyalty_rewards.json's creation history in the Aug 2026
+  commits) and uses direct id-based reads/writes as the only path in normal
+  operation. Discovery via listChildren + DRIVE_FOLDER_ID is kept as a
+  fallback ONLY for the case the hardcoded id ever 404s (file recreated,
+  moved, or deleted), which should essentially never happen day to day.
 */
 'use strict';
 
@@ -75,21 +72,26 @@ const { getAccessToken, downloadFile, createFile, updateFile, listChildren } = r
 
 const REWARDS_FILENAME = 'loyalty_rewards.json';
 
+// Captured once from Drive when loyalty_rewards.json was created (2026-08-21,
+// via a real Google account -- this service account has no storage quota of
+// its own and cannot create files, see the file-level comment above). Direct
+// id access sidesteps the list/search flakiness described above.
+const KNOWN_REWARDS_FILE_ID = '1lWU2n7qKnF-TPyr0vu67tq_JsDMSuPLF';
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function findRewardsFile(token, folderId) {
+async function findRewardsFileByListing(token, folderId) {
   const children = await listChildren(token, folderId);
   return children.find((f) => f.name === REWARDS_FILENAME) || null;
 }
 
-// Retries the lookup a few times with a short delay, to ride out Drive's
-// occasional lag in reflecting a just-written file/change back through
-// listChildren for this service account. See the file-level comment above.
+// Only used if the hardcoded id ever stops working. Retries a few times with
+// a short delay to ride out listChildren's occasional lag (see file header).
 async function findRewardsFileWithRetry(token, folderId, { retries = 4, delayMs = 1000 } = {}) {
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const found = await findRewardsFile(token, folderId);
+    const found = await findRewardsFileByListing(token, folderId);
     if (found) return found;
     if (attempt < retries) await sleep(delayMs);
   }
@@ -107,15 +109,22 @@ module.exports = async function handler(req, res) {
     const token = await getAccessToken();
 
     if (req.method === 'GET') {
-      const existing = await findRewardsFileWithRetry(token, folderId);
-      if (!existing) {
-        console.warn('[/api/loyalty-rewards] GET: loyalty_rewards.json not visible via listChildren after retries; returning empty list instead of failing.');
-        res.status(200).json({ rewards: [] });
+      try {
+        const rewards = await downloadFile(token, KNOWN_REWARDS_FILE_ID);
+        res.status(200).json({ rewards: Array.isArray(rewards) ? rewards : [] });
+        return;
+      } catch (directErr) {
+        console.warn('[/api/loyalty-rewards] GET: direct id lookup failed, falling back to listChildren:', directErr && directErr.message);
+        const existing = await findRewardsFileWithRetry(token, folderId);
+        if (!existing) {
+          console.warn('[/api/loyalty-rewards] GET: loyalty_rewards.json not visible via listChildren after retries; returning empty list instead of failing.');
+          res.status(200).json({ rewards: [] });
+          return;
+        }
+        const rewards = await downloadFile(token, existing.id);
+        res.status(200).json({ rewards: Array.isArray(rewards) ? rewards : [] });
         return;
       }
-      const rewards = await downloadFile(token, existing.id);
-      res.status(200).json({ rewards: Array.isArray(rewards) ? rewards : [] });
-      return;
     }
 
     if (req.method === 'POST') {
@@ -124,14 +133,21 @@ module.exports = async function handler(req, res) {
         res.status(400).json({ error: 'Body must include a "rewards" array' });
         return;
       }
-      const existing = await findRewardsFileWithRetry(token, folderId);
-      if (existing) {
-        await updateFile(token, existing.id, body.rewards);
-      } else {
-        await createFile(token, folderId, REWARDS_FILENAME, body.rewards);
+      try {
+        await updateFile(token, KNOWN_REWARDS_FILE_ID, body.rewards);
+        res.status(200).json({ ok: true, rewards: body.rewards });
+        return;
+      } catch (directErr) {
+        console.warn('[/api/loyalty-rewards] POST: direct id update failed, falling back to listChildren:', directErr && directErr.message);
+        const existing = await findRewardsFileWithRetry(token, folderId);
+        if (existing) {
+          await updateFile(token, existing.id, body.rewards);
+        } else {
+          await createFile(token, folderId, REWARDS_FILENAME, body.rewards);
+        }
+        res.status(200).json({ ok: true, rewards: body.rewards });
+        return;
       }
-      res.status(200).json({ ok: true, rewards: body.rewards });
-      return;
     }
 
     res.status(405).json({ error: 'Method not allowed' });
