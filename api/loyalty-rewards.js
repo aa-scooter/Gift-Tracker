@@ -45,7 +45,7 @@
 */
 'use strict';
 
-const { getAccessToken, findByName, downloadFile, writeFile } = require('../lib/driveAuth');
+const { getAccessToken, findByName, downloadFile, writeFile, listChildren } = require('../lib/driveAuth');
 
 const REWARDS_FILENAME = 'loyalty_rewards.json';
 
@@ -58,6 +58,15 @@ module.exports = async function handler(req, res) {
 
   try {
     const token = await getAccessToken();
+
+    // TEMPORARY diagnostic, added while debugging a "storageQuotaExceeded" create error --
+    // shows exactly what this service account's own Drive view of the folder contains right
+    // now. Safe to delete once the underlying issue is understood.
+    if (req.method === 'GET' && req.query && req.query.debug) {
+      const children = await listChildren(token, folderId);
+      res.status(200).json({ folderId, children });
+      return;
+    }
 
     if (req.method === 'GET') {
       const existing = await findByName(token, REWARDS_FILENAME, { parentId: folderId, fileOnly: true });
