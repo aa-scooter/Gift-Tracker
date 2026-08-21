@@ -2805,8 +2805,9 @@ function buildVisitsFromSegments(rental) {
     if (last && s.startDate <= last.endDate) {
       if (s.endDate > last.endDate) last.endDate = s.endDate;
       last.revenue += Number(s.revenue) || 0;
+      last._rawSegments.push(s);
     } else {
-      visits.push({ startDate: s.startDate, endDate: s.endDate, revenue: Number(s.revenue) || 0, bike: s.bike });
+      visits.push({ startDate: s.startDate, endDate: s.endDate, revenue: Number(s.revenue) || 0, bike: s.bike, _rawSegments: [s] });
     }
   });
 
@@ -2824,6 +2825,12 @@ function buildVisitsFromSegments(rental) {
       startDate: v.startDate, endDate, bookedDays: paidDays, paidDays,
       revenue: v.revenue, status,
       _segmentDerivedFrom: rental.id, // internal provenance marker only, never read elsewhere
+      // Raw constituent segments this visit was merged from (2+ only when touching/adjacent
+      // segments got combined above) — used ONLY by customerStats()'s reward-eligibility
+      // counting (Rental Visits / Qualified Rentals) so each real renewal counts as its own
+      // separate rental period even though it still displays as one merged visit here. Never
+      // read by anything display-facing.
+      _rawSegments: v._rawSegments,
     };
   });
 }
@@ -2890,7 +2897,27 @@ function customerStats(customer, simulatedRentals) {
     if (artifactRentalIds.has(r.id)) return; // proven artifact — visible in history, zero operational contribution
     const contrib = operationalContribution(r, todayIso);
     if (!contrib) return; // archive-only, zero operational contribution
-    rentalCount += contrib.visits;
+
+    // COUNTING vs SUMMING split (added 2026-08-21, per Attis Jovan Rudolphe Bijleveld
+    // investigation): a merged visit built from touching/back-to-back monthly renewals
+    // (r._rawSegments.length > 1, see buildVisitsFromSegments above) is still exactly ONE
+    // operational contribution for every SUMMED figure below (days/revenue/yearly breakdown/
+    // boundary-spanning) — those stay driven by `contrib`, unchanged. But for the two COUNTS
+    // that gate reward eligibility (Rental Visits = rentalCount, and Qualified Rentals =
+    // qualifiedRentalCount, which both Ride Upgrade and VIP Extra Day read), each real
+    // constituent renewal counts as its own separate rental period, exactly as the customer
+    // actually paid it — a customer who renewed the same bike monthly for 4 months genuinely
+    // rented 4 separate times, even though the display layer (rental history / "Source" rows)
+    // deliberately keeps showing that as one continuous stay to read. Splitting the count
+    // here, rather than expanding forCalculation itself, keeps every summed figure exactly as
+    // it already was — only the two counts change.
+    const segmentContribs = (r._rawSegments && r._rawSegments.length > 1)
+      ? r._rawSegments
+          .map((s) => operationalContribution({ startDate: s.startDate, endDate: s.endDate, paidDays: s.paidDays, revenue: s.revenue }, todayIso))
+          .filter(Boolean)
+      : null;
+
+    rentalCount += segmentContribs ? segmentContribs.length : contrib.visits;
     paidRentalDays += contrib.days;
     totalRevenue += contrib.revenue;
     if (contrib.isBoundarySpanning) boundarySpanningCount++;
@@ -2909,9 +2936,17 @@ function customerStats(customer, simulatedRentals) {
     // Qualified Rental check runs against the SAME clipped operational values (days/revenue)
     // as everything else — never against the raw record's all-time fields — so a
     // boundary-spanning rental with zero operational revenue can still qualify purely on its
-    // genuine 2026 day count, exactly matching how every other operational figure works.
+    // genuine 2026 day count, exactly matching how every other operational figure works. When
+    // this visit is actually several merged renewals (segmentContribs set), each renewal is
+    // checked against the threshold on its OWN days/revenue, since that's what the customer
+    // actually paid per renewal — never the merged visit's summed total, which would let one
+    // short renewal borrow qualification from another.
     const t = qualifiedRentalThreshold(rentalCategory(r));
-    if (contrib.days >= t.days || contrib.revenue >= t.revenue) qualifiedRentalCount++;
+    if (segmentContribs) {
+      segmentContribs.forEach((sc) => { if (sc.days >= t.days || sc.revenue >= t.revenue) qualifiedRentalCount++; });
+    } else if (contrib.days >= t.days || contrib.revenue >= t.revenue) {
+      qualifiedRentalCount++;
+    }
   });
 
   // TRUE LIFETIME totals (all years, no 2026 cutoff) — feed ONLY the "Total Paid Days" and
