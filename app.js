@@ -93,6 +93,13 @@ const LOYALTY_CLOUD_API_URL = "/api/loyalty";
 // button never needs a second round trip through "Refresh Loyalty Baseline
 // from Cloud". Same "imp_"-prefixed-only replacement guarantee as that flow.
 const LOYALTY_FULL_REFRESH_API_URL = "/api/loyalty-refresh";
+// Rewards sync — added 2026-08-21 alongside the lifetime-days reward-eligibility change,
+// after discovering DB.data.rewards had never been synced anywhere: every Give Gift /
+// Reserve / Accept / Decline / edit only ever wrote to that one browser's own localStorage
+// (see DB.save()), invisible on every other device. This is the same same-origin,
+// automatic (not staff-triggered) pattern as the two URLs above, backed by its own
+// loyalty_rewards.json file in the same Drive folder — see api/loyalty-rewards.js.
+const LOYALTY_REWARDS_API_URL = "/api/loyalty-rewards";
 
 // Premium Ride Experience / VIP Extra Day both use the same cycle mechanic: 180+ cumulative
 // PAID days (an active rental counts in full — no requirement to return first) since the
@@ -2669,21 +2676,22 @@ function customerRentals(customerId) {
     .slice().sort((a, b) => (a.startDate < b.startDate ? 1 : -1));
 }
 
-// A reward's cycleBaselinePaidDays was, until now, always captured under the OLD all-time
-// paid-days model (2025 + 2026 combined). The new operational model only counts 2026-onward
-// days — so an old baseline is on a different scale from the new stats.paidRentalDays and
-// must be read-time normalized, never migrated/overwritten in storage. `baselineModel:
-// "operational"` is the version marker written onto every NEW baseline going forward (see
-// quickGiveOrUse / sheetMarkPremiumRideUsed / sheetEditRewardFull); its absence on an
-// existing record is exactly how a legacy baseline is safely distinguished, with zero risk
-// of a false positive, since no code before this update ever wrote that field.
+// A reward's cycleBaselinePaidDays is compared against stats.lifetimeRentalDays (2025 + 2026
+// combined) — the app's original all-time model, and the one restored 2026-08-21 after a
+// stretch of running 2026-only while the dataset was still thin. Any baseline captured DURING
+// that 2026-only window is on the wrong scale for that comparison and must be converted up at
+// read time, never migrated/overwritten in storage. `baselineModel: "operational"` is the
+// marker every baseline written during that window carries (see quickGiveOrUse /
+// sheetMarkPremiumRideUsed / sheetEditRewardFull); baselines written before or after that
+// window (no marker, or "lifetime") are already on the correct all-time scale and pass through
+// unchanged.
 function effectiveCycleBaseline(rw, stats) {
   if (!rw || rw.cycleBaselinePaidDays === undefined) return 0;
-  if (rw.baselineModel === "operational") return rw.cycleBaselinePaidDays; // already correct scale
+  if (rw.baselineModel !== "operational") return rw.cycleBaselinePaidDays; // already lifetime scale
   const legacyPaidDaysBefore2026 = stats.rentals
     .filter((r) => r.startDate < LEGACY_CUTOFF_DATE)
     .reduce((s, r) => s + (Number(r.paidDays) || 0), 0);
-  return Math.max(0, rw.cycleBaselinePaidDays - legacyPaidDaysBefore2026);
+  return rw.cycleBaselinePaidDays + legacyPaidDaysBefore2026; // convert 2026-only baseline up to lifetime scale
 }
 // Same issue, same fix, for VIP Extra Day's qualified-episode counter specifically.
 function effectiveCycleBaselineQualified(rw, stats) {
@@ -2934,18 +2942,58 @@ function customerStats(customer, simulatedRentals) {
       const revenue = Number(r.revenue) || 0;
       preCutoffDays += days;
       preCutoffRevenue += revenue;
-      // Entirely pre-cutoff, so (for every real rental this app has on file) it falls within
-      // a single calendar year — attributed to the year the rental started in, same
-      // single-year, revenue-never-split convention used for every other rental above.
-      addYearly(Number(r.startDate.slice(0, 4)), days, revenue);
+      if (r.segments && r.segments.length) {
+        // A consolidated (multi-renewal) rental, entirely pre-cutoff — no operational-loop
+        // involvement at all for it, so both days and revenue can be safely split per
+        // constituent renewal, each attributed to its OWN start year, instead of the whole
+        // merged total landing on just the first renewal's year.
+        r.segments.forEach((s) => {
+          const sEnd = s.endDate || end;
+          const sDays = Math.max(daysBetween(s.startDate, sEnd), Number(s.paidDays) || 0);
+          addYearly(Number(s.startDate.slice(0, 4)), sDays, Number(s.revenue) || 0);
+        });
+      } else {
+        // A single, non-consolidated rental — entirely pre-cutoff, so (for every real rental
+        // this app has on file) it falls within a single calendar year — attributed to the
+        // year the rental started in.
+        addYearly(Number(r.startDate.slice(0, 4)), days, revenue);
+      }
     } else if (r.startDate < LEGACY_CUTOFF_DATE) {
       const days = Math.max(daysBetween(r.startDate, LEGACY_CUTOFF_DATE), 0);
       const revenue = Number(r.revenue) || 0;
       preCutoffDays += days;
       preCutoffRevenue += revenue;
-      // Only the pre-cutoff portion of a boundary-spanning rental — its 2026-onward portion
-      // (and full revenue, already zero here) was already attributed above via forCalculation.
-      addYearly(Number(r.startDate.slice(0, 4)), days, revenue);
+      if (r.segments && r.segments.length) {
+        // A consolidated rental whose renewal chain crosses the cutoff — e.g. a Dec-to-Jan
+        // renewal followed by a Jan-to-Feb renewal, merged into one continuous rental record.
+        // Revenue is known exactly per constituent renewal (never true for a genuinely
+        // undivided single booking), so each renewal's own revenue goes to its own start
+        // year: the Dec-Jan segment's revenue to the earlier year, the Jan-Feb segment's to
+        // the later one — instead of the whole combined total landing on just the first
+        // segment's year. Days stay on the single pre-cutoff lump above (bounded to the
+        // cutoff date) since the operational pass (forCalculation) already date-splits the
+        // post-cutoff days for whichever LEADING segments it merged into one boundary-
+        // spanning visit — only that same leading run's segments get their revenue added
+        // here, replicating buildVisitsFromSegments' own touch/overlap adjacency rule, so a
+        // later segment with a real gap (already its own independent, correctly-attributed
+        // visit in the operational pass) is never double-counted.
+        const sorted = r.segments.slice().sort((a, b) => (a.startDate < b.startDate ? -1 : 1));
+        const leadingGroup = [sorted[0]];
+        let runningEnd = sorted[0].endDate || todayIso;
+        for (let i = 1; i < sorted.length; i++) {
+          const s = sorted[i];
+          if (s.startDate > runningEnd) break;
+          leadingGroup.push(s);
+          if ((s.endDate || todayIso) > runningEnd) runningEnd = s.endDate || todayIso;
+        }
+        addYearly(Number(r.startDate.slice(0, 4)), days, 0);
+        leadingGroup.forEach((s) => addYearly(Number(s.startDate.slice(0, 4)), 0, Number(s.revenue) || 0));
+      } else {
+        // A single, non-consolidated rental spanning the cutoff — its 2026-onward portion
+        // (and full revenue, already zero here) was already attributed above via
+        // forCalculation; this is only its pre-cutoff portion.
+        addYearly(Number(r.startDate.slice(0, 4)), days, revenue);
+      }
     }
   });
   const lifetimeRentalDays = paidRentalDays + preCutoffDays;
@@ -2978,7 +3026,7 @@ const LONG_TERM_DAYS_THRESHOLD = 180;
 function computeCustomerStatus(customer, stats) {
   const hasTopTierHistory = rewardsFor(customer.id).some((r) => (r.type === "premium_ride" || r.type === "vip_extra_day") && r.given);
   const n = stats.rentalCount;
-  const longByDuration = stats.paidRentalDays >= LONG_TERM_DAYS_THRESHOLD;
+  const longByDuration = stats.lifetimeRentalDays >= LONG_TERM_DAYS_THRESHOLD;
   if (hasTopTierHistory || n >= 6) return { label: "VIP Customer", detail: n >= 2 ? `${n}${ordinal(n)} rental` : "" };
   if (n >= 4 || longByDuration) return { label: "Long-Term Customer", detail: n >= 2 ? `${n}${ordinal(n)} rental` : `${stats.lifetimeRentalDays} days with AA` };
   if (n >= 2) return { label: "Returning Customer", detail: `${n}${ordinal(n)} rental` };
@@ -3166,13 +3214,13 @@ function getSuggestions(customer, stats) {
     } else if (nextTarget) {
       const key = "return_privilege:" + customer.id + ":" + (given.length + 1);
       const enoughQualified = stats.qualifiedRentalCount >= RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS;
-      const enoughRevenue = stats.totalRevenue >= RETURN_PRIVILEGE_MIN_REVENUE;
+      const enoughRevenue = stats.lifetimeRevenueTotal >= RETURN_PRIVILEGE_MIN_REVENUE;
       const calculatedEligible = enoughQualified && enoughRevenue;
       const rewardRec = findReward(key);
       const pricing = getUpgradePricing(lastRideCategory, nextTarget);
       let reason;
       if (calculatedEligible) {
-        reason = `${stats.qualifiedRentalCount} qualified rental(s), ${fmtMoney(stats.totalRevenue)} 2026 revenue.`;
+        reason = `${stats.qualifiedRentalCount} qualified rental(s), ${fmtMoney(stats.lifetimeRevenueTotal)} revenue.`;
       } else if (!enoughQualified) {
         reason = `${stats.qualifiedRentalCount} of ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS} qualified rentals`;
       } else {
@@ -3184,7 +3232,7 @@ function getSuggestions(customer, stats) {
       out.push({
         key, type: "return_privilege",
         title: `${REWARD_LABELS.return_privilege} — upgrade to ${nextTarget}`,
-        desc: `Based on their current/last bike (${lastRideCategory}${familyUncertain ? " — Aerox/NMAX family unclear from the historical name, defaulted to Aerox; flag for review if that's wrong" : ""}). Eligible once a customer has ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals (substantial paid days or value, not just visit count) and ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ 2026 revenue, subject to bike availability.`,
+        desc: `Based on their current/last bike (${lastRideCategory}${familyUncertain ? " — Aerox/NMAX family unclear from the historical name, defaulted to Aerox; flag for review if that's wrong" : ""}). Eligible once a customer has ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals (substantial paid days or value, not just visit count) and ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ revenue, subject to bike availability.`,
         eligible: effectiveEligible(rewardRec, calculatedEligible), calculatedEligible, overridden: isOverridden(rewardRec),
         reason, notYetReason: reason, needsReview: !!familyUncertain,
         reward: rewardRec, repeatable: true, upgradeTarget: nextTarget, fromCategory: lastRideCategory,
@@ -3223,7 +3271,7 @@ function getSuggestions(customer, stats) {
 
     const lastUsed = givenPremium[givenPremium.length - 1] || null;
     const cycleBaseline = effectiveCycleBaseline(lastUsed, stats);
-    const paidDaysSinceLast = Math.max(stats.paidRentalDays - cycleBaseline, 0);
+    const paidDaysSinceLast = Math.max(stats.lifetimeRentalDays - cycleBaseline, 0);
     const enoughLoyaltyDays = paidDaysSinceLast >= PREMIUM_RIDE_MIN_PAID_DAYS;
 
     const lastRental = stats.current || stats.rentals[0] || null;
@@ -3299,7 +3347,7 @@ function getSuggestions(customer, stats) {
     const lastUsedVip = givenVip[givenVip.length - 1] || null;
     const cycleBaselineVip = effectiveCycleBaseline(lastUsedVip, stats);
     const cycleBaselineQualifiedVip = effectiveCycleBaselineQualified(lastUsedVip, stats);
-    const paidDaysSinceLastVip = Math.max(stats.paidRentalDays - cycleBaselineVip, 0);
+    const paidDaysSinceLastVip = Math.max(stats.lifetimeRentalDays - cycleBaselineVip, 0);
     const qualifiedEpisodesSinceLastVip = Math.max(stats.qualifiedRentalCount - cycleBaselineQualifiedVip, 0);
     const enoughEpisodes = qualifiedEpisodesSinceLastVip >= thresholdVip.episodes;
     const enoughDays = paidDaysSinceLastVip >= thresholdVip.days;
@@ -3816,7 +3864,7 @@ function renderLadder(customer, stats) {
   // shown at the same position as Aerox Keyless (both are "one step before the top").
   const visualCategory = lastRideCategory === "NMAX White Standard Key 155cc" ? "Aerox Standard Key 155cc" : lastRideCategory;
   const currentTierIdx = RIDE_UPGRADE_LADDER_VISUAL.indexOf(visualCategory);
-  const meetsQualification = stats.qualifiedRentalCount >= RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS && stats.totalRevenue >= RETURN_PRIVILEGE_MIN_REVENUE;
+  const meetsQualification = stats.qualifiedRentalCount >= RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS && stats.lifetimeRevenueTotal >= RETURN_PRIVILEGE_MIN_REVENUE;
   // Index of the step that represents where the customer could go next.
   const nextIndex = (meetsQualification && currentTierIdx >= 0 && currentTierIdx < RIDE_UPGRADE_LADDER_VISUAL.length - 1) ? currentTierIdx + 1 : -1;
 
@@ -4240,7 +4288,7 @@ function renderCustomerDetail() {
           <div class="stat-tile"><span class="stat-value">${stats.qualifiedRentalCount}</span><span class="stat-label">Qualified Rentals</span></div>
         </div>
         <div class="reward-note" style="margin-top:10px;">
-          A Rental Visit is any genuine rental after a previous one ended — it always counts toward this customer's history, however short. Rental Visits and Qualified Rentals only count 2026-onward activity (2025 history establishes a returning customer but isn't tallied here) — see the Customer Value card above for lifetime totals and the year-by-year breakdown. A <b>Qualified Rental</b> is one substantial enough (by paid days or paid value for its bike class) to count toward Ride Upgrade progression. Ride Upgrade needs ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals <i>and</i> ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ 2026 revenue — Long-Term/VIP status is calculated separately and doesn't require either.
+          A Rental Visit is any genuine rental after a previous one ended — it always counts toward this customer's history, however short. Rental Visits and Qualified Rentals only count 2026-onward activity (2025 history establishes a returning customer but isn't tallied here) — see the Customer Value card above for lifetime totals and the year-by-year breakdown. A <b>Qualified Rental</b> is one substantial enough (by paid days or paid value for its bike class) to count toward Ride Upgrade progression. Ride Upgrade needs ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals (2026-onward) <i>and</i> ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ lifetime revenue. Long-Term/VIP status and Premium Ride/VIP Extra Day progress are based on lifetime paid days instead, and don't require either.
         </div>
         ${c.mergedNames && c.mergedNames.length ? `<div class="reward-note" style="margin-top:10px;">Also on file as: ${c.mergedNames.map(escapeHtml).join(", ")}</div>` : ""}
         ${c.nationality ? `<div class="muted" style="margin-top:8px;">Nationality: ${escapeHtml(c.nationality)}${c.passport ? " · Passport: " + escapeHtml(c.passport) : ""}</div>` : ""}
@@ -5542,7 +5590,9 @@ function withAtomicRewardUpdate(fn) {
   const snapshot = JSON.stringify(DB.data.rewards);
   try {
     fn();
+    stampUpdatedRewards(JSON.parse(snapshot));
     DB.save();
+    syncRewardsToCloud();
     return true;
   } catch (err) {
     DB.data.rewards = JSON.parse(snapshot);
@@ -5550,6 +5600,79 @@ function withAtomicRewardUpdate(fn) {
     render();
     return false;
   }
+}
+
+// Marks every reward that's new or actually changed since `before` (the pre-fn() snapshot)
+// with a fresh updatedAt timestamp — the per-record "which side is newer" signal both
+// syncRewardsToCloud (push) and pullRewardsFromCloud (pull-and-merge) rely on, so two devices
+// that both touched the same reward can be reconciled without diffing full objects.
+function stampUpdatedRewards(before) {
+  const beforeById = {};
+  before.forEach((r) => { beforeById[r.id] = r; });
+  const nowISO = new Date().toISOString();
+  DB.data.rewards.forEach((r) => {
+    const prior = beforeById[r.id];
+    const priorComparable = prior ? JSON.stringify(Object.assign({}, prior, { updatedAt: undefined })) : null;
+    const currentComparable = JSON.stringify(Object.assign({}, r, { updatedAt: undefined }));
+    if (!prior || priorComparable !== currentComparable) r.updatedAt = nowISO;
+  });
+}
+
+// Fire-and-forget push of the full local rewards array to the shared Drive-backed store (see
+// api/loyalty-rewards.js), so a Give Gift / Reserve / Accept / Decline / edit made on this
+// device becomes visible on every other device. Never blocks the UI and never throws into the
+// caller — a failed push just leaves this device's local save (already durable via DB.save())
+// temporarily ahead of the cloud; the next successful reward action, or the next page load's
+// pull, reconciles it.
+function syncRewardsToCloud() {
+  fetch(LOYALTY_REWARDS_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rewards: DB.data.rewards }),
+  }).catch((err) => {
+    console.warn("Reward cloud sync failed (will retry on next reward action):", err);
+  });
+}
+
+// One-time pull-and-merge, run on app load: brings in any reward given on a different device
+// since this browser last synced. Union by id; per id, whichever side has the newer
+// updatedAt wins — a record with no updatedAt at all (written before this sync existed)
+// always loses to one that's been touched since, but is still kept, never dropped, if the
+// other side doesn't have it at all. Never overwrites a genuinely newer local edit just
+// because the network happened to answer first.
+function pullRewardsFromCloud() {
+  fetch(LOYALTY_REWARDS_API_URL)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data) => {
+      if (!data || !Array.isArray(data.rewards)) return;
+      const localById = {};
+      DB.data.rewards.forEach((r) => { localById[r.id] = r; });
+      const merged = DB.data.rewards.slice();
+      const mergedIndexById = {};
+      merged.forEach((r, i) => { mergedIndexById[r.id] = i; });
+      let changed = false;
+      data.rewards.forEach((remote) => {
+        const local = localById[remote.id];
+        if (!local) {
+          merged.push(remote);
+          changed = true;
+        } else if ((remote.updatedAt || "") > (local.updatedAt || "")) {
+          merged[mergedIndexById[remote.id]] = remote;
+          changed = true;
+        }
+      });
+      if (changed) {
+        DB.data.rewards = merged;
+        DB.save();
+        render();
+        // Push the merged union back so every device converges on the same result, not just
+        // whichever pair of devices happened to sync most recently.
+        syncRewardsToCloud();
+      }
+    })
+    .catch((err) => {
+      console.warn("Reward cloud pull failed (staying on local data):", err);
+    });
 }
 
 function quickGiveOrUse(key, customerId, type, rentalId, upgradeTarget) {
@@ -5610,9 +5733,9 @@ function quickGiveOrUse(key, customerId, type, rentalId, upgradeTarget) {
       // reward of this type counts only from this point on. VIP Extra Day also resets its
       // qualified-episode counter the same way.
       if ((type === "premium_ride" || type === "vip_extra_day") && preStats) {
-        rw.cycleBaselinePaidDays = preStats.paidRentalDays;
+        rw.cycleBaselinePaidDays = preStats.lifetimeRentalDays;
         if (type === "vip_extra_day") rw.cycleBaselineQualifiedCount = preStats.qualifiedRentalCount;
-        rw.baselineModel = "operational"; // this baseline is already on the 2026-only scale
+        rw.baselineModel = "lifetime"; // this baseline is on the all-time lifetime scale
       }
 
       // Ride Upgrade: lock in whichever rate applied to this specific transition at the moment
@@ -5783,22 +5906,23 @@ function sheetRewardActionMenu(key, customerId, type, rentalId) {
 // date only — never a guaranteed booking; final availability is confirmed 1 day before,
 // after paid rentals. VIP Extra Day keeps its own separate "Reserved" wording.
 function reserveReward(key, customerId, type, rentalId) {
-  let rw = findReward(key);
-  if (!rw) {
-    rw = { id: uid("rw"), key, type, customerId, rentalId: rentalId || null, given: false, history: [] };
-    DB.data.rewards.push(rw);
-  }
-  if (!rw.history) rw.history = [];
-  rw.reserved = true;
-  rw.reservedDate = todayISO();
-  const isPremium = type === "premium_ride";
-  rw.history.push({
-    field: isPremium ? "Standby" : "Reserved",
-    previous: isPremium ? "No date noted" : "Not reserved",
-    new: (isPremium ? "Preferred date noted " : "Reserved ") + fmtDate(todayISO()),
-    changedOn: nowDateTimeLabel(),
+  withAtomicRewardUpdate(() => {
+    let rw = findReward(key);
+    if (!rw) {
+      rw = { id: uid("rw"), key, type, customerId, rentalId: rentalId || null, given: false, history: [] };
+      DB.data.rewards.push(rw);
+    }
+    if (!rw.history) rw.history = [];
+    rw.reserved = true;
+    rw.reservedDate = todayISO();
+    rw.history.push({
+      field: type === "premium_ride" ? "Standby" : "Reserved",
+      previous: type === "premium_ride" ? "No date noted" : "Not reserved",
+      new: (type === "premium_ride" ? "Preferred date noted " : "Reserved ") + fmtDate(todayISO()),
+      changedOn: nowDateTimeLabel(),
+    });
   });
-  DB.save();
+  const isPremium = type === "premium_ride";
   toast(isPremium ? "Preferred date noted — standby, not guaranteed" : `${REWARD_LABELS[type] || "Reward"} reserved`);
   render();
 }
@@ -5806,15 +5930,16 @@ function reserveReward(key, customerId, type, rentalId) {
 // Ride Upgrade: Accept means "the customer said yes" — it does NOT consume the offer.
 // Only actually marking it Used (quickGiveOrUse) progresses the ladder and locks in a rate.
 function acceptRideUpgrade(key, customerId, rentalId) {
-  let rw = findReward(key);
-  if (!rw) {
-    rw = { id: uid("rw"), key, type: "return_privilege", customerId, rentalId: rentalId || null, given: false, history: [] };
-    DB.data.rewards.push(rw);
-  }
-  if (!rw.history) rw.history = [];
-  rw.upgradeStatus = "accepted";
-  rw.history.push({ field: "Ride Upgrade", previous: "Available", new: "Accepted " + fmtDate(todayISO()), changedOn: nowDateTimeLabel() });
-  DB.save();
+  withAtomicRewardUpdate(() => {
+    let rw = findReward(key);
+    if (!rw) {
+      rw = { id: uid("rw"), key, type: "return_privilege", customerId, rentalId: rentalId || null, given: false, history: [] };
+      DB.data.rewards.push(rw);
+    }
+    if (!rw.history) rw.history = [];
+    rw.upgradeStatus = "accepted";
+    rw.history.push({ field: "Ride Upgrade", previous: "Available", new: "Accepted " + fmtDate(todayISO()), changedOn: nowDateTimeLabel() });
+  });
   toast("Ride Upgrade accepted");
   render();
 }
@@ -5822,15 +5947,16 @@ function acceptRideUpgrade(key, customerId, rentalId) {
 // Declining a Ride Upgrade offer is just a logged note for staff — the reward stays fully
 // Available afterward, exactly as if nothing happened, per "declining must not consume it".
 function declineRideUpgrade(key, customerId, rentalId) {
-  let rw = findReward(key);
-  if (!rw) {
-    rw = { id: uid("rw"), key, type: "return_privilege", customerId, rentalId: rentalId || null, given: false, history: [] };
-    DB.data.rewards.push(rw);
-  }
-  if (!rw.history) rw.history = [];
-  rw.upgradeStatus = undefined; // stays/returns to Available -- decline never blocks future acceptance
-  rw.history.push({ field: "Ride Upgrade", previous: "Offered", new: "Declined " + fmtDate(todayISO()) + " — still Available", changedOn: nowDateTimeLabel() });
-  DB.save();
+  withAtomicRewardUpdate(() => {
+    let rw = findReward(key);
+    if (!rw) {
+      rw = { id: uid("rw"), key, type: "return_privilege", customerId, rentalId: rentalId || null, given: false, history: [] };
+      DB.data.rewards.push(rw);
+    }
+    if (!rw.history) rw.history = [];
+    rw.upgradeStatus = undefined; // stays/returns to Available -- decline never blocks future acceptance
+    rw.history.push({ field: "Ride Upgrade", previous: "Offered", new: "Declined " + fmtDate(todayISO()) + " — still Available", changedOn: nowDateTimeLabel() });
+  });
   toast("Recorded as declined — offer stays available");
   render();
 }
@@ -5884,8 +6010,8 @@ function sheetMarkPremiumRideUsed(key, customerId, rentalId) {
         rw.value = dailyValueFor(rw.bikeUsed) * 2;
         if (rw.actualCost === undefined || rw.actualCost === null) rw.actualCost = rw.value;
         const customer = DB.data.customers.find((c) => c.id === customerId);
-        if (customer) rw.cycleBaselinePaidDays = customerStats(customer).paidRentalDays;
-        rw.baselineModel = "operational";
+        if (customer) rw.cycleBaselinePaidDays = customerStats(customer).lifetimeRentalDays;
+        rw.baselineModel = "lifetime";
         if (isNew || !wasGiven) {
           rw.history.push({ field: "Marked Used", previous: "Ready", new: `Used on ${rw.bikeUsed}`, changedOn: nowDateTimeLabel() });
         }
@@ -6022,9 +6148,9 @@ function sheetEditRewardFull(key, customerId, type, rentalId) {
         const customer2 = DB.data.customers.find((c) => c.id === customerId);
         if (customer2) {
           const cs2 = customerStats(customer2);
-          rw.cycleBaselinePaidDays = cs2.paidRentalDays;
+          rw.cycleBaselinePaidDays = cs2.lifetimeRentalDays;
           if (type === "vip_extra_day") rw.cycleBaselineQualifiedCount = cs2.qualifiedRentalCount;
-          rw.baselineModel = "operational";
+          rw.baselineModel = "lifetime";
         }
       } else if ((type === "premium_ride" || type === "vip_extra_day") && rw.given && !newGiven) {
         delete rw.cycleBaselinePaidDays;
@@ -6820,5 +6946,6 @@ document.getElementById("gear-btn").addEventListener("click", () => navigate("se
 
 DB.load();
 navigate("home");
+pullRewardsFromCloud();
 
 })();
