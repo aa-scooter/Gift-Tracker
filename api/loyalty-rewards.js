@@ -42,12 +42,28 @@
   round-trip in between -- app.js's client-side sync (pull-before-push, see
   the DB.save()-for-rewards wiring) is what keeps that window small, not this
   endpoint.
+
+  LOOKUP METHOD -- listChildren, not findByName
+  ----------------------------------------------
+  driveAuth.js's findByName() does a `name = '...'` query, which goes through
+  Drive's search index -- confirmed (2026-08-21) to lag well behind reality
+  for a file just freshly shared with this service account: the file was
+  immediately visible via a plain "list everything in this folder" call, but
+  a name-filtered search still missed it 90+ seconds later. listChildren()
+  has no such lag (it's a direct parent/child graph lookup, not an index
+  search), so this file finds its own file by listing the folder and
+  filtering client-side instead of trusting the name-search index.
 */
 'use strict';
 
-const { getAccessToken, findByName, downloadFile, writeFile, listChildren } = require('../lib/driveAuth');
+const { getAccessToken, downloadFile, createFile, updateFile, listChildren } = require('../lib/driveAuth');
 
 const REWARDS_FILENAME = 'loyalty_rewards.json';
+
+async function findRewardsFile(token, folderId) {
+  const children = await listChildren(token, folderId);
+  return children.find((f) => f.name === REWARDS_FILENAME) || null;
+}
 
 module.exports = async function handler(req, res) {
   const folderId = process.env.DRIVE_FOLDER_ID;
@@ -59,19 +75,10 @@ module.exports = async function handler(req, res) {
   try {
     const token = await getAccessToken();
 
-    // TEMPORARY diagnostic, added while debugging a "storageQuotaExceeded" create error --
-    // shows exactly what this service account's own Drive view of the folder contains right
-    // now. Safe to delete once the underlying issue is understood.
-    if (req.method === 'GET' && req.query && req.query.debug) {
-      const children = await listChildren(token, folderId);
-      res.status(200).json({ folderId, children });
-      return;
-    }
-
     if (req.method === 'GET') {
-      const existing = await findByName(token, REWARDS_FILENAME, { parentId: folderId, fileOnly: true });
+      const existing = await findRewardsFile(token, folderId);
       if (!existing) {
-        await writeFile(token, folderId, REWARDS_FILENAME, []);
+        await createFile(token, folderId, REWARDS_FILENAME, []);
         res.status(200).json({ rewards: [] });
         return;
       }
@@ -86,7 +93,12 @@ module.exports = async function handler(req, res) {
         res.status(400).json({ error: 'Body must include a "rewards" array' });
         return;
       }
-      await writeFile(token, folderId, REWARDS_FILENAME, body.rewards);
+      const existing = await findRewardsFile(token, folderId);
+      if (existing) {
+        await updateFile(token, existing.id, body.rewards);
+      } else {
+        await createFile(token, folderId, REWARDS_FILENAME, body.rewards);
+      }
       res.status(200).json({ ok: true, rewards: body.rewards });
       return;
     }
