@@ -4149,13 +4149,27 @@ function renderCustomerValueCard(c, stats) {
     <div class="card" style="margin-bottom:14px;">
       <div class="section-label" style="margin-top:0;">Customer Value</div>
       <div class="grid-2" style="margin-bottom:10px;">
+        <div><div class="muted" style="font-size:11.5px;">Total Time with AA</div><div style="font-weight:700;">${stats.lifetimeRentalDays} days</div></div>
+        <div><div class="muted" style="font-size:11.5px;">Lifetime Rental Revenue</div><div style="font-weight:700;">${fmtMoney(stats.lifetimeRevenueTotal)}</div></div>
+      </div>
+      <div class="grid-2" style="margin-bottom:10px;">
         <div><div class="muted" style="font-size:11.5px;">2026 Revenue</div><div style="font-weight:700;">${fmtMoney(fin.lifetimeRevenue)}</div></div>
         <div><div class="muted" style="font-size:11.5px;">Reward Value Given</div><div style="font-weight:700;">${fmtMoney(fin.totalRewardValue)}</div></div>
         <div><div class="muted" style="font-size:11.5px;">Actual Gift Cost</div><div style="font-weight:700;">${fmtMoney(fin.actualGiftCost)}</div></div>
         <div><div class="muted" style="font-size:11.5px;">Reward-to-Revenue</div><div style="font-weight:700;">${fin.ratioPct.toFixed(1)}%</div></div>
       </div>
       <span class="pill ${fin.health.cls === "green" ? "pill-green" : fin.health.cls === "amber" ? "pill-amber" : "pill-red"}">${fin.health.emoji} ${escapeHtml(fin.health.label)}</span>
-      <button class="link-btn" data-action="view-reward-history" data-id="${c.id}" style="display:block;margin-top:10px;">View Reward History</button>
+      <div class="section-label" style="margin-top:14px;">Paid Days &amp; Revenue by Year</div>
+      <div style="border:1px solid rgba(0,0,0,0.1); border-radius:10px; overflow:hidden; margin-bottom:10px;">
+        ${stats.yearlyBreakdown.length ? stats.yearlyBreakdown.map((y, i) => `
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 12px; gap:10px; ${i > 0 ? "border-top:1px solid rgba(0,0,0,0.1);" : ""}">
+            <span style="font-weight:700;">${y.year}</span>
+            <span class="muted" style="font-size:12.5px;">${y.days} paid day(s)</span>
+            <span style="font-weight:700;">${fmtMoney(y.revenue)}</span>
+          </div>
+        `).join("") : `<div class="muted" style="padding:9px 12px;font-size:12.5px;">No dated rental history yet.</div>`}
+      </div>
+      <button class="link-btn" data-action="view-reward-history" data-id="${c.id}" style="display:block;">View Reward History</button>
     </div>
   `;
 }
@@ -4224,21 +4238,9 @@ function renderCustomerDetail() {
         <div class="stat-grid">
           <div class="stat-tile"><span class="stat-value">${stats.rentalCount}</span><span class="stat-label">Rental Visits</span></div>
           <div class="stat-tile"><span class="stat-value">${stats.qualifiedRentalCount}</span><span class="stat-label">Qualified Rentals</span></div>
-          <div class="stat-tile"><span class="stat-value">${fmtMoney(stats.lifetimeRevenueTotal)}</span><span class="stat-label">Lifetime Rental Revenue</span></div>
-          <div class="stat-tile"><span class="stat-value">${stats.lifetimeRentalDays}</span><span class="stat-label">Total Paid Days</span></div>
         </div>
         <div class="reward-note" style="margin-top:10px;">
-          A Rental Visit is any genuine rental after a previous one ended — it always counts toward this customer's history, however short. Rental Visits and Qualified Rentals only count 2026-onward activity (2025 history establishes a returning customer but isn't tallied here); Lifetime Rental Revenue and Total Paid Days above cover the customer's entire history. A <b>Qualified Rental</b> is one substantial enough (by paid days or paid value for its bike class) to count toward Ride Upgrade progression. Ride Upgrade needs ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals <i>and</i> ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ 2026 revenue — Long-Term/VIP status is calculated separately and doesn't require either.
-        </div>
-        <div class="section-label" style="margin-top:14px;">Paid Days &amp; Revenue by Year</div>
-        <div style="border:1px solid rgba(0,0,0,0.1); border-radius:10px; overflow:hidden; margin-bottom:6px;">
-          ${stats.yearlyBreakdown.length ? stats.yearlyBreakdown.map((y, i) => `
-            <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 12px; gap:10px; ${i > 0 ? "border-top:1px solid rgba(0,0,0,0.1);" : ""}">
-              <span style="font-weight:700;">${y.year}</span>
-              <span class="muted" style="font-size:12.5px;">${y.days} paid day(s)</span>
-              <span style="font-weight:700;">${fmtMoney(y.revenue)}</span>
-            </div>
-          `).join("") : `<div class="muted" style="padding:9px 12px;font-size:12.5px;">No dated rental history yet.</div>`}
+          A Rental Visit is any genuine rental after a previous one ended — it always counts toward this customer's history, however short. Rental Visits and Qualified Rentals only count 2026-onward activity (2025 history establishes a returning customer but isn't tallied here) — see the Customer Value card above for lifetime totals and the year-by-year breakdown. A <b>Qualified Rental</b> is one substantial enough (by paid days or paid value for its bike class) to count toward Ride Upgrade progression. Ride Upgrade needs ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals <i>and</i> ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ 2026 revenue — Long-Term/VIP status is calculated separately and doesn't require either.
         </div>
         ${c.mergedNames && c.mergedNames.length ? `<div class="reward-note" style="margin-top:10px;">Also on file as: ${c.mergedNames.map(escapeHtml).join(", ")}</div>` : ""}
         ${c.nationality ? `<div class="muted" style="margin-top:8px;">Nationality: ${escapeHtml(c.nationality)}${c.passport ? " · Passport: " + escapeHtml(c.passport) : ""}</div>` : ""}
