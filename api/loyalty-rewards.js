@@ -43,16 +43,31 @@
   the DB.save()-for-rewards wiring) is what keeps that window small, not this
   endpoint.
 
-  LOOKUP METHOD -- listChildren, not findByName
-  ----------------------------------------------
+  LOOKUP METHOD -- listChildren, not findByName, plus a retry loop
+  ------------------------------------------------------------------
   driveAuth.js's findByName() does a `name = '...'` query, which goes through
   Drive's search index -- confirmed (2026-08-21) to lag well behind reality
   for a file just freshly shared with this service account: the file was
   immediately visible via a plain "list everything in this folder" call, but
   a name-filtered search still missed it 90+ seconds later. listChildren()
-  has no such lag (it's a direct parent/child graph lookup, not an index
-  search), so this file finds its own file by listing the folder and
-  filtering client-side instead of trusting the name-search index.
+  (a direct parent/child graph lookup, not an index search) is far more
+  reliable, but NOT perfectly so -- same-day testing also caught listChildren
+  itself failing to see a file for 30+ seconds immediately after that exact
+  file was updated (content PATCHed) by this same service account moments
+  earlier. So this endpoint retries the listChildren lookup a few times with
+  a short delay before giving up, to ride out that shorter-lived lag too.
+
+  GET's not-found fallback used to call createFile() when the lookup came up
+  empty. That is now known to be actively harmful: this service account has
+  no Drive storage quota of its own and createFile() always 403s for it
+  (see loyalty_rewards.json's creation history -- it had to be created once,
+  manually, from a real Google account). So if the retried lookup still can't
+  see the file, GET no longer tries to create it -- it logs a warning and
+  returns an empty list instead of turning a transient listing lag into a
+  hard 500 for every device pulling rewards at a bad moment. POST keeps a
+  createFile() fallback for the genuine one-time-ever case (file deleted or
+  truly never created), since a POST that can't persist really should fail
+  loudly rather than silently drop a reward.
 */
 'use strict';
 
@@ -60,9 +75,25 @@ const { getAccessToken, downloadFile, createFile, updateFile, listChildren } = r
 
 const REWARDS_FILENAME = 'loyalty_rewards.json';
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function findRewardsFile(token, folderId) {
   const children = await listChildren(token, folderId);
   return children.find((f) => f.name === REWARDS_FILENAME) || null;
+}
+
+// Retries the lookup a few times with a short delay, to ride out Drive's
+// occasional lag in reflecting a just-written file/change back through
+// listChildren for this service account. See the file-level comment above.
+async function findRewardsFileWithRetry(token, folderId, { retries = 4, delayMs = 1000 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const found = await findRewardsFile(token, folderId);
+    if (found) return found;
+    if (attempt < retries) await sleep(delayMs);
+  }
+  return null;
 }
 
 module.exports = async function handler(req, res) {
@@ -76,9 +107,9 @@ module.exports = async function handler(req, res) {
     const token = await getAccessToken();
 
     if (req.method === 'GET') {
-      const existing = await findRewardsFile(token, folderId);
+      const existing = await findRewardsFileWithRetry(token, folderId);
       if (!existing) {
-        await createFile(token, folderId, REWARDS_FILENAME, []);
+        console.warn('[/api/loyalty-rewards] GET: loyalty_rewards.json not visible via listChildren after retries; returning empty list instead of failing.');
         res.status(200).json({ rewards: [] });
         return;
       }
@@ -93,7 +124,7 @@ module.exports = async function handler(req, res) {
         res.status(400).json({ error: 'Body must include a "rewards" array' });
         return;
       }
-      const existing = await findRewardsFile(token, folderId);
+      const existing = await findRewardsFileWithRetry(token, folderId);
       if (existing) {
         await updateFile(token, existing.id, body.rewards);
       } else {
