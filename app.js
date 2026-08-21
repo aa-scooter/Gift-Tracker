@@ -2923,7 +2923,7 @@ function computeCustomerStatus(customer, stats) {
   const n = stats.rentalCount;
   const longByDuration = stats.paidRentalDays >= LONG_TERM_DAYS_THRESHOLD;
   if (hasTopTierHistory || n >= 6) return { label: "VIP Customer", detail: n >= 2 ? `${n}${ordinal(n)} rental` : "" };
-  if (n >= 4 || longByDuration) return { label: "Long-Term Customer", detail: n >= 2 ? `${n}${ordinal(n)} rental` : `${stats.paidRentalDays} days with AA` };
+  if (n >= 4 || longByDuration) return { label: "Long-Term Customer", detail: n >= 2 ? `${n}${ordinal(n)} rental` : `${stats.lifetimeRentalDays} days with AA` };
   if (n >= 2) return { label: "Returning Customer", detail: `${n}${ordinal(n)} rental` };
   return { label: "New Customer", detail: "" };
 }
@@ -3115,7 +3115,7 @@ function getSuggestions(customer, stats) {
       const pricing = getUpgradePricing(lastRideCategory, nextTarget);
       let reason;
       if (calculatedEligible) {
-        reason = `${stats.qualifiedRentalCount} qualified rental(s), ${fmtMoney(stats.totalRevenue)} lifetime revenue.`;
+        reason = `${stats.qualifiedRentalCount} qualified rental(s), ${fmtMoney(stats.totalRevenue)} 2026 revenue.`;
       } else if (!enoughQualified) {
         reason = `${stats.qualifiedRentalCount} of ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS} qualified rentals`;
       } else {
@@ -3127,7 +3127,7 @@ function getSuggestions(customer, stats) {
       out.push({
         key, type: "return_privilege",
         title: `${REWARD_LABELS.return_privilege} — upgrade to ${nextTarget}`,
-        desc: `Based on their current/last bike (${lastRideCategory}${familyUncertain ? " — Aerox/NMAX family unclear from the historical name, defaulted to Aerox; flag for review if that's wrong" : ""}). Eligible once a customer has ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals (substantial paid days or value, not just visit count) and ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ lifetime revenue, subject to bike availability.`,
+        desc: `Based on their current/last bike (${lastRideCategory}${familyUncertain ? " — Aerox/NMAX family unclear from the historical name, defaulted to Aerox; flag for review if that's wrong" : ""}). Eligible once a customer has ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals (substantial paid days or value, not just visit count) and ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ 2026 revenue, subject to bike availability.`,
         eligible: effectiveEligible(rewardRec, calculatedEligible), calculatedEligible, overridden: isOverridden(rewardRec),
         reason, notYetReason: reason, needsReview: !!familyUncertain,
         reward: rewardRec, repeatable: true, upgradeTarget: nextTarget, fromCategory: lastRideCategory,
@@ -4139,7 +4139,7 @@ function renderCustomerDetail() {
         <div class="profile-stat">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#FFC107" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M8 3v4M16 3v4"/></svg>
           <div class="profile-stat-label">Total Time<br/>with AA</div>
-          <div class="profile-stat-value">${stats.paidRentalDays} <span>days</span></div>
+          <div class="profile-stat-value">${stats.lifetimeRentalDays} <span>days</span></div>
         </div>
         <div class="profile-stat">
           <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#FFC107" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="17" r="3"/><circle cx="18" cy="17" r="3"/><path d="M6 17V12l3-3h4l3 5h3"/></svg>
