@@ -82,6 +82,17 @@ const MANAGER_SYNC_URL = "https://script.google.com/macros/s/AKfycbztdtViH9qFCZ7
 // Sync ("mgr_r*") or the in-app "+" customer/rental forms (uid()-based ids) is never touched
 // by this sync, exactly mirroring how Manager Sync itself leaves legacy history alone.
 const LOYALTY_CLOUD_API_URL = "/api/loyalty";
+// Full Refresh — the "one button does everything" rebuild, added 2026-08-21.
+// POSTs here (no body) triggers the server to: pull the LIVE 2026-onward
+// booking data straight from the AA Scooters Manager app's own Drive
+// database, combine it with the frozen 2025 archive bundled server-side,
+// re-run the full name/passport/phone matching pipeline (including folding
+// a customer's back-to-back renewals of the same bike into one continuous
+// rental entry), and write the result to the same Drive file
+// LOYALTY_CLOUD_API_URL reads/writes — returning it directly too, so this
+// button never needs a second round trip through "Refresh Loyalty Baseline
+// from Cloud". Same "imp_"-prefixed-only replacement guarantee as that flow.
+const LOYALTY_FULL_REFRESH_API_URL = "/api/loyalty-refresh";
 
 // Premium Ride Experience / VIP Extra Day both use the same cycle mechanic: 180+ cumulative
 // PAID days (an active rental counts in full — no requirement to return first) since the
@@ -3333,7 +3344,7 @@ function dashboardStats() {
 /* ROUTER + STATE                                                          */
 /* ---------------------------------------------------------------------- */
 
-const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null, managerSyncStatus: "idle", managerSyncPlan: null, managerSyncError: null, managerSyncResult: null, managerSyncExpandedNewCustomer: null, cloudSyncStatus: "idle", cloudSyncError: null, cloudSyncPreview: null };
+const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null, managerSyncStatus: "idle", managerSyncPlan: null, managerSyncError: null, managerSyncResult: null, managerSyncExpandedNewCustomer: null, cloudSyncStatus: "idle", cloudSyncError: null, cloudSyncPreview: null, fullRefreshStatus: "idle", fullRefreshError: null, fullRefreshPreview: null };
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -4839,6 +4850,27 @@ function renderSettings() {
         <div class="btn-row">
           <button class="btn btn-orange btn-sm" data-goto="manager-sync">Check for Updates from Manager…</button>
         </div>
+      </div>
+
+      <div class="section-title">Full Refresh (Live + 2025 History)</div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px;">Rebuilds the ENTIRE loyalty baseline in one go, self-contained on the server — no manual steps for anyone. Pulls the live 2026-onward booking data straight from the AA Scooters Manager app's own Drive database, combines it with the frozen 2025 archive, re-runs the full name/passport/phone matching from scratch, and folds a customer's back-to-back renewals of the same bike into one continuous entry (e.g. 6 monthly renewals become one "Jan 1 – Jun 30" rental) instead of one row per renewal. Takes longer than Manager Sync since it rebuilds everything, not just what changed. Only runs when you press the button, and only replaces the imported baseline — anything added via Manager Sync or the "+" buttons is never touched.</p>
+        <div class="btn-row">
+          <button class="btn btn-orange btn-sm" id="check-full-refresh">Run Full Refresh</button>
+        </div>
+        ${state.fullRefreshStatus === "fetching" ? `<p class="muted" style="margin-top:10px;">Rebuilding from live data + 2025 archive — this can take a little while…</p>` : ""}
+        ${state.fullRefreshStatus === "error" ? `<p style="margin-top:10px; color:#c0392b;">${escapeHtml(state.fullRefreshError || "Something went wrong.")}</p>` : ""}
+        ${state.fullRefreshStatus === "preview" && state.fullRefreshPreview ? `
+          <div style="margin-top:12px; padding:12px; border-radius:10px; background:rgba(255,255,255,0.04);">
+            <p style="margin-bottom:8px;">Rebuilt <strong>${state.fullRefreshPreview.stats.customerCount}</strong> customers and <strong>${state.fullRefreshPreview.stats.rentalCount}</strong> rental entries (${state.fullRefreshPreview.stats.consolidatedRentalCount} of those are consolidated multi-renewal stays) from live data + the 2025 archive. Currently on this device: ${state.fullRefreshPreview.localCustomerCount} / ${state.fullRefreshPreview.localRentalCount}. ${state.fullRefreshPreview.stats.reviewCount} item(s) flagged for review server-side (not shown here).</p>
+            ${(state.fullRefreshPreview.warnings || []).length ? `<p class="muted" style="margin-bottom:8px;">${state.fullRefreshPreview.warnings.map(escapeHtml).join("<br>")}</p>` : ""}
+            <div class="btn-row">
+              <button class="btn btn-primary btn-sm" id="apply-full-refresh">Apply</button>
+              <button class="btn btn-outline btn-sm" id="cancel-full-refresh">Cancel</button>
+            </div>
+          </div>
+        ` : ""}
+        ${state.fullRefreshStatus === "done" ? `<p class="muted" style="margin-top:10px;">Full refresh applied ✓</p>` : ""}
       </div>
 
       <div class="section-title">Loyalty Data (Cloud)</div>
@@ -6471,6 +6503,69 @@ function wireScreenEvents() {
   if (cancelCloudSyncBtn) cancelCloudSyncBtn.addEventListener("click", () => {
     state.cloudSyncPreview = null;
     state.cloudSyncStatus = "idle";
+    render();
+  });
+
+  // Full Refresh — staff-triggered only, fires exclusively from this click handler.
+  // POST (no body) tells the server to rebuild the whole baseline itself (live Drive
+  // data + frozen 2025 archive + full matching pipeline) and hand back the result in
+  // one response — this button never calls out to LOYALTY_CLOUD_API_URL separately.
+  // Same "imp_"-prefixed-only replacement guarantee as Cloud Sync/Manager Sync.
+  const checkFullRefreshBtn = document.getElementById("check-full-refresh");
+  if (checkFullRefreshBtn) checkFullRefreshBtn.addEventListener("click", () => {
+    state.fullRefreshStatus = "fetching";
+    state.fullRefreshError = null;
+    render();
+    fetch(LOYALTY_FULL_REFRESH_API_URL, { method: "POST" })
+      .then((res) => {
+        if (!res.ok) return res.json().catch(() => null).then((body) => { throw new Error((body && body.error) || ("Server responded with status " + res.status)); });
+        return res.json();
+      })
+      .then((data) => {
+        if (!data || data.ok !== true || !Array.isArray(data.customers) || !Array.isArray(data.rentals)) {
+          throw new Error((data && data.error) || "Unexpected response shape.");
+        }
+        state.fullRefreshPreview = {
+          customers: data.customers,
+          rentals: data.rentals,
+          stats: data.stats || {},
+          warnings: data.warnings || [],
+          localCustomerCount: DB.data.customers.filter((c) => (c.id || "").indexOf("imp_") === 0).length,
+          localRentalCount: DB.data.rentals.filter((r) => (r.id || "").indexOf("imp_") === 0).length,
+        };
+        state.fullRefreshStatus = "preview";
+        render();
+      })
+      .catch((err) => {
+        state.fullRefreshError = err.message || String(err);
+        state.fullRefreshStatus = "error";
+        render();
+      });
+  });
+
+  const applyFullRefreshBtn = document.getElementById("apply-full-refresh");
+  if (applyFullRefreshBtn) applyFullRefreshBtn.addEventListener("click", () => {
+    const preview = state.fullRefreshPreview;
+    if (!preview) return;
+    confirmSheet(
+      `This will replace the ${preview.localCustomerCount} imported baseline customer(s) and ${preview.localRentalCount} imported baseline rental(s) currently on this device with the freshly rebuilt ${preview.customers.length} / ${preview.rentals.length} version (live data + 2025 archive, renewals consolidated). Anything added via Manager Sync or the "+" buttons is never touched. This cannot be undone from within the app — use Export Backup first if unsure.`,
+      () => {
+        DB.data.customers = DB.data.customers.filter((c) => (c.id || "").indexOf("imp_") !== 0).concat(preview.customers);
+        DB.data.rentals = DB.data.rentals.filter((r) => (r.id || "").indexOf("imp_") !== 0).concat(preview.rentals);
+        DB.save();
+        state.fullRefreshStatus = "done";
+        state.fullRefreshPreview = null;
+        toast(`Full refresh applied ✓ — ${preview.customers.length} customers`);
+        render();
+      },
+      "Apply"
+    );
+  });
+
+  const cancelFullRefreshBtn = document.getElementById("cancel-full-refresh");
+  if (cancelFullRefreshBtn) cancelFullRefreshBtn.addEventListener("click", () => {
+    state.fullRefreshPreview = null;
+    state.fullRefreshStatus = "idle";
     render();
   });
 
