@@ -670,6 +670,24 @@ function daysBetween(a, b) {
   return Math.round((d2 - d1) / 86400000);
 }
 function daysFromToday(iso) { return daysBetween(todayISO(), iso); }
+// Splits an [startIso, endIso) date range into per-calendar-year day counts — e.g.
+// 2025-11-01..2026-02-01 -> [{year:2025, days:61}, {year:2026, days:31}]. Only ever used on
+// a date-derived range (never on a flat recorded paidDays value), since fabricating a split
+// of a single recorded number across years would invent precision the data doesn't have.
+function splitDaysAcrossYears(startIso, endIso) {
+  const out = [];
+  if (!startIso || !endIso || endIso <= startIso) return out;
+  let cur = startIso;
+  while (cur < endIso) {
+    const year = Number(cur.slice(0, 4));
+    const yearEnd = `${year + 1}-01-01`;
+    const segEnd = yearEnd < endIso ? yearEnd : endIso;
+    const days = daysBetween(cur, segEnd);
+    if (days > 0) out.push({ year, days });
+    cur = segEnd;
+  }
+  return out;
+}
 function initials(name) {
   return (name || "?").trim().split(/\s+/).slice(0, 2).map((s) => s[0]?.toUpperCase() || "").join("");
 }
@@ -2849,6 +2867,17 @@ function customerStats(customer, simulatedRentals) {
   const todayIso = todayISO();
   let rentalCount = 0, paidRentalDays = 0, totalRevenue = 0, qualifiedRentalCount = 0;
   let boundarySpanningCount = 0;
+  // Per-calendar-year days/revenue, feeding the "Rental History by Year" breakdown returned
+  // below as `yearlyBreakdown` — built alongside paidRentalDays/totalRevenue/preCutoffDays/
+  // preCutoffRevenue from the exact same contributions, so it always sums to exactly
+  // lifetimeRentalDays / lifetimeRevenueTotal, never a separately-computed figure that could
+  // drift out of sync with the totals shown next to it.
+  const yearlyMap = {};
+  const addYearly = (year, days, revenue) => {
+    const b = yearlyMap[year] || (yearlyMap[year] = { days: 0, revenue: 0 });
+    b.days += days;
+    b.revenue += revenue;
+  };
   forCalculation.forEach((r) => {
     if (artifactRentalIds.has(r.id)) return; // proven artifact — visible in history, zero operational contribution
     const contrib = operationalContribution(r, todayIso);
@@ -2857,6 +2886,18 @@ function customerStats(customer, simulatedRentals) {
     paidRentalDays += contrib.days;
     totalRevenue += contrib.revenue;
     if (contrib.isBoundarySpanning) boundarySpanningCount++;
+    // A boundary-spanning contribution's days are date-derived (the overlap window clipped
+    // to 2026-onward and to today), so they're split across whichever calendar year(s) that
+    // window actually touches. A normal (non-boundary) contribution's days come straight
+    // from the rental's own recorded paidDays field rather than a date computation, so —
+    // matching how its revenue is never split either — its full day/revenue total is
+    // attributed to the single calendar year the rental started in.
+    if (contrib.isBoundarySpanning) {
+      const overlapEnd = (r.endDate || todayIso) > todayIso ? todayIso : (r.endDate || todayIso);
+      splitDaysAcrossYears(LEGACY_CUTOFF_DATE, overlapEnd).forEach((seg) => addYearly(seg.year, seg.days, 0));
+    } else {
+      addYearly(Number(r.startDate.slice(0, 4)), contrib.days, contrib.revenue);
+    }
     // Qualified Rental check runs against the SAME clipped operational values (days/revenue)
     // as everything else — never against the raw record's all-time fields — so a
     // boundary-spanning rental with zero operational revenue can still qualify purely on its
@@ -2889,21 +2930,37 @@ function customerStats(customer, simulatedRentals) {
   rentals.forEach((r) => {
     const end = r.endDate || todayIso;
     if (end < LEGACY_CUTOFF_DATE) {
-      preCutoffDays += Math.max(daysBetween(r.startDate, end), Number(r.paidDays) || 0);
-      preCutoffRevenue += Number(r.revenue) || 0;
+      const days = Math.max(daysBetween(r.startDate, end), Number(r.paidDays) || 0);
+      const revenue = Number(r.revenue) || 0;
+      preCutoffDays += days;
+      preCutoffRevenue += revenue;
+      // Entirely pre-cutoff, so (for every real rental this app has on file) it falls within
+      // a single calendar year — attributed to the year the rental started in, same
+      // single-year, revenue-never-split convention used for every other rental above.
+      addYearly(Number(r.startDate.slice(0, 4)), days, revenue);
     } else if (r.startDate < LEGACY_CUTOFF_DATE) {
-      preCutoffDays += Math.max(daysBetween(r.startDate, LEGACY_CUTOFF_DATE), 0);
-      preCutoffRevenue += Number(r.revenue) || 0;
+      const days = Math.max(daysBetween(r.startDate, LEGACY_CUTOFF_DATE), 0);
+      const revenue = Number(r.revenue) || 0;
+      preCutoffDays += days;
+      preCutoffRevenue += revenue;
+      // Only the pre-cutoff portion of a boundary-spanning rental — its 2026-onward portion
+      // (and full revenue, already zero here) was already attributed above via forCalculation.
+      addYearly(Number(r.startDate.slice(0, 4)), days, revenue);
     }
   });
   const lifetimeRentalDays = paidRentalDays + preCutoffDays;
   const lifetimeRevenueTotal = totalRevenue + preCutoffRevenue;
+  // Sorted oldest-to-newest — sums exactly to lifetimeRentalDays / lifetimeRevenueTotal above,
+  // by construction (see addYearly calls throughout this function).
+  const yearlyBreakdown = Object.keys(yearlyMap)
+    .map((y) => ({ year: Number(y), days: yearlyMap[y].days, revenue: yearlyMap[y].revenue }))
+    .sort((a, b) => a.year - b.year);
   const previousBikes = [...new Set(completed.map((r) => rentalCategory(r)))];
 
   return {
     rentals, current, completed,
     rentalCount, qualifiedRentalCount,
-    paidRentalDays, lifetimeRentalDays, totalRevenue, lifetimeRevenueTotal,
+    paidRentalDays, lifetimeRentalDays, totalRevenue, lifetimeRevenueTotal, yearlyBreakdown,
     previousBikes, boundarySpanningCount, artifactRentalIds,
   };
 }
@@ -4172,6 +4229,16 @@ function renderCustomerDetail() {
         </div>
         <div class="reward-note" style="margin-top:10px;">
           A Rental Visit is any genuine rental after a previous one ended — it always counts toward this customer's history, however short. Rental Visits and Qualified Rentals only count 2026-onward activity (2025 history establishes a returning customer but isn't tallied here); Lifetime Rental Revenue and Total Paid Days above cover the customer's entire history. A <b>Qualified Rental</b> is one substantial enough (by paid days or paid value for its bike class) to count toward Ride Upgrade progression. Ride Upgrade needs ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals <i>and</i> ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ 2026 revenue — Long-Term/VIP status is calculated separately and doesn't require either.
+        </div>
+        <div class="section-label" style="margin-top:14px;">Paid Days &amp; Revenue by Year</div>
+        <div style="border:1px solid rgba(0,0,0,0.1); border-radius:10px; overflow:hidden; margin-bottom:6px;">
+          ${stats.yearlyBreakdown.length ? stats.yearlyBreakdown.map((y, i) => `
+            <div style="display:flex; justify-content:space-between; align-items:center; padding:9px 12px; gap:10px; ${i > 0 ? "border-top:1px solid rgba(0,0,0,0.1);" : ""}">
+              <span style="font-weight:700;">${y.year}</span>
+              <span class="muted" style="font-size:12.5px;">${y.days} paid day(s)</span>
+              <span style="font-weight:700;">${fmtMoney(y.revenue)}</span>
+            </div>
+          `).join("") : `<div class="muted" style="padding:9px 12px;font-size:12.5px;">No dated rental history yet.</div>`}
         </div>
         ${c.mergedNames && c.mergedNames.length ? `<div class="reward-note" style="margin-top:10px;">Also on file as: ${c.mergedNames.map(escapeHtml).join(", ")}</div>` : ""}
         ${c.nationality ? `<div class="muted" style="margin-top:8px;">Nationality: ${escapeHtml(c.nationality)}${c.passport ? " · Passport: " + escapeHtml(c.passport) : ""}</div>` : ""}
