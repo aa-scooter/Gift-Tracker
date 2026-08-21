@@ -2865,16 +2865,45 @@ function customerStats(customer, simulatedRentals) {
     if (contrib.days >= t.days || contrib.revenue >= t.revenue) qualifiedRentalCount++;
   });
 
-  const lifetimeRentalDays = rentals.reduce((s, r) => {
+  // TRUE LIFETIME totals (all years, no 2026 cutoff) — feed ONLY the "Total Paid Days" and
+  // "Lifetime Rental Revenue" display tiles on the customer profile. Everything else
+  // (Qualified Rentals, VIP/Long-Term status, Ride Upgrade, gift eligibility) intentionally
+  // stays on the 2026-onward operational totals above, per the approved design — this is a
+  // display-only addition, added 2026-08-21 because those two tiles were labeled "Lifetime"
+  // while actually showing the 2026-only operational figures, hiding a customer's real 2025
+  // history (e.g. a customer with real 2025 rentals showing far fewer days/revenue than
+  // they've actually paid AA over their whole relationship).
+  //
+  // Built by adding the pre-2026 portion of history on top of the already-correctly-deduped
+  // operational totals above, so it never double-counts a booking that exists in both a
+  // Legacy/imported record and a Manager-linked record (the same protection the operational
+  // model has) — Manager Sync only ever holds 2026-onward rows, so a genuine 2025-only
+  // rental can never have a Manager duplicate to worry about, and is always safe to add in
+  // full. A boundary-spanning rental (starts before 2026, still active/ends after) already
+  // had its 2026-onward days counted operationally above; only its pre-2026 portion is added
+  // here, so it's counted exactly once across the whole span. Its revenue isn't split by
+  // date (this app has no reliable way to allocate a boundary payment between years), and
+  // the operational total already counts zero revenue for it, so the full recorded revenue
+  // is safely attributed here without double-counting.
+  let preCutoffDays = 0, preCutoffRevenue = 0;
+  rentals.forEach((r) => {
     const end = r.endDate || todayIso;
-    return s + Math.max(daysBetween(r.startDate, end), Number(r.paidDays) || 0);
-  }, 0);
+    if (end < LEGACY_CUTOFF_DATE) {
+      preCutoffDays += Math.max(daysBetween(r.startDate, end), Number(r.paidDays) || 0);
+      preCutoffRevenue += Number(r.revenue) || 0;
+    } else if (r.startDate < LEGACY_CUTOFF_DATE) {
+      preCutoffDays += Math.max(daysBetween(r.startDate, LEGACY_CUTOFF_DATE), 0);
+      preCutoffRevenue += Number(r.revenue) || 0;
+    }
+  });
+  const lifetimeRentalDays = paidRentalDays + preCutoffDays;
+  const lifetimeRevenueTotal = totalRevenue + preCutoffRevenue;
   const previousBikes = [...new Set(completed.map((r) => rentalCategory(r)))];
 
   return {
     rentals, current, completed,
     rentalCount, qualifiedRentalCount,
-    paidRentalDays, lifetimeRentalDays, totalRevenue,
+    paidRentalDays, lifetimeRentalDays, totalRevenue, lifetimeRevenueTotal,
     previousBikes, boundarySpanningCount, artifactRentalIds,
   };
 }
@@ -4138,11 +4167,11 @@ function renderCustomerDetail() {
         <div class="stat-grid">
           <div class="stat-tile"><span class="stat-value">${stats.rentalCount}</span><span class="stat-label">Rental Visits</span></div>
           <div class="stat-tile"><span class="stat-value">${stats.qualifiedRentalCount}</span><span class="stat-label">Qualified Rentals</span></div>
-          <div class="stat-tile"><span class="stat-value">${fmtMoney(stats.totalRevenue)}</span><span class="stat-label">Lifetime Rental Revenue</span></div>
-          <div class="stat-tile"><span class="stat-value">${stats.paidRentalDays}</span><span class="stat-label">Total Paid Days</span></div>
+          <div class="stat-tile"><span class="stat-value">${fmtMoney(stats.lifetimeRevenueTotal)}</span><span class="stat-label">Lifetime Rental Revenue</span></div>
+          <div class="stat-tile"><span class="stat-value">${stats.lifetimeRentalDays}</span><span class="stat-label">Total Paid Days</span></div>
         </div>
         <div class="reward-note" style="margin-top:10px;">
-          A Rental Visit is any genuine rental after a previous one ended — it always counts toward this customer's history, however short. A <b>Qualified Rental</b> is one substantial enough (by paid days or paid value for its bike class) to count toward Ride Upgrade progression. Ride Upgrade needs ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals <i>and</i> ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ lifetime revenue — Long-Term/VIP status is calculated separately and doesn't require either.
+          A Rental Visit is any genuine rental after a previous one ended — it always counts toward this customer's history, however short. Rental Visits and Qualified Rentals only count 2026-onward activity (2025 history establishes a returning customer but isn't tallied here); Lifetime Rental Revenue and Total Paid Days above cover the customer's entire history. A <b>Qualified Rental</b> is one substantial enough (by paid days or paid value for its bike class) to count toward Ride Upgrade progression. Ride Upgrade needs ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals <i>and</i> ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ 2026 revenue — Long-Term/VIP status is calculated separately and doesn't require either.
         </div>
         ${c.mergedNames && c.mergedNames.length ? `<div class="reward-note" style="margin-top:10px;">Also on file as: ${c.mergedNames.map(escapeHtml).join(", ")}</div>` : ""}
         ${c.nationality ? `<div class="muted" style="margin-top:8px;">Nationality: ${escapeHtml(c.nationality)}${c.passport ? " · Passport: " + escapeHtml(c.passport) : ""}</div>` : ""}
