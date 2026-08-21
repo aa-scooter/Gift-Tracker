@@ -1,0 +1,9 @@
+{
+  "name": "aa-scooter-gift-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AA Scooter Rental — Manager PWA. Static site (app.js/index.html/styles.css) plus one serverless function (/api/loyalty.js) that bridges the Customer Loyalty dataset to Google Drive. No build step, no dependencies — the function uses only Node's built-in crypto and fetch.",
+  "engines": {
+    "node": ">=18"
+  }
+}
