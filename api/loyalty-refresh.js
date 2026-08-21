@@ -56,7 +56,7 @@ module.exports = async function handler(req, res) {
 
   try {
     const token = await getAccessToken();
-    const { rows: liveRows, yearsFound, warnings } = await fetchLiveRows(token);
+    const { rows: liveRows, backfilledPassport, backfilledPhone, warnings } = await fetchLiveRows(token);
 
     const fileRows = [
       ['2025 archive', archive2025],
@@ -84,7 +84,9 @@ module.exports = async function handler(req, res) {
         rentalCount: appRentals.length,
         reviewCount: review.length,
         consolidatedRentalCount: consolidatedCount,
-        liveYearsFound: yearsFound,
+        liveRowsFound: liveRows.length,
+        liveBackfilledPassport: backfilledPassport,
+        liveBackfilledPhone: backfilledPhone,
         totalSpendThb: Math.round(customers.reduce((s, c) => s + (c.total_spend_thb || 0), 0)),
       },
       warnings,
