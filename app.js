@@ -107,6 +107,18 @@ const LOYALTY_REWARDS_API_URL = "/api/loyalty-rewards";
 // legacy rewards file is never read or written by this, and vice versa, so neither sync can
 // ever clobber the other's history.
 const LOYALTY_LEDGER_API_URL = "/api/loyalty-ledger";
+// Persistent, append-only audit trail for every owner/staff action that changes loyalty
+// state — added 2026-08-23 as the required safety layer on top of the ledger above. Its own
+// Drive file (loyalty_audit_log.json), completely separate from customers/rentals/rewards/
+// the ledger, so nothing else can ever erase it. The client-side array only ever grows (see
+// appendAuditRecord — nothing in this app ever splices or filters loyaltyAuditLog down), so
+// even though the sync below pushes the whole array like the ledger/rewards sync do, the
+// invariant "this array only grows" makes that push effectively append-only in practice.
+const LOYALTY_AUDIT_API_URL = "/api/loyalty-audit";
+// Versioned, timestamped, never-overwritten backup snapshots — added 2026-08-23. Each
+// backup is its OWN Drive file (loyalty_backup_<timestamp>.json, see api/loyalty-backup.js),
+// never updated once written, so an older backup can never be silently lost by a newer one.
+const LOYALTY_BACKUP_API_URL = "/api/loyalty-backup";
 
 // Premium Ride Experience / VIP Extra Day both use the same cycle mechanic: 180+ cumulative
 // PAID days (an active rental counts in full — no requirement to return first) since the
@@ -390,6 +402,9 @@ const DB = {
     // completely separate from the legacy `rewards` array (never migrated into it, never
     // migrated out of it) so existing given-reward history is never touched by this.
     if (!this.data.loyaltyLedger) this.data.loyaltyLedger = [];
+    // Append-only audit trail — see LOYALTY_AUDIT_API_URL above. Never cleared, filtered, or
+    // reset by DB.load()/wipe() migration logic beyond ensuring the array exists.
+    if (!this.data.loyaltyAuditLog) this.data.loyaltyAuditLog = [];
     // Migration safety: older saves may be missing newer vehicle fields.
     this.data.vehicles.forEach((v) => {
       if (v.taxExpiryDate === undefined) v.taxExpiryDate = v.taxDate || "";
@@ -3290,6 +3305,9 @@ function ensureLoyaltyLedgerEntries(customer, stats, dims) {
       };
       DB.data.loyaltyLedger.push(entry);
       changed = true;
+      appendAuditRecord(customer.id, "system_milestone_reached",
+        [{ field: "status", previousValue: null, newValue: entry.status }],
+        "system", "Milestone reached automatically: " + entry.milestoneLabel, entitlementId);
     });
   });
   if (changed) { DB.save(); syncLoyaltyLedgerToCloud(); }
@@ -3349,16 +3367,192 @@ function pullLoyaltyLedgerFromCloud() {
     .catch((err) => { console.warn("Loyalty ledger cloud pull failed (staying on local data):", err); });
 }
 
+/* ---------------------------------------------------------------------- */
+/* LOYALTY V2 — append-only audit log                                      */
+/* ---------------------------------------------------------------------- */
+// Every owner/staff action that changes loyalty state creates ONE record here. Nothing in
+// this app ever removes, filters, or truncates DB.data.loyaltyAuditLog — the only operation
+// on it is push (see appendAuditRecord). `changes` is an array of {field, previousValue,
+// newValue} so a single action (e.g. Change Reward) that touches more than one field is
+// still one audit record, per the spec's "field(s) changed" plural.
+function appendAuditRecord(customerCanonicalId, action, changes, performedBy, reason, entitlementId) {
+  const record = {
+    auditId: uid("aud"),
+    timestamp: new Date().toISOString(),
+    customerCanonicalId, entitlementId: entitlementId || null,
+    action, // manual_grant | grant_early | change_reward | change_quantity | select_alternative |
+            // mark_given | mark_redeemed | decline_skip | owner_override | owner_note_edit |
+            // correction_of_status | manual_backtrack | system_milestone_reached |
+            // backup_created | backup_restored
+    changes: changes || [], // [{field, previousValue, newValue}]
+    performedBy: performedBy || "owner",
+    reason: reason || "",
+  };
+  DB.data.loyaltyAuditLog.push(record);
+  DB.save();
+  syncLoyaltyAuditLogToCloud();
+  return record;
+}
+function customerActivityHistory(customerId) {
+  return DB.data.loyaltyAuditLog
+    .filter((a) => a.customerCanonicalId === customerId)
+    .slice()
+    .sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+}
+function syncLoyaltyAuditLogToCloud() {
+  fetch(LOYALTY_AUDIT_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ loyaltyAuditLog: DB.data.loyaltyAuditLog }),
+  }).catch((err) => { console.warn("Loyalty audit log cloud sync failed (will retry on next audited action):", err); });
+}
+function pullLoyaltyAuditLogFromCloud() {
+  fetch(LOYALTY_AUDIT_API_URL)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data) => {
+      if (!data || !Array.isArray(data.loyaltyAuditLog)) return;
+      // Pure union by auditId — audit records are immutable once created (nothing ever
+      // edits one), so unlike the ledger/rewards merge there is no "newer wins" comparison
+      // to make, only "do we already have this record".
+      const localIds = new Set(DB.data.loyaltyAuditLog.map((a) => a.auditId));
+      const toAdd = data.loyaltyAuditLog.filter((a) => !localIds.has(a.auditId));
+      if (toAdd.length) {
+        DB.data.loyaltyAuditLog = DB.data.loyaltyAuditLog.concat(toAdd);
+        DB.save();
+        render();
+        syncLoyaltyAuditLogToCloud();
+      }
+    })
+    .catch((err) => { console.warn("Loyalty audit log cloud pull failed (staying on local data):", err); });
+}
+
+// Human-readable labels for the audit action enum — used only by the Activity History UI;
+// the raw `action` string is still what's stored and synced, this is a display concern only.
+const AUDIT_ACTION_LABELS = {
+  manual_grant: "Manual Grant", grant_early: "Grant Early", change_reward: "Reward Changed",
+  change_quantity: "Quantity Changed", select_alternative: "Reward Selected", mark_given: "Marked Given",
+  mark_redeemed: "Marked Redeemed", decline_skip: "Skipped / Declined", owner_override: "Owner Override",
+  owner_note_edit: "Note Updated", correction_of_status: "Corrected / Undone", manual_backtrack: "Manual Backtrack",
+  system_milestone_reached: "Milestone Reached (automatic)", backup_created: "Backup Created", backup_restored: "Backup Restored",
+};
+
+/* ---------------------------------------------------------------------- */
+/* LOYALTY V2 — versioned backups + safe restore                           */
+/* ---------------------------------------------------------------------- */
+// Snapshots the three persistent/owner-decision-bearing stores (ledger, audit log, and the
+// legacy rewards array) PLUS the source data (customers, rentals) so a restore can bring
+// back a fully consistent point-in-time state. Deliberately does NOT snapshot vehicles/
+// needsReview (out of scope for loyalty) or re-snapshot the backup list itself.
+function buildLoyaltySnapshot() {
+  return {
+    customers: DB.data.customers, rentals: DB.data.rentals, rewards: DB.data.rewards,
+    loyaltyLedger: DB.data.loyaltyLedger, loyaltyAuditLog: DB.data.loyaltyAuditLog,
+    meta: DB.data.meta,
+  };
+}
+// Call this before any operation capable of changing multiple customer/reward records —
+// production migration, bulk loyalty changes, a full loyalty rebuild, or a ledger migration
+// — per the safety requirement. Each call creates a NEW, separately-named, never-overwritten
+// file (see api/loyalty-backup.js — it always creates, never updates). Returns a promise so
+// callers can await it before proceeding with the risky operation, and reject/no-op safely
+// if the network call fails rather than silently proceeding without a backup.
+function createLoyaltyBackup(reason, performedBy) {
+  const snapshot = buildLoyaltySnapshot();
+  return fetch(LOYALTY_BACKUP_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason: reason || "Manual", snapshot }),
+  })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Backup request failed: " + r.status))))
+    .then((data) => {
+      appendAuditRecord(null, "backup_created", [{ field: "backup", previousValue: null, newValue: data.filename }], performedBy || "owner", reason || "Manual backup");
+      return data;
+    });
+}
+function listLoyaltyBackups() {
+  return fetch(LOYALTY_BACKUP_API_URL)
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("List backups failed: " + r.status))))
+    .then((data) => (data && Array.isArray(data.backups) ? data.backups : []));
+}
+function fetchLoyaltyBackup(id) {
+  return fetch(LOYALTY_BACKUP_API_URL + "?id=" + encodeURIComponent(id))
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Fetch backup failed: " + r.status))));
+}
+// Builds a preview of exactly what a restore would change — never a blind action. Compares
+// customers/rentals/rewards/loyaltyLedger record-by-record (by id) between the current state
+// and the backup's snapshot. The audit log itself is NEVER part of the diff or the restore —
+// restoring an older snapshot must never erase audit history recorded since that backup was
+// taken; a restore is itself recorded as a NEW forward-only audit entry (see
+// restoreLoyaltyBackup), never a rollback of the log.
+function buildRestoreDiff(backupSnapshot) {
+  function diffArray(currentArr, backupArr, idField) {
+    const currentById = {}; currentArr.forEach((r) => { currentById[r[idField]] = r; });
+    const backupById = {}; backupArr.forEach((r) => { backupById[r[idField]] = r; });
+    const changed = [], added = [], removed = [];
+    Object.keys(backupById).forEach((id) => {
+      const cur = currentById[id];
+      if (!cur) { added.push({ id, backup: backupById[id] }); }
+      else if (JSON.stringify(cur) !== JSON.stringify(backupById[id])) { changed.push({ id, current: cur, backup: backupById[id] }); }
+    });
+    Object.keys(currentById).forEach((id) => { if (!backupById[id]) removed.push({ id, current: currentById[id] }); });
+    return { changed, added, removed };
+  }
+  return {
+    customers: diffArray(DB.data.customers, backupSnapshot.customers || [], "id"),
+    rentals: diffArray(DB.data.rentals, backupSnapshot.rentals || [], "id"),
+    rewards: diffArray(DB.data.rewards, backupSnapshot.rewards || [], "id"),
+    loyaltyLedger: diffArray(DB.data.loyaltyLedger, backupSnapshot.loyaltyLedger || [], "id"),
+  };
+}
+function restoreDiffSummary(diff) {
+  const totalFor = (d) => d.changed.length + d.added.length + d.removed.length;
+  return {
+    customers: totalFor(diff.customers), rentals: totalFor(diff.rentals),
+    rewards: totalFor(diff.rewards), loyaltyLedger: totalFor(diff.loyaltyLedger),
+    total: totalFor(diff.customers) + totalFor(diff.rentals) + totalFor(diff.rewards) + totalFor(diff.loyaltyLedger),
+  };
+}
+// The ONLY function that actually applies a restore — requires the caller to have already
+// shown the owner a diff and gotten explicit confirmation (see the "v2-restore-confirm" UI
+// wiring). Always takes a fresh safety backup of the CURRENT state first, so a restore is
+// itself always undoable. Never touches loyaltyAuditLog (see buildRestoreDiff comment above)
+// — it only restores customers/rentals/rewards/loyaltyLedger, then appends one forward audit
+// record documenting that the restore happened.
+function restoreLoyaltyBackup(backupId, backupLabel, performedBy) {
+  return createLoyaltyBackup("Pre-restore safety backup (before restoring " + backupLabel + ")", performedBy)
+    .then(() => fetchLoyaltyBackup(backupId))
+    .then((data) => {
+      const snap = data.snapshot;
+      if (!snap) throw new Error("Backup has no snapshot content");
+      const before = { customers: DB.data.customers.length, rentals: DB.data.rentals.length, rewards: DB.data.rewards.length, loyaltyLedger: DB.data.loyaltyLedger.length };
+      DB.data.customers = snap.customers || DB.data.customers;
+      DB.data.rentals = snap.rentals || DB.data.rentals;
+      DB.data.rewards = snap.rewards || DB.data.rewards;
+      DB.data.loyaltyLedger = snap.loyaltyLedger || DB.data.loyaltyLedger;
+      DB.save();
+      syncLoyaltyLedgerToCloud();
+      syncRewardsToCloud();
+      appendAuditRecord(null, "backup_restored",
+        [{ field: "restoredFrom", previousValue: before, newValue: { backupId, backupLabel } }],
+        performedBy || "owner", "Restored from backup " + backupLabel);
+      render();
+    });
+}
+
 // Owner override actions — grant early, change reward, change quantity, select an
 // alternative, mark given, undo, skip/decline, add a note. Automatic eligibility (the
 // `automaticEligibility` field, always preserved) is a recommendation; owner decision is
 // final authority and is layered on top, never overwriting the underlying facts (genuine
-// visits / continuous days / lifetime days are never touched by any of these).
-function loyaltyOwnerGrantManual(customer, program, ladderId, note) {
+// visits / continuous days / lifetime days are never touched by any of these). EVERY action
+// below appends exactly one append-only audit record (see appendAuditRecord above) —
+// auditing happens inside the same withAtomicLedgerUpdate transaction, so an audit record is
+// only ever created for a change that actually saved successfully.
+function loyaltyOwnerGrantManual(customer, program, ladderId, note, isEarly, performedBy) {
   // A manual grant creates a ledger row even if the customer hasn't (yet) automatically
   // qualified — the owner's decision, clearly labeled, not a recalculated fact.
   const entitlementId = loyaltyEntitlementId(customer.id, program, ladderId);
-  withAtomicLedgerUpdate(() => {
+  const existedBefore = !!findLoyaltyLedgerEntry(entitlementId);
+  const ok = withAtomicLedgerUpdate(() => {
     let entry = findLoyaltyLedgerEntry(entitlementId);
     const ladder = loyaltyLadders()[program] || [];
     const rung = ladder.find((r) => r.id === ladderId) || { id: ladderId, label: "Manual Appreciation", rewardType: "choice_reward" };
@@ -3369,27 +3563,35 @@ function loyaltyOwnerGrantManual(customer, program, ladderId, note) {
         program, qualificationTrack: LOYALTY_LADDER_PROGRAM_LABEL[program] || "Owner Manual Appreciation",
         rewardType: rung.rewardType, qualifyingMilestone: rung.id, milestoneLabel: rung.label,
         qualificationDate: nowISO.slice(0, 10),
-        qualificationReason: "Owner Override / Manual Appreciation — not from an automatic rule.",
+        qualificationReason: isEarly ? "Owner Override / Grant Early — automatic threshold not yet reached." : "Owner Override / Manual Appreciation — not from an automatic rule.",
         qualificationThreshold: rung.threshold || null,
         continuousRentalStartDate: null, continuousRentalDays: null,
         automaticEligibility: false,
-        ownerOverride: "manual_grant", overrideReason: note || "",
+        ownerOverride: isEarly ? "grant_early" : "manual_grant", overrideReason: note || "",
         availableChoices: rung.rewardType === "choice_reward" ? CHOICE_REWARD_OPTIONS.slice() : [],
         selectedChoice: null, selectionDate: null, quantity: rung.quantity || null,
         status: rung.rewardType === "choice_reward" ? "pending_choice" : "manual",
-        givenDate: null, grantedBy: "owner", ownerNote: note || "",
+        givenDate: null, grantedBy: performedBy || "owner", ownerNote: note || "",
         source: "owner_manual_appreciation", createdAt: nowISO, updatedAt: nowISO,
       };
       DB.data.loyaltyLedger.push(entry);
     } else {
-      entry.ownerOverride = "manual_grant";
+      entry.ownerOverride = isEarly ? "grant_early" : "manual_grant";
       entry.overrideReason = note || entry.overrideReason;
       entry.status = entry.rewardType === "choice_reward" ? "pending_choice" : "manual";
     }
   });
+  if (ok) {
+    appendAuditRecord(customer.id, isEarly ? "grant_early" : "manual_grant",
+      [{ field: "status", previousValue: existedBefore ? "existing" : "none", newValue: "granted" }],
+      performedBy, note, entitlementId);
+  }
 }
-function loyaltyOwnerSelectChoice(entitlementId, choice, grantedBy) {
-  withAtomicLedgerUpdate(() => {
+function loyaltyOwnerSelectChoice(entitlementId, choice, grantedBy, reason) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  const prevChoice = before ? before.selectedChoice : null;
+  const isChange = before && before.selectedChoice && before.selectedChoice !== choice;
+  const ok = withAtomicLedgerUpdate(() => {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
     entry.selectedChoice = choice;
@@ -3397,46 +3599,89 @@ function loyaltyOwnerSelectChoice(entitlementId, choice, grantedBy) {
     entry.status = "selected";
     entry.grantedBy = grantedBy || entry.grantedBy || "owner";
   });
+  if (ok) {
+    appendAuditRecord(before.customerCanonicalId, isChange ? "change_reward" : "select_alternative",
+      [{ field: "selectedChoice", previousValue: prevChoice, newValue: choice }],
+      grantedBy, reason, entitlementId);
+  }
 }
-function loyaltyOwnerMarkGiven(entitlementId) {
-  withAtomicLedgerUpdate(() => {
+function loyaltyOwnerMarkGiven(entitlementId, performedBy) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  const prevStatus = before ? before.status : null;
+  const ok = withAtomicLedgerUpdate(() => {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
     entry.status = entry.rewardType === "choice_reward" ? "redeemed" : "given";
     entry.givenDate = todayISO();
   });
+  if (ok) {
+    const newStatus = before.rewardType === "choice_reward" ? "redeemed" : "given";
+    appendAuditRecord(before.customerCanonicalId, newStatus === "redeemed" ? "mark_redeemed" : "mark_given",
+      [{ field: "status", previousValue: prevStatus, newValue: newStatus }, { field: "givenDate", previousValue: null, newValue: todayISO() }],
+      performedBy, "", entitlementId);
+  }
 }
-function loyaltyOwnerUndo(entitlementId) {
-  withAtomicLedgerUpdate(() => {
+function loyaltyOwnerUndo(entitlementId, performedBy, reason) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  const prevStatus = before ? before.status : null;
+  const prevGivenDate = before ? before.givenDate : null;
+  const ok = withAtomicLedgerUpdate(() => {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
     entry.status = entry.selectedChoice ? "selected" : entry.rewardType === "choice_reward" ? "pending_choice" : entry.rewardType === null ? "recognition" : "ready";
     entry.givenDate = null;
   });
+  if (ok) {
+    const after = findLoyaltyLedgerEntry(entitlementId);
+    appendAuditRecord(before.customerCanonicalId, "correction_of_status",
+      [{ field: "status", previousValue: prevStatus, newValue: after.status }, { field: "givenDate", previousValue: prevGivenDate, newValue: null }],
+      performedBy, reason || "Undo / correction", entitlementId);
+  }
 }
-function loyaltyOwnerSkip(entitlementId, note) {
-  withAtomicLedgerUpdate(() => {
+function loyaltyOwnerSkip(entitlementId, note, performedBy) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  const prevStatus = before ? before.status : null;
+  const ok = withAtomicLedgerUpdate(() => {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
     entry.status = "declined";
     entry.ownerOverride = "declined";
     entry.overrideReason = note || entry.overrideReason;
   });
+  if (ok) {
+    appendAuditRecord(before.customerCanonicalId, "decline_skip",
+      [{ field: "status", previousValue: prevStatus, newValue: "declined" }],
+      performedBy, note, entitlementId);
+  }
 }
-function loyaltyOwnerAddNote(entitlementId, note) {
-  withAtomicLedgerUpdate(() => {
+function loyaltyOwnerAddNote(entitlementId, note, performedBy) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  const prevNote = before ? before.ownerNote : null;
+  const ok = withAtomicLedgerUpdate(() => {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
     entry.ownerNote = note || "";
   });
+  if (ok) {
+    appendAuditRecord(before.customerCanonicalId, "owner_note_edit",
+      [{ field: "ownerNote", previousValue: prevNote, newValue: note || "" }],
+      performedBy, "", entitlementId);
+  }
 }
-function loyaltyOwnerChangeQuantity(entitlementId, quantity) {
-  withAtomicLedgerUpdate(() => {
+function loyaltyOwnerChangeQuantity(entitlementId, quantity, performedBy, reason) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  const prevQty = before ? before.quantity : null;
+  const ok = withAtomicLedgerUpdate(() => {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
     entry.quantity = quantity;
     entry.ownerOverride = entry.ownerOverride || "quantity_adjusted";
   });
+  if (ok) {
+    appendAuditRecord(before.customerCanonicalId, "change_quantity",
+      [{ field: "quantity", previousValue: prevQty, newValue: quantity }],
+      performedBy, reason, entitlementId);
+  }
 }
 
 function rewardsFor(customerId) { return DB.data.rewards.filter((r) => r.customerId === customerId); }
@@ -3848,7 +4093,11 @@ function dashboardStats() {
 const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null, managerSyncStatus: "idle", managerSyncPlan: null, managerSyncError: null, managerSyncResult: null, managerSyncExpandedNewCustomer: null, cloudSyncStatus: "idle", cloudSyncError: null, cloudSyncPreview: null, fullRefreshStatus: "idle", fullRefreshError: null, fullRefreshPreview: null,
   // LOYALTY V2 — message-guide draft state, keyed by entitlementId so switching customers
   // never bleeds one customer's edited draft into another's.
-  messageDrafts: {} };
+  messageDrafts: {},
+  // LOYALTY V2 — Persistent Backup + Audit History UI state.
+  loyaltyBackupsStatus: "idle", loyaltyBackupsList: [], loyaltyBackupsError: null,
+  loyaltyBackupCreateStatus: "idle", loyaltyBackupCreateError: null,
+  loyaltyRestoreStatus: "idle", loyaltyRestoreError: null, loyaltyRestorePreview: null };
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -4761,9 +5010,37 @@ function renderLoyaltySummaryV2(customer, stats, dims, ledger) {
       <div class="loyalty-ledger-list" style="margin-top:12px;">
         ${ledger.length ? ledger.slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)).map((e) => renderLoyaltyLedgerEntryCard(customer, e)).join("") : `<div class="muted" style="font-size:12px;">No loyalty milestones reached yet.</div>`}
       </div>
-      <button class="btn btn-ghost btn-sm" data-action="v2-manual-grant" data-customer="${customer.id}" style="margin-top:10px;">+ Owner Manual Appreciation</button>
+      <div class="btn-row" style="margin-top:10px;">
+        <button class="btn btn-ghost btn-sm" data-action="v2-manual-grant" data-customer="${customer.id}">+ Owner Manual Appreciation</button>
+        <button class="btn btn-ghost btn-sm" data-action="v2-view-activity-history" data-customer="${customer.id}">View Activity History</button>
+      </div>
     </div>
   `;
+}
+
+function renderActivityHistorySheet(customer) {
+  const history = customerActivityHistory(customer.id);
+  openSheet(`
+    <div class="sheet-title">Activity History</div>
+    <div class="sheet-sub">Every owner/staff and system action for ${escapeHtml(customer.name)}, oldest changes at the bottom. This is a permanent record — nothing here is ever edited or deleted.</div>
+    <div class="activity-history-list" style="margin-top:12px;max-height:60vh;overflow-y:auto;">
+      ${history.length ? history.map((a) => `
+        <div class="activity-history-item">
+          <div style="display:flex;justify-content:space-between;gap:8px;">
+            <span style="font-weight:600;">${escapeHtml(AUDIT_ACTION_LABELS[a.action] || a.action)}</span>
+            <span class="muted" style="font-size:11px;white-space:nowrap;">${escapeHtml(fmtDateTimeLabel(a.timestamp) || a.timestamp)}</span>
+          </div>
+          ${(a.changes || []).length ? `<div class="muted" style="font-size:12px;margin-top:2px;">${a.changes.map((c) => `${escapeHtml(c.field)}: ${escapeHtml(c.previousValue === null || c.previousValue === undefined ? "—" : String(c.previousValue))} → ${escapeHtml(c.newValue === null || c.newValue === undefined ? "—" : String(c.newValue))}`).join(" · ")}</div>` : ""}
+          ${a.reason ? `<div class="muted" style="font-size:12px;margin-top:2px;">"${escapeHtml(a.reason)}"</div>` : ""}
+          <div class="muted" style="font-size:11px;margin-top:2px;">by ${escapeHtml(a.performedBy || "owner")}</div>
+        </div>
+      `).join("") : `<div class="muted">No recorded activity yet for this customer.</div>`}
+    </div>
+    <div class="btn-row" style="margin-top:14px;">
+      <button class="btn btn-primary btn-block" id="v2-activity-history-close">Close</button>
+    </div>
+  `);
+  document.getElementById("v2-activity-history-close").addEventListener("click", closeSheet);
 }
 
 function renderCustomerDetail() {
@@ -5267,6 +5544,192 @@ function exportLoyaltyReportCsv() {
   URL.revokeObjectURL(url);
 }
 
+/* ---------------------------------------------------------------------- */
+/* RENDER — LOYALTY BACKUPS & SAFE RESTORE                                 */
+/* ---------------------------------------------------------------------- */
+
+function loyaltyBackupsListRefresh() {
+  state.loyaltyBackupsStatus = "loading";
+  render();
+  listLoyaltyBackups()
+    .then((backups) => {
+      state.loyaltyBackupsList = backups;
+      state.loyaltyBackupsStatus = "loaded";
+      render();
+    })
+    .catch((err) => {
+      state.loyaltyBackupsError = String((err && err.message) || err);
+      state.loyaltyBackupsStatus = "error";
+      render();
+    });
+}
+
+function renderLoyaltyBackupsScreen() {
+  // Kick off the first load lazily, the first time this screen is shown — render() runs
+  // again once the list arrives (or fails), same async-then-render pattern already used for
+  // Manager Sync / Full Refresh / Cloud Sync above.
+  if (state.loyaltyBackupsStatus === "idle") {
+    state.loyaltyBackupsStatus = "loading";
+    setTimeout(loyaltyBackupsListRefresh, 0);
+  }
+  const backups = state.loyaltyBackupsList || [];
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="settings">‹ Settings</button>
+      <h1 class="screen-title" style="margin-top:8px;">Loyalty Backups</h1>
+      <p class="screen-sub">Versioned, timestamped snapshots — every backup is a brand-new file, nothing is ever overwritten.</p>
+    </header>
+    <div class="screen-body">
+      <div class="card" style="margin-bottom:14px;">
+        <p class="muted" style="margin-bottom:12px;">Create a backup any time, or before any bulk loyalty change. A pre-restore safety backup is also always taken automatically, right before any restore runs.</p>
+        <div class="btn-row">
+          <button class="btn btn-primary btn-sm" id="v2-create-backup-now" ${state.loyaltyBackupCreateStatus === "creating" ? "disabled" : ""}>${state.loyaltyBackupCreateStatus === "creating" ? "Creating…" : "Create Backup Now"}</button>
+          <button class="btn btn-outline btn-sm" id="v2-refresh-backups">Refresh List</button>
+        </div>
+        ${state.loyaltyBackupCreateStatus === "error" ? `<p style="margin-top:10px;color:#c0392b;">${escapeHtml(state.loyaltyBackupCreateError || "Backup failed.")}</p>` : ""}
+        ${state.loyaltyBackupCreateStatus === "done" ? `<p class="muted" style="margin-top:10px;">Backup created ✓</p>` : ""}
+      </div>
+
+      ${state.loyaltyBackupsStatus === "loading" ? `<p class="muted">Loading backups…</p>` : ""}
+      ${state.loyaltyBackupsStatus === "error" ? `<p style="color:#c0392b;">${escapeHtml(state.loyaltyBackupsError || "Could not load backups.")}</p>` : ""}
+      ${state.loyaltyBackupsStatus === "loaded" ? (
+        backups.length ? `
+          <div class="loyalty-backup-list">
+            ${backups.map((b) => `
+              <div class="card loyalty-backup-row" style="margin-bottom:10px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+                  <div>
+                    <div style="font-weight:600;">${escapeHtml(fmtDateTimeLabel(b.createdAt) || b.filename)}</div>
+                    <div class="muted" style="font-size:11.5px;">${escapeHtml(b.filename)}</div>
+                  </div>
+                  <div class="btn-row" style="margin:0;">
+                    <button class="btn btn-outline btn-sm" data-action="v2-export-backup" data-id="${escapeHtml(b.id)}" data-filename="${escapeHtml(b.filename)}">Export</button>
+                    <button class="btn btn-danger btn-sm" data-action="v2-restore-backup" data-id="${escapeHtml(b.id)}" data-filename="${escapeHtml(b.filename)}">Restore…</button>
+                  </div>
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        ` : `<div class="muted">No backups yet — create one above.</div>`
+      ) : ""}
+    </div>
+  `;
+}
+
+// Shows a preview sheet (date/time, records affected, changed/added/removed counts) and
+// requires an explicit second confirmation before actually restoring — never a one-click
+// blind restore. Fetches the backup's full content once, up front, so the diff and the
+// eventual restore both work from the exact same snapshot the owner reviewed.
+function openRestorePreviewSheet(backupId, backupLabel) {
+  openSheet(`
+    <div class="sheet-title">Restore Preview</div>
+    <div class="sheet-sub">Loading backup…</div>
+  `);
+  fetchLoyaltyBackup(backupId)
+    .then((data) => {
+      const snap = data.snapshot;
+      if (!snap) throw new Error("Backup has no snapshot content");
+      const diff = buildRestoreDiff(snap);
+      const summary = restoreDiffSummary(diff);
+      renderRestorePreviewSheet(backupId, backupLabel, data, diff, summary);
+    })
+    .catch((err) => {
+      openSheet(`
+        <div class="sheet-title">Restore Preview</div>
+        <div class="sheet-sub" style="color:#c0392b;">Could not load that backup: ${escapeHtml(String((err && err.message) || err))}</div>
+        <div class="btn-row" style="margin-top:14px;"><button class="btn btn-outline btn-block" id="v2-restore-preview-close">Close</button></div>
+      `);
+      document.getElementById("v2-restore-preview-close").addEventListener("click", closeSheet);
+    });
+}
+
+function renderRestorePreviewSheet(backupId, backupLabel, backupData, diff, summary) {
+  const rows = [
+    ["Customers", diff.customers], ["Rentals", diff.rentals],
+    ["Legacy Rewards", diff.rewards], ["Loyalty Ledger", diff.loyaltyLedger],
+  ];
+  openSheet(`
+    <div class="sheet-title">Restore Preview</div>
+    <div class="sheet-sub">Backup date/time: <b>${escapeHtml(fmtDateTimeLabel(backupData.createdAt) || backupLabel)}</b>${backupData.reason ? ` · ${escapeHtml(backupData.reason)}` : ""}</div>
+    <div class="reward-note" style="margin-top:10px;">
+      This does <b>not</b> touch the audit history — every action ever recorded stays exactly as it is. Restoring is itself recorded as a new audit entry, and a fresh safety backup of the CURRENT state is taken automatically right before anything changes.
+    </div>
+    <div style="margin-top:12px;">
+      <div style="font-weight:600;margin-bottom:6px;">Records that would change: ${summary.total}</div>
+      ${rows.map(([label, d]) => `
+        <div style="display:flex;justify-content:space-between;font-size:12.5px;padding:4px 0;border-bottom:1px solid var(--line);">
+          <span>${escapeHtml(label)}</span>
+          <span class="muted">${d.changed.length} changed · ${d.added.length} added back · ${d.removed.length} would be removed</span>
+        </div>
+      `).join("")}
+    </div>
+    ${summary.total === 0 ? `<p class="muted" style="margin-top:10px;">No differences — current state already matches this backup.</p>` : ""}
+    <div class="btn-row" style="margin-top:16px;">
+      <button class="btn btn-outline btn-block" id="v2-restore-preview-cancel">Cancel</button>
+      <button class="btn btn-danger btn-block" id="v2-restore-preview-confirm" ${summary.total === 0 ? "disabled" : ""}>Confirm Restore</button>
+    </div>
+  `);
+  document.getElementById("v2-restore-preview-cancel").addEventListener("click", closeSheet);
+  const confirmBtn = document.getElementById("v2-restore-preview-confirm");
+  if (confirmBtn) confirmBtn.addEventListener("click", () => {
+    openSheet(`<div class="sheet-title">Restoring…</div><div class="sheet-sub">Taking a safety backup of the current state first, then restoring.</div>`);
+    restoreLoyaltyBackup(backupId, backupLabel, "owner")
+      .then(() => {
+        closeSheet();
+        toast("Restore complete");
+        state.loyaltyBackupsStatus = "idle"; // force the backup list to refresh (the safety backup is new)
+        render();
+      })
+      .catch((err) => {
+        toast("Restore failed: " + String((err && err.message) || err));
+        closeSheet();
+      });
+  });
+}
+
+function wireLoyaltyBackupEvents() {
+  const createBtn = document.getElementById("v2-create-backup-now");
+  if (createBtn) createBtn.addEventListener("click", () => {
+    state.loyaltyBackupCreateStatus = "creating";
+    render();
+    createLoyaltyBackup("Manual", "owner")
+      .then(() => {
+        state.loyaltyBackupCreateStatus = "done";
+        loyaltyBackupsListRefresh();
+      })
+      .catch((err) => {
+        state.loyaltyBackupCreateStatus = "error";
+        state.loyaltyBackupCreateError = String((err && err.message) || err);
+        render();
+      });
+  });
+  const refreshBtn = document.getElementById("v2-refresh-backups");
+  if (refreshBtn) refreshBtn.addEventListener("click", loyaltyBackupsListRefresh);
+
+  document.querySelectorAll('[data-action="v2-export-backup"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      fetchLoyaltyBackup(el.dataset.id)
+        .then((data) => {
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = el.dataset.filename || "loyalty_backup.json";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        })
+        .catch((err) => toast("Export failed: " + String((err && err.message) || err)));
+    });
+  });
+
+  document.querySelectorAll('[data-action="v2-restore-backup"]').forEach((el) => {
+    el.addEventListener("click", () => openRestorePreviewSheet(el.dataset.id, el.dataset.filename));
+  });
+}
+
 function renderVehiclesList() {
   const withStatus = DB.data.vehicles.map((v) => ({ v, st: vehicleStatus(v) }));
   const needsAttention = withStatus.filter((x) => x.st.tax.level !== "green" || x.st.prb.level !== "green");
@@ -5738,6 +6201,14 @@ function renderSettings() {
           </div>
         ` : ""}
         ${state.cloudSyncStatus === "done" ? `<p class="muted" style="margin-top:10px;">Baseline refreshed ✓</p>` : ""}
+      </div>
+
+      <div class="section-title">Loyalty Backups &amp; Audit History</div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px;">Versioned, timestamped snapshots of loyalty data (customers, rentals, rewards, the loyalty ledger, and the audit log). Every backup is a brand-new file — none of them are ever overwritten. Every owner/staff action that changes loyalty state (grants, overrides, status changes, notes) is separately recorded forever in an append-only audit log, never erased by a sync, refresh, or restore.</p>
+        <div class="btn-row">
+          <button class="btn btn-orange btn-sm" data-goto="loyalty-backups">Manage Backups &amp; Restore</button>
+        </div>
       </div>
 
       <div class="section-title">Data</div>
@@ -7049,6 +7520,7 @@ function render() {
     case "reward-history": html = renderRewardHistoryScreen(); break;
     case "loyalty-reports": html = renderLoyaltyReportsScreen(); break;
     case "loyalty-ledger-report": html = renderLoyaltyLedgerReportScreen(); break;
+    case "loyalty-backups": html = renderLoyaltyBackupsScreen(); break;
     case "vehicles": html = renderVehiclesList(); break;
     case "vehicle": html = renderVehicleDetail(); break;
     case "settings": html = renderSettings(); break;
@@ -7570,6 +8042,7 @@ function wireScreenEvents() {
   if (startImportBtn) startImportBtn.addEventListener("click", () => { resetImportState(null); navigate("import"); });
 
   wireLoyaltyV2Events();
+  wireLoyaltyBackupEvents();
   wireImportScreenEvents();
 }
 
@@ -7672,6 +8145,12 @@ function wireLoyaltyV2Events() {
         loyaltyOwnerGrantManual(customer, program, ladderId, note);
         closeSheet(); toast("Manual appreciation granted"); render();
       }));
+    });
+  });
+  document.querySelectorAll('[data-action="v2-view-activity-history"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const customer = DB.data.customers.find((c) => c.id === el.dataset.customer);
+      if (customer) renderActivityHistorySheet(customer);
     });
   });
   document.querySelectorAll('[data-action="v2-open-message"]').forEach((el) => {
@@ -7800,5 +8279,6 @@ DB.load();
 navigate("home");
 pullRewardsFromCloud();
 pullLoyaltyLedgerFromCloud();
+pullLoyaltyAuditLogFromCloud();
 
 })();

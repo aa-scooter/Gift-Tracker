@@ -1375,3 +1375,8 @@ p { margin: 0; }
 .report-table th, .report-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
 .report-table th { background: var(--paper-dim); font-weight: 700; position: sticky; top: 0; }
 .report-table tr:last-child td { border-bottom: none; }
+
+/* LOYALTY V2 — Persistent Backup + Audit History (2026-08-23) */
+.loyalty-backup-row { padding: 12px 14px; }
+.activity-history-list { display: flex; flex-direction: column; gap: 10px; }
+.activity-history-item { padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--paper-dim); }
