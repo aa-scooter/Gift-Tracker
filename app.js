@@ -504,7 +504,7 @@ const DB = {
       // as ineligible purely for having rented before the app existed. Adjust in Settings
       // if you'd rather the program only apply going forward.
       meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)) },
-      customers, rentals, vehicles, rewards, needsReview, loyaltyLedger: [],
+      customers, rentals, vehicles, rewards, needsReview, loyaltyLedger: [], loyaltyAuditLog: [],
     };
   },
 
@@ -515,7 +515,12 @@ const DB = {
     this.save();
   },
   wipe() {
-    this.data = { meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)) }, customers: [], rentals: [], vehicles: [], rewards: [], needsReview: [], loyaltyLedger: [] };
+    // loyaltyAuditLog is intentionally included here even though "Reset all data" is a
+    // deliberate local nuke button, not one of the sync/refresh operations the audit history
+    // must survive — omitting it would leave DB.data.loyaltyAuditLog undefined until the next
+    // full page load, and the very next ensureLoyaltyLedgerEntries() call (opening any
+    // customer profile right after wiping) would crash trying to .push() onto it.
+    this.data = { meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)) }, customers: [], rentals: [], vehicles: [], rewards: [], needsReview: [], loyaltyLedger: [], loyaltyAuditLog: [] };
     this.save();
   },
 };
