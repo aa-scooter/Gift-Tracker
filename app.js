@@ -6330,11 +6330,14 @@ function renderSettings() {
         <p class="muted" style="margin-bottom:12px;">Data is stored locally on this device — this is this app's own standalone database, separate from any other AA Scooters system. Export regularly and keep a backup.</p>
         <div class="btn-row">
           <button class="btn btn-outline btn-sm" id="export-data">Export JSON</button>
-          <label class="btn btn-outline btn-sm" for="import-file">Import JSON backup</label>
+          <span class="btn btn-outline btn-sm"
+          style="position:relative;overflow:hidden;display:inline-flex;align-items:center;">
+          Import JSON backup
+          <input type="file" id="import-file" accept="application/json"
+            style="position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;" />
+        </span>
           <button class="btn btn-danger btn-sm" id="wipe-data">Reset all data</button>
         </div>
-        <input type="file" id="import-file" accept="application/json"
-          style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;" />
       </div>
 
       <div class="section-title">About</div>
