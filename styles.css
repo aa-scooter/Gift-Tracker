@@ -1351,3 +1351,27 @@ p { margin: 0; }
 }
 .action-menu-item:active { background: var(--paper-dim); }
 .action-menu-item .muted { font-weight: 500; font-size: 12px; }
+
+/* ============================================================
+   LOYALTY V2 — three-dimension architecture (added 2026-08-23).
+   ============================================================ */
+.sheet-textarea {
+  width: 100%;
+  min-height: 80px;
+  padding: 12px 14px;
+  border: 1.5px solid var(--line-strong);
+  border-radius: var(--radius-s);
+  font-size: 15px;
+  font-family: inherit;
+  background: var(--paper-card);
+  color: var(--text);
+  resize: vertical;
+}
+.sheet-textarea:focus { border-color: var(--orange); }
+.loyalty-ledger-list .reward-row-v2 { margin-bottom: 10px; }
+.loyalty-ledger-list .reward-row-v2:last-child { margin-bottom: 0; }
+.report-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius-m); margin-top: 10px; }
+.report-table { border-collapse: collapse; width: 100%; font-size: 12.5px; white-space: nowrap; }
+.report-table th, .report-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+.report-table th { background: var(--paper-dim); font-weight: 700; position: sticky; top: 0; }
+.report-table tr:last-child td { border-bottom: none; }

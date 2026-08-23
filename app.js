@@ -100,6 +100,13 @@ const LOYALTY_FULL_REFRESH_API_URL = "/api/loyalty-refresh";
 // automatic (not staff-triggered) pattern as the two URLs above, backed by its own
 // loyalty_rewards.json file in the same Drive folder — see api/loyalty-rewards.js.
 const LOYALTY_REWARDS_API_URL = "/api/loyalty-rewards";
+// Loyalty V2 persistent ledger sync — added 2026-08-23 alongside the three-dimension
+// architecture. Same same-origin, automatic (not staff-triggered) pattern as the rewards
+// sync above, backed by its own loyalty_ledger.json file in the same Drive folder (see
+// api/loyalty-ledger.js). Kept completely separate from LOYALTY_REWARDS_API_URL — the
+// legacy rewards file is never read or written by this, and vice versa, so neither sync can
+// ever clobber the other's history.
+const LOYALTY_LEDGER_API_URL = "/api/loyalty-ledger";
 
 // Premium Ride Experience / VIP Extra Day both use the same cycle mechanic: 180+ cumulative
 // PAID days (an active rental counts in full — no requirement to return first) since the
@@ -131,6 +138,61 @@ const DEFAULT_VIP_THRESHOLDS = {
 // Reward-to-Revenue Loyalty Health bands (%). <= healthyMax => Healthy, <= watchMax =>
 // Watch, above that => High. Initial suggested values only — meant to be tuned in Settings.
 const DEFAULT_HEALTH_THRESHOLDS = { healthyMax: 8, watchMax: 15 };
+
+/* ---------------------------------------------------------------------- */
+/* LOYALTY V2 — three independent loyalty dimensions (added 2026-08-23)    */
+/* ---------------------------------------------------------------------- */
+// Replaces the old Ride Upgrade / Premium Ride Experience / VIP Extra Day forward-looking
+// eligibility logic (those three TYPES and their given history stay fully intact and
+// visible — see getSuggestions — only their "what should we offer NEXT" generation is
+// retired) with three independently-evaluated, never-conflated dimensions:
+//   A. Genuine Visits        — how many genuinely separate rental episodes, full lifetime.
+//   B. Continuous Stay       — how long the longest single uninterrupted episode lasted.
+//   C. Lifetime Paid Days    — total paid days across the customer's entire history.
+//     (reuses customerStats().lifetimeRentalDays, already a true, never-reset, full-
+//      history figure — nothing new needed to compute this one.)
+// Each dimension has its own reward ladder (ladder id -> threshold), staff-editable via
+// DB.data.meta.loyaltyLadders (Settings), mirroring every other tunable threshold in this
+// app. Entitlements are keyed by ladder id, NOT by the threshold number, so changing a
+// threshold later in Settings never invalidates or regenerates an already-created ledger
+// entry for a customer who qualified under the old number — see ensureLoyaltyLedgerEntries.
+const DEFAULT_LOYALTY_LADDERS = {
+  lifetimeDays: [
+    { id: "lifetime_30", threshold: 30, label: "First Loyalty Milestone", rewardType: "extra_day", quantity: 1 },
+    { id: "lifetime_60", threshold: 60, label: "Growing Loyalty", rewardType: null },
+    { id: "lifetime_90", threshold: 90, label: "Established AA Rider", rewardType: "extra_day", quantity: 2 },
+    { id: "lifetime_180", threshold: 180, label: "Lifetime Loyalty Milestone", rewardType: "choice_reward" },
+    { id: "lifetime_365", threshold: 365, label: "Exceptional Loyalty", rewardType: "owner_appreciation_review" },
+  ],
+  genuineVisits: [
+    { id: "visits_2", threshold: 2, label: "Welcome Back", rewardType: null },
+    { id: "visits_3", threshold: 3, label: "Returning Rider", rewardType: "extra_day", quantity: 1 },
+    { id: "visits_5", threshold: 5, label: "AA Family", rewardType: "choice_reward" },
+  ],
+  continuousStay: [
+    { id: "stay_90", threshold: 90, label: "Long-Term Rider", rewardType: "recognition" },
+    { id: "stay_180", threshold: 180, label: "Long-Term Appreciation", rewardType: "choice_reward" },
+  ],
+};
+// Every "Choice Reward" milestone offers the same three options — the owner (not the
+// system) decides which is actually appropriate/available at grant time.
+const CHOICE_REWARD_OPTIONS = ["premium_ride_on_us", "extra_day_on_us", "appreciation_gift"];
+const CHOICE_REWARD_OPTION_LABELS = {
+  premium_ride_on_us: "Premium Ride on Us (Forza 300 or XMAX 300, subject to availability)",
+  extra_day_on_us: "Extra Day(s) on Us (current/appropriate category)",
+  appreciation_gift: "Equivalent AA Appreciation Gift (owner-selected)",
+};
+const LOYALTY_LADDER_PROGRAM_LABEL = { lifetimeDays: "Lifetime Paid Days", genuineVisits: "Genuine Visits", continuousStay: "Continuous Stay" };
+
+function loyaltyLadders() { return (DB.data.meta && DB.data.meta.loyaltyLadders) || DEFAULT_LOYALTY_LADDERS; }
+
+// Premium Ride on Us has ONE meaning, always: Forza 300 or XMAX 300, owner's/fleet's pick —
+// never a proportional one-tier-up progression, and NEVER NMAX at any tier. This replaces
+// premiumExperienceBike() (which offered NMAX/Aerox 155cc as an intermediate "experience")
+// for every NEW Choice Reward — premiumExperienceBike() itself is left untouched since the
+// one real historical premium_ride/vip_extra_day given-reward record still reads it for
+// display purposes.
+function premiumRideOnUsOptions() { return ["Forza 300", "XMAX 300"]; }
 
 const ALL_BIKE_MODELS = CATEGORY_TIERS;
 
@@ -320,9 +382,14 @@ const DB = {
     if (!this.data.meta.dailyValues) this.data.meta.dailyValues = Object.assign({}, DEFAULT_DAILY_VALUES);
     if (!this.data.meta.vipThresholds) this.data.meta.vipThresholds = JSON.parse(JSON.stringify(DEFAULT_VIP_THRESHOLDS));
     if (!this.data.meta.healthThresholds) this.data.meta.healthThresholds = Object.assign({}, DEFAULT_HEALTH_THRESHOLDS);
+    if (!this.data.meta.loyaltyLadders) this.data.meta.loyaltyLadders = JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS));
     if (!this.data.customers) this.data.customers = [];
     if (!this.data.rentals) this.data.rentals = [];
     if (!this.data.vehicles) this.data.vehicles = [];
+    // LOYALTY V2 persistent ledger — see the LOYALTY V2 block above. Additive-only array,
+    // completely separate from the legacy `rewards` array (never migrated into it, never
+    // migrated out of it) so existing given-reward history is never touched by this.
+    if (!this.data.loyaltyLedger) this.data.loyaltyLedger = [];
     // Migration safety: older saves may be missing newer vehicle fields.
     this.data.vehicles.forEach((v) => {
       if (v.taxExpiryDate === undefined) v.taxExpiryDate = v.taxDate || "";
@@ -421,8 +488,8 @@ const DB = {
       // customers can be credited for qualifying past bookings rather than being treated
       // as ineligible purely for having rented before the app existed. Adjust in Settings
       // if you'd rather the program only apply going forward.
-      meta: { loyaltyEffectiveDate: "2026-08-10" },
-      customers, rentals, vehicles, rewards, needsReview,
+      meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)) },
+      customers, rentals, vehicles, rewards, needsReview, loyaltyLedger: [],
     };
   },
 
@@ -433,7 +500,7 @@ const DB = {
     this.save();
   },
   wipe() {
-    this.data = { meta: { loyaltyEffectiveDate: "2026-08-10" }, customers: [], rentals: [], vehicles: [], rewards: [], needsReview: [] };
+    this.data = { meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)) }, customers: [], rentals: [], vehicles: [], rewards: [], needsReview: [], loyaltyLedger: [] };
     this.save();
   },
 };
@@ -3049,6 +3116,329 @@ function customerStats(customer, simulatedRentals) {
 }
 
 
+/* ---------------------------------------------------------------------- */
+/* LOYALTY V2 — dimension calculators, ledger, and message guide           */
+/* ---------------------------------------------------------------------- */
+
+// Full-history, cross-stored-record "genuine episode" builder. Pools every atomic date
+// interval for a customer across ALL their stored rental records (not just one record's own
+// segments), sorts chronologically, and merges two intervals into one episode only when they
+// touch (gap <= 1 day, the same GAP_DAYS constant lib/loyaltyMatch.js's own renewal
+// consolidation uses) AND carry the exact same bike-name text (normalized for case/
+// whitespace only). This is deliberately the same rule already validated against real
+// production data before this implementation (see the dry-run/validation reports) —
+// touching-but-different-bike-text pairs are never auto-merged; they're recorded in
+// `reviewCandidates` for a human "same-day bike swap or a new booking?" judgment call
+// instead, exactly matching the "no fuzzy matching" identity rule used everywhere else in
+// this app, extended to bike identity.
+const LOYALTY_V2_GAP_DAYS = 1;
+function loyaltyV2BikeKey(b) { return String(b || "").trim().toLowerCase().replace(/\s+/g, " "); }
+
+function loyaltyV2AtomicIntervals(rental) {
+  if (rental.segments && rental.segments.length) {
+    const visits = buildVisitsFromSegments(rental);
+    return visits.map((v) => ({ start: v.startDate, end: v.endDate, bike: rental.bikeModel, sourceRentalId: rental.id, active: v.status === "active" }));
+  }
+  return [{ start: rental.startDate, end: rental.endDate, bike: rental.bikeModel, sourceRentalId: rental.id, active: rental.status === "active" }];
+}
+
+// Which stored rentals feed episode-building for a customer. Mirrors customerStats()'s own
+// "MANAGER SUPERSEDES LEGACY" de-dup rule for any 2026-onward activity (a legacy Gift
+// Tracker rental and a Manager-linked rental can represent the very same real-world booking
+// once Manager data exists for a customer), but — UNLIKE the 2026-only operational figures
+// elsewhere in this app — Genuine Visits / Continuous Stay are TRUE LIFETIME dimensions per
+// the current business rules, so a customer's pre-2026 legacy history is always kept: Manager
+// Sync only ever holds 2026-onward rows, so a fully pre-cutoff legacy rental can never be a
+// Manager duplicate. This exactly mirrors the same "true lifetime" pattern customerStats()
+// already uses for lifetimeRentalDays/lifetimeRevenueTotal.
+function loyaltyV2EpisodeSourceRentals(customerId) {
+  const rentals = customerRentals(customerId);
+  const hasManagerData = rentals.some((r) => r.mgrRowNumber !== undefined && r.mgrRowNumber !== null);
+  if (!hasManagerData) return rentals;
+  const todayIso = todayISO();
+  return rentals.filter((r) => {
+    if (r.mgrRowNumber !== undefined && r.mgrRowNumber !== null) return true;
+    const end = r.endDate || todayIso;
+    return end < LEGACY_CUTOFF_DATE;
+  });
+}
+
+function computeLoyaltyEpisodes(customerId) {
+  const todayIso = todayISO();
+  const rentals = loyaltyV2EpisodeSourceRentals(customerId);
+  let atoms = [];
+  rentals.forEach((r) => { atoms = atoms.concat(loyaltyV2AtomicIntervals(r)); });
+  atoms.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+
+  const episodes = [];
+  const reviewCandidates = [];
+  let cur = null;
+  atoms.forEach((a) => {
+    const aEnd = a.end || todayIso;
+    if (!cur) { cur = { start: a.start, end: aEnd, active: a.active, bike: a.bike, sourceRentalIds: new Set([a.sourceRentalId]) }; return; }
+    const gap = daysBetween(cur.end, a.start);
+    const sameBike = loyaltyV2BikeKey(cur.bike) === loyaltyV2BikeKey(a.bike);
+    if (gap <= LOYALTY_V2_GAP_DAYS && sameBike) {
+      if (aEnd > cur.end) cur.end = aEnd;
+      if (a.active) cur.active = true;
+      cur.sourceRentalIds.add(a.sourceRentalId);
+    } else {
+      if (gap <= LOYALTY_V2_GAP_DAYS && !sameBike) {
+        reviewCandidates.push({ customerId, gapDays: gap, prevBike: cur.bike, prevEnd: cur.end, nextBike: a.bike, nextStart: a.start });
+      }
+      episodes.push(cur);
+      cur = { start: a.start, end: aEnd, active: a.active, bike: a.bike, sourceRentalIds: new Set([a.sourceRentalId]) };
+    }
+  });
+  if (cur) episodes.push(cur);
+
+  return {
+    episodes: episodes.map((e) => ({
+      start: e.start, end: e.active ? null : e.end, active: e.active,
+      days: daysBetween(e.start, e.end || todayIso), bike: e.bike,
+      crossesMultipleStoredRentals: e.sourceRentalIds.size > 1,
+    })),
+    reviewCandidates,
+  };
+}
+
+// The three independent dimensions for one customer. `stats` is the already-computed
+// customerStats() result — reused here purely for lifetimePaidDays (a true, never-reset,
+// full-history figure customerStats() already produces correctly; nothing new needed).
+function computeLoyaltyDimensions(customer, stats) {
+  const { episodes, reviewCandidates } = computeLoyaltyEpisodes(customer.id);
+  const longest = episodes.reduce((best, e) => (e.days > (best ? best.days : -1) ? e : best), null);
+  const current = episodes.find((e) => e.active) || null;
+  return {
+    genuineVisits: episodes.length,
+    episodes,
+    reviewCandidates,
+    longestContinuousStayDays: longest ? longest.days : 0,
+    longestContinuousStayEpisode: longest,
+    currentContinuousStayDays: current ? current.days : 0,
+    currentContinuousStayEpisode: current,
+    lifetimePaidDays: stats.lifetimeRentalDays,
+  };
+}
+
+// Every milestone a customer has REACHED (value >= threshold) on one ladder, most-recent
+// first. Does not touch the ledger — pure calculation, exactly like getSuggestions().
+function loyaltyLadderMilestonesReached(program, value) {
+  const ladder = loyaltyLadders()[program] || [];
+  return ladder.filter((rung) => value >= rung.threshold);
+}
+function loyaltyLadderNextMilestone(program, value) {
+  const ladder = loyaltyLadders()[program] || [];
+  return ladder.find((rung) => value < rung.threshold) || null;
+}
+
+function loyaltyEntitlementId(customerId, program, ladderId) { return customerId + ":" + program + ":" + ladderId; }
+function findLoyaltyLedgerEntry(entitlementId) { return DB.data.loyaltyLedger.find((e) => e.entitlementId === entitlementId) || null; }
+function loyaltyLedgerFor(customerId) { return DB.data.loyaltyLedger.filter((e) => e.customerCanonicalId === customerId); }
+
+function loyaltyQualificationReason(program, rung, customer, dims) {
+  if (program === "lifetimeDays") return `Qualified because this customer has accumulated ${dims.lifetimePaidDays} Lifetime Paid Days (${rung.threshold}+ required for "${rung.label}").`;
+  if (program === "genuineVisits") return `Qualified because this customer has returned for ${dims.genuineVisits} genuine rental visits (${rung.threshold}+ required for "${rung.label}").`;
+  if (program === "continuousStay") {
+    const ep = dims.longestContinuousStayEpisode;
+    return `Qualified because this customer maintained one continuous rental for ${dims.longestContinuousStayDays} days${ep ? ` (${fmtDate(ep.start)} to ${ep.active ? "ongoing" : fmtDate(ep.end)})` : ""}. Monthly renewals are treated as extensions of the same rental.`;
+  }
+  return "";
+}
+
+// Idempotently GROWS the persistent ledger for one customer — creates a ledger row for
+// every milestone this customer has newly reached that doesn't already have one, and NEVER
+// touches, removes, or regenerates an existing row (milestones never reset; a redeemed
+// reward never regenerates from a refresh; Manager Sync / Full Refresh / Drive refresh can
+// safely call this as often as they like). Returns the full current ledger for this
+// customer. Call this lazily wherever a customer's loyalty state is displayed or reported —
+// there is no batch/cron job, exactly like every other on-demand calculation in this app.
+function ensureLoyaltyLedgerEntries(customer, stats, dims) {
+  const nowISO = new Date().toISOString();
+  let changed = false;
+  ["lifetimeDays", "genuineVisits", "continuousStay"].forEach((program) => {
+    const value = program === "lifetimeDays" ? dims.lifetimePaidDays : program === "genuineVisits" ? dims.genuineVisits : dims.longestContinuousStayDays;
+    const reached = loyaltyLadderMilestonesReached(program, value);
+    reached.forEach((rung) => {
+      const entitlementId = loyaltyEntitlementId(customer.id, program, rung.id);
+      if (findLoyaltyLedgerEntry(entitlementId)) return; // already exists — never regenerate/overwrite
+      const isChoice = rung.rewardType === "choice_reward";
+      const isReview = rung.rewardType === "owner_appreciation_review";
+      const entry = {
+        id: uid("led"), entitlementId,
+        customerCanonicalId: customer.id,
+        program, qualificationTrack: LOYALTY_LADDER_PROGRAM_LABEL[program],
+        rewardType: rung.rewardType, // "extra_day" | "choice_reward" | "owner_appreciation_review" | "recognition" | null
+        qualifyingMilestone: rung.id,
+        milestoneLabel: rung.label,
+        qualificationDate: nowISO.slice(0, 10),
+        qualificationReason: loyaltyQualificationReason(program, rung, customer, dims),
+        qualificationThreshold: rung.threshold,
+        // Continuous-stay-specific "why" fields (section 4's minimum display set) — left
+        // null for the other two programs, where they don't apply.
+        continuousRentalStartDate: program === "continuousStay" && dims.longestContinuousStayEpisode ? dims.longestContinuousStayEpisode.start : null,
+        continuousRentalDays: program === "continuousStay" ? dims.longestContinuousStayDays : null,
+        automaticEligibility: true,
+        ownerOverride: null, overrideReason: null,
+        availableChoices: isChoice ? CHOICE_REWARD_OPTIONS.slice() : [],
+        selectedChoice: null, selectionDate: null,
+        quantity: rung.quantity || null,
+        status: (rung.rewardType === null || rung.rewardType === "recognition") ? "recognition" : isReview ? "review_needed" : isChoice ? "pending_choice" : "ready",
+        givenDate: null, grantedBy: null, ownerNote: "",
+        source: program === "genuineVisits" ? "returning_customer_milestone" : program === "continuousStay" ? "long_term_appreciation" : "lifetime_paid_days_ladder",
+        createdAt: nowISO, updatedAt: nowISO,
+      };
+      DB.data.loyaltyLedger.push(entry);
+      changed = true;
+    });
+  });
+  if (changed) { DB.save(); syncLoyaltyLedgerToCloud(); }
+  return loyaltyLedgerFor(customer.id);
+}
+
+// ATOMIC update wrapper for the ledger, mirroring withAtomicRewardUpdate exactly — snapshot,
+// mutate, verify, save+sync, or roll back to the snapshot on any thrown error.
+function withAtomicLedgerUpdate(fn) {
+  const snapshot = JSON.stringify(DB.data.loyaltyLedger);
+  try {
+    fn();
+    const nowISO = new Date().toISOString();
+    DB.data.loyaltyLedger.forEach((e) => { if (e.updatedAt === undefined) e.updatedAt = nowISO; });
+    DB.save();
+    syncLoyaltyLedgerToCloud();
+    return true;
+  } catch (err) {
+    DB.data.loyaltyLedger = JSON.parse(snapshot);
+    toast("Update failed — no changes were saved.");
+    render();
+    return false;
+  }
+}
+
+function syncLoyaltyLedgerToCloud() {
+  fetch(LOYALTY_LEDGER_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ loyaltyLedger: DB.data.loyaltyLedger }),
+  }).catch((err) => { console.warn("Loyalty ledger cloud sync failed (will retry on next ledger action):", err); });
+}
+
+function pullLoyaltyLedgerFromCloud() {
+  fetch(LOYALTY_LEDGER_API_URL)
+    .then((r) => (r.ok ? r.json() : null))
+    .then((data) => {
+      if (!data || !Array.isArray(data.loyaltyLedger)) return;
+      const localById = {};
+      DB.data.loyaltyLedger.forEach((e) => { localById[e.id] = e; });
+      const merged = DB.data.loyaltyLedger.slice();
+      const mergedIndexById = {};
+      merged.forEach((e, i) => { mergedIndexById[e.id] = i; });
+      let changed = false;
+      data.loyaltyLedger.forEach((remote) => {
+        const local = localById[remote.id];
+        if (!local) { merged.push(remote); changed = true; }
+        else if ((remote.updatedAt || "") > (local.updatedAt || "")) { merged[mergedIndexById[remote.id]] = remote; changed = true; }
+      });
+      if (changed) {
+        DB.data.loyaltyLedger = merged;
+        DB.save();
+        render();
+        syncLoyaltyLedgerToCloud();
+      }
+    })
+    .catch((err) => { console.warn("Loyalty ledger cloud pull failed (staying on local data):", err); });
+}
+
+// Owner override actions — grant early, change reward, change quantity, select an
+// alternative, mark given, undo, skip/decline, add a note. Automatic eligibility (the
+// `automaticEligibility` field, always preserved) is a recommendation; owner decision is
+// final authority and is layered on top, never overwriting the underlying facts (genuine
+// visits / continuous days / lifetime days are never touched by any of these).
+function loyaltyOwnerGrantManual(customer, program, ladderId, note) {
+  // A manual grant creates a ledger row even if the customer hasn't (yet) automatically
+  // qualified — the owner's decision, clearly labeled, not a recalculated fact.
+  const entitlementId = loyaltyEntitlementId(customer.id, program, ladderId);
+  withAtomicLedgerUpdate(() => {
+    let entry = findLoyaltyLedgerEntry(entitlementId);
+    const ladder = loyaltyLadders()[program] || [];
+    const rung = ladder.find((r) => r.id === ladderId) || { id: ladderId, label: "Manual Appreciation", rewardType: "choice_reward" };
+    const nowISO = new Date().toISOString();
+    if (!entry) {
+      entry = {
+        id: uid("led"), entitlementId, customerCanonicalId: customer.id,
+        program, qualificationTrack: LOYALTY_LADDER_PROGRAM_LABEL[program] || "Owner Manual Appreciation",
+        rewardType: rung.rewardType, qualifyingMilestone: rung.id, milestoneLabel: rung.label,
+        qualificationDate: nowISO.slice(0, 10),
+        qualificationReason: "Owner Override / Manual Appreciation — not from an automatic rule.",
+        qualificationThreshold: rung.threshold || null,
+        continuousRentalStartDate: null, continuousRentalDays: null,
+        automaticEligibility: false,
+        ownerOverride: "manual_grant", overrideReason: note || "",
+        availableChoices: rung.rewardType === "choice_reward" ? CHOICE_REWARD_OPTIONS.slice() : [],
+        selectedChoice: null, selectionDate: null, quantity: rung.quantity || null,
+        status: rung.rewardType === "choice_reward" ? "pending_choice" : "manual",
+        givenDate: null, grantedBy: "owner", ownerNote: note || "",
+        source: "owner_manual_appreciation", createdAt: nowISO, updatedAt: nowISO,
+      };
+      DB.data.loyaltyLedger.push(entry);
+    } else {
+      entry.ownerOverride = "manual_grant";
+      entry.overrideReason = note || entry.overrideReason;
+      entry.status = entry.rewardType === "choice_reward" ? "pending_choice" : "manual";
+    }
+  });
+}
+function loyaltyOwnerSelectChoice(entitlementId, choice, grantedBy) {
+  withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    entry.selectedChoice = choice;
+    entry.selectionDate = todayISO();
+    entry.status = "selected";
+    entry.grantedBy = grantedBy || entry.grantedBy || "owner";
+  });
+}
+function loyaltyOwnerMarkGiven(entitlementId) {
+  withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    entry.status = entry.rewardType === "choice_reward" ? "redeemed" : "given";
+    entry.givenDate = todayISO();
+  });
+}
+function loyaltyOwnerUndo(entitlementId) {
+  withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    entry.status = entry.selectedChoice ? "selected" : entry.rewardType === "choice_reward" ? "pending_choice" : entry.rewardType === null ? "recognition" : "ready";
+    entry.givenDate = null;
+  });
+}
+function loyaltyOwnerSkip(entitlementId, note) {
+  withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    entry.status = "declined";
+    entry.ownerOverride = "declined";
+    entry.overrideReason = note || entry.overrideReason;
+  });
+}
+function loyaltyOwnerAddNote(entitlementId, note) {
+  withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    entry.ownerNote = note || "";
+  });
+}
+function loyaltyOwnerChangeQuantity(entitlementId, quantity) {
+  withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    entry.quantity = quantity;
+    entry.ownerOverride = entry.ownerOverride || "quantity_adjusted";
+  });
+}
+
 function rewardsFor(customerId) { return DB.data.rewards.filter((r) => r.customerId === customerId); }
 function findReward(key) { return DB.data.rewards.find((r) => r.key === key) || null; }
 
@@ -3234,58 +3624,21 @@ function getSuggestions(customer, stats) {
       familyUncertain = !(n.includes("aerox") || n.includes("rax") || n.includes("rex") || n.includes("cool") || n.includes("nmax"));
     }
 
-    if (isOn300cc) {
-      // 300cc riders are never routed through the 155cc ladder — handled separately via
-      // Premium Ride Experience / VIP Extra Day, not a Ride Upgrade "downgrade".
+    // RETIRED 2026-08-23: no new Ride Upgrade offers are generated going forward — the new
+    // three-dimension Loyalty V2 architecture (see "AA Loyalty" on the customer profile)
+    // replaces it. Historical given records above stay fully intact and visible; NMAX is
+    // never offered as an automatic loyalty upgrade anywhere in the new system. This single
+    // informational entry keeps the card visible (rather than silently vanishing) so staff
+    // understand where it went, without ever computing eligibility or NMAX targets for it again.
+    if (!given.length) {
       out.push({
-        key: "return_privilege:" + customer.id + ":na300",
+        key: "return_privilege:" + customer.id + ":retired",
         type: "return_privilege",
-        title: `${REWARD_LABELS.return_privilege} — not applicable`,
-        desc: "This customer's current bike is already Forza/XMAX (300cc) — the normal 155cc Ride Upgrade ladder doesn't apply. See Premium Ride Experience / VIP Extra Day on Us instead.",
+        title: `${REWARD_LABELS.return_privilege} — retired`,
+        desc: "This program has been retired and no longer generates new offers. See the AA Loyalty summary above for the current Genuine Visits / Continuous Stay / Lifetime Paid Days rewards.",
         eligible: false, calculatedEligible: false, overridden: false,
-        reason: `Already riding ${lastTier}.`,
-        reward: null, repeatable: false, notApplicable300cc: true,
-      });
-    } else if (nextTarget) {
-      const key = "return_privilege:" + customer.id + ":" + (given.length + 1);
-      const enoughQualified = stats.qualifiedRentalCount >= RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS;
-      const enoughRevenue = stats.lifetimeRevenueTotal >= RETURN_PRIVILEGE_MIN_REVENUE;
-      const calculatedEligible = enoughQualified && enoughRevenue;
-      const rewardRec = findReward(key);
-      const pricing = getUpgradePricing(lastRideCategory, nextTarget);
-      let reason;
-      if (calculatedEligible) {
-        reason = `${stats.qualifiedRentalCount} qualified rental(s), ${fmtMoney(stats.lifetimeRevenueTotal)} revenue.`;
-      } else if (!enoughQualified) {
-        reason = `${stats.qualifiedRentalCount} of ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS} qualified rentals`;
-      } else {
-        reason = "Revenue requirement not yet reached";
-      }
-      // Available until actually used — accepting or declining an offer never consumes it.
-      const accepted = !!(rewardRec && rewardRec.upgradeStatus === "accepted" && !rewardRec.given);
-      const rideUpgradeStatus = rewardRec && rewardRec.given ? "used" : accepted ? "accepted" : "available";
-      out.push({
-        key, type: "return_privilege",
-        title: `${REWARD_LABELS.return_privilege} — upgrade to ${nextTarget}`,
-        desc: `Based on their current/last bike (${lastRideCategory}${familyUncertain ? " — Aerox/NMAX family unclear from the historical name, defaulted to Aerox; flag for review if that's wrong" : ""}). Eligible once a customer has ${RETURN_PRIVILEGE_MIN_QUALIFIED_RENTALS}+ Qualified Rentals (substantial paid days or value, not just visit count) and ${fmtMoney(RETURN_PRIVILEGE_MIN_REVENUE)}+ revenue, subject to bike availability.`,
-        eligible: effectiveEligible(rewardRec, calculatedEligible), calculatedEligible, overridden: isOverridden(rewardRec),
-        reason, notYetReason: reason, needsReview: !!familyUncertain,
-        reward: rewardRec, repeatable: true, upgradeTarget: nextTarget, fromCategory: lastRideCategory,
-        normalRate: pricing ? pricing.normalRate : null, loyaltyRate: pricing ? pricing.loyaltyRate : null, rateUnit: pricing ? pricing.unit : null,
-        // The reward's financial value is only the DISCOUNT actually given (normal minus
-        // loyalty rate) — never the full rental price. Null when the step isn't priced yet.
-        estimatedValue: pricing ? Math.max(pricing.normalRate - pricing.loyaltyRate, 0) : null,
-        rideUpgradeStatus,
-      });
-    } else if (lastRideCategory === "NMAX Keyless/ABS 155cc") {
-      out.push({
-        key: "return_privilege:" + customer.id + ":top",
-        type: "return_privilege",
-        title: `${REWARD_LABELS.return_privilege} — top of the ladder`,
-        desc: "This customer has reached NMAX Keyless/ABS — the top of the normal Ride Upgrade ladder. No further Ride Upgrade applies; consider Premium Ride Experience instead.",
-        eligible: false, calculatedEligible: false, overridden: false,
-        reason: "Already at NMAX Keyless/ABS 155cc, the top of the Ride Upgrade ladder.",
-        reward: null, repeatable: false, atTopTier: true,
+        reason: "Retired — replaced by the AA Loyalty three-dimension program.",
+        reward: null, repeatable: false, retired: true,
       });
     }
   }
@@ -3330,32 +3683,23 @@ function getSuggestions(customer, stats) {
       });
     });
 
-    const key = "premium_ride:" + customer.id + ":" + (givenPremium.length + 1);
-    const rewardRec = findReward(key);
-    const eligible = effectiveEligible(rewardRec, calculatedEligible);
-    const isReserved = !!(rewardRec && rewardRec.reserved && !rewardRec.given);
-    const cycleStatus = eligible ? (isReserved ? "reserved" : "ready") : "locked";
-
-    let reason;
-    if (calculatedEligible) {
-      reason = `${paidDaysSinceLast} paid day(s) since last Premium Ride (${PREMIUM_RIDE_MIN_PAID_DAYS} needed) — does not require the bike to be returned.`;
-    } else if (enoughLoyaltyDays && !experienceBike) {
-      reason = "Long-term loyalty requirement achieved, but this customer's current bike is already 300cc — see VIP Extra Day on Us instead.";
-    } else {
-      reason = `${paidDaysSinceLast} of ${PREMIUM_RIDE_MIN_PAID_DAYS} paid days since last Premium Ride.` + (experienceBike ? ` Would offer: ${experienceBike}.` : "");
+    // RETIRED (superseded) 2026-08-23: this cumulative-lifetime-days cycle is replaced by
+    // the new Continuous Stay ladder's 180-continuous-day Long-Term Appreciation Choice
+    // (Premium Ride on Us is now always Forza 300 or XMAX 300 only, never NMAX/Aerox) and
+    // the Lifetime Paid Days ladder's own 180-day Choice Reward — see the AA Loyalty
+    // summary above. Historical given records above stay fully intact; no new forward cycle
+    // is generated here anymore.
+    if (!givenPremium.length) {
+      out.push({
+        key: "premium_ride:" + customer.id + ":retired",
+        type: "premium_ride",
+        title: `${REWARD_LABELS.premium_ride} — superseded`,
+        desc: "Superseded by the AA Loyalty Long-Term Appreciation Choice (Continuous Stay) and Lifetime Loyalty Milestone (Lifetime Paid Days) — see the AA Loyalty summary above.",
+        eligible: false, calculatedEligible: false, overridden: false,
+        reason: "Superseded — replaced by the AA Loyalty three-dimension program.",
+        reward: null, repeatable: false, retired: true,
+      });
     }
-
-    out.push({
-      key, type: "premium_ride",
-      title: REWARD_LABELS.premium_ride,
-      desc: "A complimentary standby perk, not a guaranteed reservation — the customer can share preferred dates 3–5 days ahead, but final availability is only confirmed the day before, after paid rentals are settled first. Swaps to the Experience Bike for 2 days / 1 night, then back to their original bike — this never closes, splits, or restarts their ongoing rental.",
-      eligible, calculatedEligible, overridden: isOverridden(rewardRec), cycleStatus,
-      reason,
-      reward: rewardRec, repeatable: true,
-      savedForNextVisit: eligible && !stats.current,
-      paidDaysSinceLast, currentBikeRaw, experienceBike,
-      estimatedValue: experienceBike ? dailyValueFor(experienceBike) * 2 : null,
-    });
   }
 
   // 5. VIP Extra Day on Us — an EARNED reward with its own qualification/redemption cycle.
@@ -3402,33 +3746,21 @@ function getSuggestions(customer, stats) {
       });
     });
 
-    const key = "vip_extra_day:" + customer.id + ":" + (givenVip.length + 1);
-    const rewardRec = findReward(key);
-    const eligible = effectiveEligible(rewardRec, calculatedEligible);
-    const isReserved = !!(rewardRec && rewardRec.reserved && !rewardRec.given);
-    const cycleStatus = eligible ? (isReserved ? "reserved" : "ready") : "locked";
-
-    let reasonVip;
-    if (calculatedEligible) {
-      reasonVip = `${qualifiedEpisodesSinceLastVip} qualified rental(s), ${paidDaysSinceLastVip} paid day(s) since last VIP reward (needs ${thresholdVip.episodes}+ episodes and ${thresholdVip.days}+ days).`;
-    } else if (!enoughEpisodes) {
-      reasonVip = `${qualifiedEpisodesSinceLastVip} of ${thresholdVip.episodes} qualified rental episodes since last VIP reward.`;
-    } else {
-      reasonVip = `${paidDaysSinceLastVip} of ${thresholdVip.days} cumulative paid days since last VIP reward.`;
+    // RETIRED (superseded) 2026-08-23: this qualified-episode/cumulative-days cycle is
+    // replaced by the new Genuine Visits ladder's 3-visit Returning Rider / 5-visit AA
+    // Family milestones — see the AA Loyalty summary above. Historical given records above
+    // stay fully intact; no new forward cycle is generated here anymore.
+    if (!givenVip.length) {
+      out.push({
+        key: "vip_extra_day:" + customer.id + ":retired",
+        type: "vip_extra_day",
+        title: `${REWARD_LABELS.vip_extra_day} — superseded`,
+        desc: "Superseded by the AA Loyalty Genuine Visits ladder (Returning Rider / AA Family) — see the AA Loyalty summary above.",
+        eligible: false, calculatedEligible: false, overridden: false,
+        reason: "Superseded — replaced by the AA Loyalty three-dimension program.",
+        reward: null, repeatable: false, retired: true,
+      });
     }
-
-    out.push({
-      key, type: "vip_extra_day",
-      title: REWARD_LABELS.vip_extra_day,
-      desc: `An earned reward, redeemed as one complimentary day added to a qualifying rental of 7+ paid days — e.g. Pay 7 → Ride 8, Pay 10 → Ride 11 (not a repeating "7+1" promotion, and paying 14 doesn't become 16). The alternative to Ride Upgrade for customers who genuinely prefer their current bike size.`,
-      eligible, calculatedEligible, overridden: isOverridden(rewardRec), cycleStatus,
-      reason: reasonVip,
-      reward: rewardRec, repeatable: true,
-      savedForNextVisit: eligible && !stats.current,
-      lastUsed: lastUsedVip ? lastUsedVip.dateGiven : null,
-      currentTierVip, qualifiedEpisodesSinceLastVip, paidDaysSinceLastVip, thresholdVip,
-      estimatedValue: fineTierVip ? dailyValueFor(fineTierVip) : null,
-    });
   }
 
   return out;
@@ -3513,7 +3845,10 @@ function dashboardStats() {
 /* ROUTER + STATE                                                          */
 /* ---------------------------------------------------------------------- */
 
-const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null, managerSyncStatus: "idle", managerSyncPlan: null, managerSyncError: null, managerSyncResult: null, managerSyncExpandedNewCustomer: null, cloudSyncStatus: "idle", cloudSyncError: null, cloudSyncPreview: null, fullRefreshStatus: "idle", fullRefreshError: null, fullRefreshPreview: null };
+const state = { route: "home", customerId: null, vehicleId: null, search: "", expandedCard: null, searchOpen: false, rewardHistoryCustomerId: null, rewardHistorySearch: "", reportsPeriod: "month", rewardHistoryFilter: "all", backupConfirmed: false, lastReconciliationResult: null, managerSyncStatus: "idle", managerSyncPlan: null, managerSyncError: null, managerSyncResult: null, managerSyncExpandedNewCustomer: null, cloudSyncStatus: "idle", cloudSyncError: null, cloudSyncPreview: null, fullRefreshStatus: "idle", fullRefreshError: null, fullRefreshPreview: null,
+  // LOYALTY V2 — message-guide draft state, keyed by entitlementId so switching customers
+  // never bleeds one customer's edited draft into another's.
+  messageDrafts: {} };
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -3538,7 +3873,7 @@ function navigate(route, params = {}) {
   window.scrollTo(0, 0);
 }
 function topLevel(route) {
-  if (route.startsWith("customer") || route === "needs-review" || route === "rewards-ready" || route === "active-riders" || route === "reward-history" || route === "loyalty-reports") return "customers";
+  if (route.startsWith("customer") || route === "needs-review" || route === "rewards-ready" || route === "active-riders" || route === "reward-history" || route === "loyalty-reports" || route === "loyalty-ledger-report") return "customers";
   if (route.startsWith("vehicle")) return "vehicles";
   return "settings"; // settings/import — no bottom tab, reached via gear icon
 }
@@ -3942,6 +4277,7 @@ function loyaltyStatusDisplay(s) {
   }
 
   if (s.reward && s.reward.given) return { emoji: "✅", text: "Given", cls: "given" };
+  if (s.retired) return { emoji: "—", text: "Retired", cls: "not-yet" };
   if (s.isNoCurrentRentalMarker) return { emoji: "—", text: "No Current Rental", cls: "not-yet" };
   if (s.notActive) return { emoji: "—", text: "Not Active", cls: "not-yet" };
   if (s.historical) return { emoji: "—", text: "Historical", cls: "not-yet" };
@@ -4025,7 +4361,7 @@ function renderRewardCardV2(customer, s) {
     } else {
       actionHtml += `<button class="btn btn-ghost btn-sm" data-action="decline-upgrade" data-key="${s.key}" data-customer="${customer.id}" data-rental="${s.rentalId || ""}">Decline</button>`;
     }
-  } else if (!given && !s.inProgress && !s.historical && !s.notActive && !s.isNoCurrentRentalMarker) {
+  } else if (!given && !s.inProgress && !s.historical && !s.notActive && !s.isNoCurrentRentalMarker && !s.retired) {
     actionHtml = `<button class="btn btn-orange btn-sm" data-action="quick-give-use" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}" data-upgrade-target="${s.upgradeTarget || ""}">${s.type === "return_privilege" ? "Use" : "Give Gift"}</button>`;
   }
 
@@ -4057,7 +4393,7 @@ function renderRewardCardV2(customer, s) {
           ${s.reward && s.reward.notes ? `<div class="reward-note">${escapeHtml(s.reward.notes)}</div>` : ""}
           ${s.reward && s.reward.history && s.reward.history.length ? s.reward.history.slice().reverse().map((h) => `<div class="reward-note" style="margin-bottom:4px;font-size:12px;">${escapeHtml(h.field)}: ${escapeHtml(String(h.previous))} → ${escapeHtml(String(h.new))} · ${h.changedOn}</div>`).join("") : ""}
         </div>` : ""}
-      ${given
+      ${s.retired ? "" : given
         ? `<button class="btn btn-outline btn-sm" data-action="reward-override-menu" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}" style="margin-top:8px;">Edit / Override</button>`
         : `<button class="link-btn" data-action="edit-reward-full" data-key="${s.key}" data-customer="${customer.id}" data-type="${s.type}" data-rental="${s.rentalId || ""}" style="font-size:11.5px; margin-top:4px;">Edit / override</button>`}
     </div>
@@ -4257,11 +4593,186 @@ function renderCustomerValueCard(c, stats) {
   `;
 }
 
+/* ---------------------------------------------------------------------- */
+/* LOYALTY V2 — Customer Message Guide (never auto-sent, staff copy/edit)  */
+/* ---------------------------------------------------------------------- */
+// Voice: warm, natural, human, small-local-business — never corporate, never sounds
+// AI-generated. STRICT: no em dash / en dash characters anywhere in generated text. 0-2
+// emoji, drawn only from 😊 ❤️ 🎁 ✨ — never a motorcycle emoji. These are style-guided
+// TEMPLATES with light variation (several hand-written openings/closings per kind, picked
+// by a rotating index so "Regenerate" gives a genuinely different version, not the exact
+// same string) — never sent by the app itself; always surfaced for a human to copy, edit,
+// and send when the timing is right.
+const CUSTOMER_MESSAGE_TEMPLATES = {
+  lifetime_extra_day: [
+    (n) => `Hey ${n}! We noticed you've spent a good number of riding days with us now 😊 So we've got a little thank you waiting for you. Your extra day is on us ❤️ Just let us know when you're ready to use it.`,
+    (n) => `Hi ${n}, just wanted to reach out with some good news. You've ridden with AA enough now that we owe you a thank you, an extra day on us whenever suits you 😊`,
+    (n) => `Hey ${n}! Every time you come back to AA it means a lot to us. We've set aside an extra day on the house as a small thank you, just say the word whenever you'd like to use it ❤️`,
+  ],
+  lifetime_choice: [
+    (n) => `Hey ${n}! You've been with AA long enough now that we wanted to do something a little special for you 😊 We've got a thank you waiting, and we'll give you a couple of options so you can pick what suits you best ❤️`,
+    (n) => `Hi ${n}, this one's a bit different. You've built up quite a bit of history with us, so we'd love to treat you to something nice. We'll walk you through the options when you're next in ✨`,
+  ],
+  genuine_visit_extra_day: [
+    (n) => `Hey ${n}! It's always nice seeing you back with us 😊 You've now come back to AA a few times, so we'd love to add an extra day on us as a little thank you for continuing to choose us ❤️`,
+    (n) => `Hi ${n}, we noticed this isn't your first time renting with us, and honestly that means a lot. Here's an extra day on the house next time you're out with us 😊`,
+  ],
+  genuine_visit_choice: [
+    (n) => `Hey ${n}! You've become part of the AA family at this point 😊 We'd like to do something a bit more special for you this time, we'll go through the options together ❤️`,
+    (n) => `Hi ${n}, you keep coming back to us and we really notice it. We've got a proper thank you ready for you, just need to chat through what you'd prefer ✨`,
+  ],
+  continuous_stay_recognition: [
+    (n) => `Hey ${n}, just wanted to say we've really enjoyed having you stay with us this long 😊 No reward attached to this one, just a genuine thank you for choosing AA.`,
+  ],
+  continuous_stay_choice: [
+    (n) => `Hey ${n}! You've been riding with us for quite a while now, and we wanted to do something a little special for you 😊 We've got a thank you from us waiting for you. We'll give you a couple of options so you can choose what you'd enjoy most ❤️`,
+    (n) => `Hi ${n}, a long continuous stay like yours doesn't go unnoticed here. We've got a thank you ready and a couple of ways to take it, happy to talk it through whenever works for you ✨`,
+  ],
+  premium_ride_on_us: [
+    (n) => `Hey ${n}! We have a little surprise for you 😊 We'd love to treat you to a Premium Ride on Us as a thank you for being such a loyal rider with AA. When the timing works and we have one available, you can enjoy a day on a Forza 300 or XMAX 300 on us ❤️`,
+    (n) => `Hi ${n}, we've got something fun lined up if you're interested. A day on a Forza 300 or XMAX 300, our treat, whenever we've got one free and the timing suits you 😊`,
+  ],
+  journey_gift: [
+    (n) => `Hey ${n}! We've got a little something waiting for you 🎁 Just our way of saying thank you for spending so much of your Chiang Mai journey with AA. We'll keep the rest a surprise for now 😊`,
+  ],
+  welcome_kit: [
+    (n) => `Hey ${n}! We've prepared a little welcome gift for your ride with us 🎁 Nothing big, just a few useful things from us to make your time in Chiang Mai a little easier 😊`,
+  ],
+  owner_manual: [
+    (n) => `Hey ${n}! This one isn't from any automatic reward or promotion. We just wanted to do something nice for you ❤️ We've really appreciated having you with us, so there's a little thank you waiting for you.`,
+  ],
+};
+function customerMessageKindFor(entry) {
+  if (entry.selectedChoice === "premium_ride_on_us") return "premium_ride_on_us";
+  if (entry.ownerOverride === "manual_grant" && !entry.program) return "owner_manual";
+  if (entry.program === "lifetimeDays") return entry.rewardType === "choice_reward" ? "lifetime_choice" : "lifetime_extra_day";
+  if (entry.program === "genuineVisits") return entry.rewardType === "choice_reward" ? "genuine_visit_choice" : "genuine_visit_extra_day";
+  if (entry.program === "continuousStay") return entry.rewardType === "choice_reward" ? "continuous_stay_choice" : "continuous_stay_recognition";
+  return "owner_manual";
+}
+function generateCustomerMessage(entry, customer, variantIndex) {
+  const kind = customerMessageKindFor(entry);
+  const templates = CUSTOMER_MESSAGE_TEMPLATES[kind] || CUSTOMER_MESSAGE_TEMPLATES.owner_manual;
+  const idx = ((variantIndex || 0) % templates.length + templates.length) % templates.length;
+  return templates[idx](firstNameOf(customer.name) || customer.name);
+}
+
+/* ---------------------------------------------------------------------- */
+/* LOYALTY V2 — Loyalty Summary render                                     */
+/* ---------------------------------------------------------------------- */
+function loyaltyLedgerStatusDisplay(entry) {
+  if (entry.status === "given" || entry.status === "redeemed") return { emoji: "✅", text: entry.status === "redeemed" ? "Redeemed" : "Given", cls: "given" };
+  if (entry.status === "declined") return { emoji: "—", text: "Declined", cls: "not-yet" };
+  if (entry.status === "recognition") return { emoji: "🏅", text: "Milestone Reached", cls: "eligible" };
+  if (entry.status === "review_needed") return { emoji: "👀", text: "Owner Review", cls: "eligible" };
+  if (entry.status === "pending_choice") return { emoji: "🎁", text: "Ready — Choose Reward", cls: "eligible" };
+  if (entry.status === "selected") return { emoji: "🎁", text: `Ready — ${CHOICE_REWARD_OPTION_LABELS[entry.selectedChoice] ? entry.selectedChoice.replace(/_/g, " ") : "Selected"}`, cls: "eligible" };
+  if (entry.status === "manual") return { emoji: "🎁", text: "Owner Manual Grant", cls: "eligible" };
+  return { emoji: "🎁", text: "Ready", cls: "eligible" };
+}
+
+function renderLoyaltyLedgerEntryCard(customer, entry) {
+  const status = loyaltyLedgerStatusDisplay(entry);
+  const pillClass = status.cls === "given" ? "pill-green" : status.cls === "not-yet" ? "pill-neutral" : "pill-orange";
+  const panelId = "led-" + entry.id;
+  const draft = state.messageDrafts[entry.entitlementId];
+
+  let actionHtml = "";
+  if (entry.status === "given" || entry.status === "redeemed" || entry.status === "declined") {
+    actionHtml = `<button class="btn btn-ghost btn-sm" data-action="v2-undo" data-eid="${entry.entitlementId}">Undo / Correct</button>`;
+  } else {
+    if (entry.status === "pending_choice") {
+      actionHtml += CHOICE_REWARD_OPTIONS.map((opt) => `<button class="btn btn-outline btn-sm" data-action="v2-select-choice" data-eid="${entry.entitlementId}" data-choice="${opt}">${escapeHtml(CHOICE_REWARD_OPTION_LABELS[opt].split(" (")[0])}</button>`).join("");
+    } else if (entry.status === "ready" || entry.status === "manual" || entry.status === "selected") {
+      actionHtml += `<button class="btn btn-orange btn-sm" data-action="v2-mark-given" data-eid="${entry.entitlementId}">Mark Given</button>`;
+      if (entry.status === "selected") actionHtml += `<button class="btn btn-ghost btn-sm" data-action="v2-select-choice" data-eid="${entry.entitlementId}" data-choice="">Change Choice</button>`;
+    }
+    if (entry.status !== "recognition" && entry.status !== "review_needed") {
+      actionHtml += `<button class="btn btn-ghost btn-sm" data-action="v2-skip" data-eid="${entry.entitlementId}">Skip / Decline</button>`;
+    }
+  }
+  const showMessageGuide = entry.rewardType !== null && entry.status !== "declined";
+
+  return `
+    <div class="reward-row-v2" data-entitlement="${entry.entitlementId}">
+      <div class="reward-row-v2-top">
+        ${boldIcon("gift")}
+        <div class="reward-row-v2-body">
+          <div class="reward-row-v2-titleline">
+            <span class="reward-row-v2-title">${escapeHtml(entry.milestoneLabel)} <span class="muted" style="font-weight:500;">(${escapeHtml(entry.qualificationTrack)})</span></span>
+            <span class="pill ${pillClass}">${status.emoji} ${escapeHtml(status.text)}</span>
+          </div>
+          <div class="reward-row-v2-reason">${escapeHtml(entry.qualificationReason)}</div>
+          ${entry.program === "continuousStay" && entry.continuousRentalStartDate ? `<div class="reward-row-v2-reason muted">Continuous rental start: ${fmtDate(entry.continuousRentalStartDate)} · ${entry.continuousRentalDays} continuous days · threshold ${entry.qualificationThreshold}</div>` : ""}
+          ${entry.availableChoices && entry.availableChoices.length ? `<div class="reward-row-v2-reason muted">Available choices: ${entry.availableChoices.map((o) => escapeHtml(CHOICE_REWARD_OPTION_LABELS[o])).join(" · ")}</div>` : ""}
+          ${entry.selectedChoice ? `<div class="reward-row-v2-reason"><b>Selected:</b> ${escapeHtml(CHOICE_REWARD_OPTION_LABELS[entry.selectedChoice] || entry.selectedChoice)} (${fmtDate(entry.selectionDate)})</div>` : ""}
+          ${entry.quantity ? `<div class="reward-row-v2-reason muted">Quantity: ${entry.quantity}</div>` : ""}
+          ${entry.ownerOverride ? `<div class="loyalty-override-tag">Owner Override — ${escapeHtml(entry.overrideReason || entry.ownerOverride)}</div>` : ""}
+          ${entry.ownerNote ? `<div class="reward-note">Owner note: ${escapeHtml(entry.ownerNote)}</div>` : ""}
+        </div>
+      </div>
+      ${actionHtml ? `<div class="reward-row-v2-actions">${actionHtml}</div>` : ""}
+      <div class="btn-row" style="margin-top:8px;flex-wrap:wrap;">
+        ${showMessageGuide ? `<button class="link-btn" data-action="v2-open-message" data-eid="${entry.entitlementId}" data-customer="${customer.id}" style="font-size:11.5px;">Suggested Customer Message</button>` : ""}
+        <button class="link-btn" data-action="v2-add-note" data-eid="${entry.entitlementId}" style="font-size:11.5px;">Add Owner Note</button>
+      </div>
+    </div>
+  `;
+}
+
+// The compact "AA Loyalty" summary block — Genuine Visits / Longest Continuous Stay /
+// Lifetime Paid Days, current milestones per dimension, Rewards Ready count, each with a
+// plain-language "why". Kept deliberately compact (section 2: "do not clutter the
+// interface") — full ledger detail lives in the cards below it, one per entitlement.
+function renderLoyaltySummaryV2(customer, stats, dims, ledger) {
+  const milestonesByProgram = {
+    lifetimeDays: loyaltyLadderMilestonesReached("lifetimeDays", dims.lifetimePaidDays),
+    genuineVisits: loyaltyLadderMilestonesReached("genuineVisits", dims.genuineVisits),
+    continuousStay: loyaltyLadderMilestonesReached("continuousStay", dims.longestContinuousStayDays),
+  };
+  const currentMilestoneLabels = Object.values(milestonesByProgram).flat().map((r) => r.label);
+  const readyCount = ledger.filter((e) => e.status === "ready" || e.status === "pending_choice" || e.status === "selected" || e.status === "manual" || e.status === "review_needed").length;
+  const nextByProgram = [
+    ["Lifetime Paid Days", loyaltyLadderNextMilestone("lifetimeDays", dims.lifetimePaidDays), dims.lifetimePaidDays],
+    ["Genuine Visits", loyaltyLadderNextMilestone("genuineVisits", dims.genuineVisits), dims.genuineVisits],
+    ["Continuous Stay", loyaltyLadderNextMilestone("continuousStay", dims.longestContinuousStayDays), dims.longestContinuousStayDays],
+  ].filter(([, next]) => next);
+
+  return `
+    <div class="card" style="margin-bottom:14px;">
+      <div class="section-label" style="margin-top:0;">AA Loyalty</div>
+      <div class="stat-grid" style="margin-bottom:10px;">
+        <div class="stat-tile"><span class="stat-value">${dims.genuineVisits}</span><span class="stat-label">Genuine Visits</span></div>
+        <div class="stat-tile"><span class="stat-value">${dims.longestContinuousStayDays}</span><span class="stat-label">Longest Continuous Stay (days)</span></div>
+        <div class="stat-tile"><span class="stat-value">${dims.lifetimePaidDays}</span><span class="stat-label">Lifetime Paid Days</span></div>
+      </div>
+      ${currentMilestoneLabels.length ? `<div class="reward-note" style="margin-bottom:8px;"><b>Current Milestones:</b> ${currentMilestoneLabels.map(escapeHtml).join(" · ")}</div>` : `<div class="muted" style="font-size:12px;margin-bottom:8px;">No milestones reached yet.</div>`}
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <span class="pill ${readyCount ? "pill-orange" : "pill-neutral"}">🎁 Rewards Ready: ${readyCount}</span>
+        ${dims.reviewCandidates && dims.reviewCandidates.length ? `<span class="pill pill-amber">👀 ${dims.reviewCandidates.length} case(s) need review</span>` : ""}
+      </div>
+      ${nextByProgram.length ? `<div class="muted" style="font-size:11.5px;margin-top:10px;">${nextByProgram.map(([label, next, val]) => `${escapeHtml(label)}: ${val}/${next.threshold} to "${escapeHtml(next.label)}"`).join(" · ")}</div>` : ""}
+      ${dims.reviewCandidates && dims.reviewCandidates.length ? `
+        <div class="reward-note" style="margin-top:10px;">
+          Ambiguous case${dims.reviewCandidates.length > 1 ? "s" : ""} found: a rental ended and a different-named bike's rental started the same day (or within a day). This may be a mid-stay bike swap (still one continuous visit) or a genuinely new booking. Not auto-merged — please review:
+          ${dims.reviewCandidates.map((rc) => `<div style="margin-top:4px;">"${escapeHtml(rc.prevBike)}" ended ${fmtDate(rc.prevEnd)} → "${escapeHtml(rc.nextBike)}" started ${fmtDate(rc.nextStart)}</div>`).join("")}
+        </div>
+      ` : ""}
+      <div class="loyalty-ledger-list" style="margin-top:12px;">
+        ${ledger.length ? ledger.slice().sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)).map((e) => renderLoyaltyLedgerEntryCard(customer, e)).join("") : `<div class="muted" style="font-size:12px;">No loyalty milestones reached yet.</div>`}
+      </div>
+      <button class="btn btn-ghost btn-sm" data-action="v2-manual-grant" data-customer="${customer.id}" style="margin-top:10px;">+ Owner Manual Appreciation</button>
+    </div>
+  `;
+}
+
 function renderCustomerDetail() {
   const c = DB.data.customers.find((x) => x.id === state.customerId);
   if (!c) { navigate("customers"); return ""; }
   const stats = customerStats(c);
   const suggestions = getSuggestions(c, stats);
+  const loyaltyDims = computeLoyaltyDimensions(c, stats);
+  const loyaltyLedger = ensureLoyaltyLedgerEntries(c, stats, loyaltyDims);
   // Current Bike = the raw bike name from the customer's latest active/ongoing rental row
   // only — never the standardized loyalty-tier category, never a fallback from Ride
   // Upgrade or any other field. If there's no active rental, this is the raw name from
@@ -4310,6 +4821,8 @@ function renderCustomerDetail() {
     <div class="screen-body" style="margin-top:-14px;">
 
       ${pendingBoundaries > 0 ? `<div class="alert-strip amber" data-goto="needs-review" style="margin-bottom:10px;cursor:pointer;"><span class="dot dot-amber"></span>${pendingBoundaries} rental date${pendingBoundaries > 1 ? "s" : ""} for this customer need${pendingBoundaries > 1 ? "" : "s"} review</div>` : ""}
+
+      ${renderLoyaltySummaryV2(c, stats, loyaltyDims, loyaltyLedger)}
 
       ${renderLoyaltySection(c, stats, suggestions)}
 
@@ -4597,8 +5110,161 @@ function renderLoyaltyReportsScreen() {
         </div>
         <div class="reward-note" style="margin-top:10px;">Revenue from loyalty customers (lifetime, all customers who have ever received a reward): ${fmtMoney(loyaltyRevenue)}.</div>
       </div>
+      ${renderLoyaltyV2ReportSummaryCard()}
     </div>
   `;
+}
+
+// LOYALTY V2 — aggregate ladder counts (all-time, not period-filtered — these are lifetime
+// milestone dimensions, not a "given this month" figure) plus a link to the full per-
+// customer export. Lazily ensures every customer's ledger is up to date first, exactly like
+// visiting each customer profile would, so the counts here always match what a customer's
+// own AA Loyalty summary shows.
+function renderLoyaltyV2ReportSummaryCard() {
+  let readyByProgram = { lifetimeDays: 0, genuineVisits: 0, continuousStay: 0 };
+  let givenOrRedeemed = 0, manualGrants = 0, ownerOverrides = 0, reviewCases = 0;
+  DB.data.customers.forEach((c) => {
+    const stats = customerStats(c);
+    const dims = computeLoyaltyDimensions(c, stats);
+    const ledger = ensureLoyaltyLedgerEntries(c, stats, dims);
+    ledger.forEach((e) => {
+      if (["ready", "pending_choice", "selected", "manual"].includes(e.status)) readyByProgram[e.program] = (readyByProgram[e.program] || 0) + 1;
+      if (e.status === "given" || e.status === "redeemed") givenOrRedeemed++;
+      if (e.source === "owner_manual_appreciation") manualGrants++;
+      if (e.ownerOverride) ownerOverrides++;
+    });
+    reviewCases += dims.reviewCandidates.length;
+  });
+  const tile = (label, value) => `<div class="report-tile"><div class="report-tile-value">${value}</div><div class="report-tile-label">${escapeHtml(label)}</div></div>`;
+  return `
+    <div class="card" style="margin-bottom:14px;">
+      <div class="section-label" style="margin-top:0;">AA Loyalty — Three Dimensions (Lifetime)</div>
+      <div class="report-grid">
+        ${tile("Lifetime Paid Days — Ready", readyByProgram.lifetimeDays)}
+        ${tile("Genuine Visits — Ready", readyByProgram.genuineVisits)}
+        ${tile("Continuous Stay — Ready", readyByProgram.continuousStay)}
+        ${tile("Given / Redeemed (All-Time)", givenOrRedeemed)}
+        ${tile("Owner Manual Grants", manualGrants)}
+        ${tile("Bike-Swap Cases Needing Review", reviewCases)}
+      </div>
+      <button class="link-btn" data-goto="loyalty-ledger-report" style="display:block;margin-top:8px;">View / Export Full Loyalty Report</button>
+      <div class="reward-note" style="margin-top:8px;">Legacy Ride Upgrade / Premium Ride Experience / VIP Extra Day forward eligibility is retired — historical given records for those stay visible on each customer's profile and in Reward History, untouched.</div>
+    </div>
+  `;
+}
+
+function csvEscape(v) {
+  const s = String(v === null || v === undefined ? "" : v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// Owner-facing, exportable, printable per-customer Loyalty Report — every field from the
+// "what should this table show" list: identity, all three dimensions, milestones reached/
+// next, rewards ready/given, manual grants, owner overrides, selected reward, qualification
+// reason, owner notes. Answers, at a glance: how loyal is this customer, what kind of
+// loyalty do they show, what have we given them, why, what's next, should the owner
+// personally do more.
+function renderLoyaltyLedgerReportScreen() {
+  const rows = DB.data.customers.map((c) => {
+    const stats = customerStats(c);
+    const dims = computeLoyaltyDimensions(c, stats);
+    const ledger = ensureLoyaltyLedgerEntries(c, stats, dims);
+    const milestones = ledger.map((e) => e.milestoneLabel);
+    const nextByProgram = [
+      loyaltyLadderNextMilestone("lifetimeDays", dims.lifetimePaidDays),
+      loyaltyLadderNextMilestone("genuineVisits", dims.genuineVisits),
+      loyaltyLadderNextMilestone("continuousStay", dims.longestContinuousStayDays),
+    ].filter(Boolean);
+    const ready = ledger.filter((e) => ["ready", "pending_choice", "selected", "manual", "review_needed"].includes(e.status));
+    const given = ledger.filter((e) => e.status === "given" || e.status === "redeemed");
+    const manual = ledger.filter((e) => e.source === "owner_manual_appreciation");
+    const overrides = ledger.filter((e) => e.ownerOverride);
+    const selected = ledger.filter((e) => e.selectedChoice);
+    return {
+      customer: c, stats, dims, ledger,
+      name: c.name, canonicalId: c.id,
+      genuineVisits: dims.genuineVisits,
+      currentContinuousStayDays: dims.currentContinuousStayDays,
+      longestContinuousStayDays: dims.longestContinuousStayDays,
+      lifetimePaidDays: dims.lifetimePaidDays,
+      milestonesReached: milestones.join(" | "),
+      nextMilestone: nextByProgram.map((n) => n.label).join(" | ") || "—",
+      rewardsReady: ready.length,
+      rewardsGiven: given.length,
+      manualGrants: manual.length,
+      ownerOverrides: overrides.length,
+      selectedRewards: selected.map((e) => `${e.milestoneLabel}: ${CHOICE_REWARD_OPTION_LABELS[e.selectedChoice] || e.selectedChoice}`).join(" | "),
+      qualificationReasons: ledger.map((e) => e.qualificationReason).join(" | "),
+      ownerNotes: ledger.filter((e) => e.ownerNote).map((e) => e.ownerNote).join(" | "),
+    };
+  }).sort((a, b) => (a.name < b.name ? -1 : 1));
+
+  const cols = [
+    ["name", "Customer"], ["canonicalId", "Canonical Customer ID"], ["genuineVisits", "Genuine Visits"],
+    ["currentContinuousStayDays", "Current Continuous Stay"], ["longestContinuousStayDays", "Longest Continuous Stay"],
+    ["lifetimePaidDays", "Lifetime Paid Days"], ["milestonesReached", "Milestones Reached"], ["nextMilestone", "Next Milestone"],
+    ["rewardsReady", "Rewards Ready"], ["rewardsGiven", "Rewards Given/Redeemed"], ["manualGrants", "Manual Grants"],
+    ["ownerOverrides", "Owner Overrides"], ["selectedRewards", "Selected Reward"], ["qualificationReasons", "Qualification Reason"], ["ownerNotes", "Owner Notes"],
+  ];
+
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="loyalty-reports">‹ Loyalty Reports</button>
+      <h1 class="screen-title" style="margin-top:8px;">Full Loyalty Report</h1>
+      <p class="screen-sub">Every customer, all three dimensions — inspect, print, or export.</p>
+    </header>
+    <div class="screen-body">
+      <div class="btn-row" style="margin-bottom:12px;">
+        <button class="btn btn-outline btn-sm" data-action="export-loyalty-report-csv">Export CSV</button>
+        <button class="btn btn-ghost btn-sm" data-action="print-loyalty-report">Print</button>
+      </div>
+      <div class="report-table-wrap">
+        <table class="report-table">
+          <thead><tr>${cols.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join("")}</tr></thead>
+          <tbody>
+            ${rows.map((r) => `<tr>${cols.map(([key]) => `<td>${escapeHtml(r[key])}</td>`).join("")}</tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function exportLoyaltyReportCsv() {
+  const rows = DB.data.customers.map((c) => {
+    const stats = customerStats(c);
+    const dims = computeLoyaltyDimensions(c, stats);
+    const ledger = ensureLoyaltyLedgerEntries(c, stats, dims);
+    const nextByProgram = [
+      loyaltyLadderNextMilestone("lifetimeDays", dims.lifetimePaidDays),
+      loyaltyLadderNextMilestone("genuineVisits", dims.genuineVisits),
+      loyaltyLadderNextMilestone("continuousStay", dims.longestContinuousStayDays),
+    ].filter(Boolean);
+    const ready = ledger.filter((e) => ["ready", "pending_choice", "selected", "manual", "review_needed"].includes(e.status));
+    const given = ledger.filter((e) => e.status === "given" || e.status === "redeemed");
+    const manual = ledger.filter((e) => e.source === "owner_manual_appreciation");
+    const overrides = ledger.filter((e) => e.ownerOverride);
+    const selected = ledger.filter((e) => e.selectedChoice);
+    return [
+      c.name, c.id, dims.genuineVisits, dims.currentContinuousStayDays, dims.longestContinuousStayDays, dims.lifetimePaidDays,
+      ledger.map((e) => e.milestoneLabel).join(" | "), nextByProgram.map((n) => n.label).join(" | "),
+      ready.length, given.length, manual.length, overrides.length,
+      selected.map((e) => `${e.milestoneLabel}: ${e.selectedChoice}`).join(" | "),
+      ledger.map((e) => e.qualificationReason).join(" | "),
+      ledger.filter((e) => e.ownerNote).map((e) => e.ownerNote).join(" | "),
+    ];
+  });
+  const header = ["Customer", "Canonical Customer ID", "Genuine Visits", "Current Continuous Stay", "Longest Continuous Stay", "Lifetime Paid Days", "Milestones Reached", "Next Milestone", "Rewards Ready", "Rewards Given/Redeemed", "Manual Grants", "Owner Overrides", "Selected Reward", "Qualification Reason", "Owner Notes"];
+  const csv = [header, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "aa_loyalty_report_" + todayISO() + ".csv";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function renderVehiclesList() {
@@ -6382,6 +7048,7 @@ function render() {
     case "active-riders": html = renderActiveRidersScreen(); break;
     case "reward-history": html = renderRewardHistoryScreen(); break;
     case "loyalty-reports": html = renderLoyaltyReportsScreen(); break;
+    case "loyalty-ledger-report": html = renderLoyaltyLedgerReportScreen(); break;
     case "vehicles": html = renderVehiclesList(); break;
     case "vehicle": html = renderVehicleDetail(); break;
     case "settings": html = renderSettings(); break;
@@ -6902,7 +7569,157 @@ function wireScreenEvents() {
   const startImportBtn = document.getElementById("start-import");
   if (startImportBtn) startImportBtn.addEventListener("click", () => { resetImportState(null); navigate("import"); });
 
+  wireLoyaltyV2Events();
   wireImportScreenEvents();
+}
+
+/* ---------------------------------------------------------------------- */
+/* LOYALTY V2 — event wiring (owner override controls + message guide)    */
+/* ---------------------------------------------------------------------- */
+function wireLoyaltyV2Events() {
+  const exportBtn = document.querySelector('[data-action="export-loyalty-report-csv"]');
+  if (exportBtn) exportBtn.addEventListener("click", exportLoyaltyReportCsv);
+  const printBtn = document.querySelector('[data-action="print-loyalty-report"]');
+  if (printBtn) printBtn.addEventListener("click", () => window.print());
+
+  document.querySelectorAll('[data-action="v2-mark-given"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      confirmSheet("Mark this reward as given?", () => { loyaltyOwnerMarkGiven(el.dataset.eid); toast("Marked given"); render(); }, "Mark Given");
+    });
+  });
+  document.querySelectorAll('[data-action="v2-undo"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      confirmSheet("Undo this and return it to its previous status?", () => { loyaltyOwnerUndo(el.dataset.eid); toast("Reverted"); render(); }, "Undo");
+    });
+  });
+  document.querySelectorAll('[data-action="v2-select-choice"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const eid = el.dataset.eid;
+      const choice = el.dataset.choice;
+      if (choice) { loyaltyOwnerSelectChoice(eid, choice); toast("Choice selected"); render(); return; }
+      openSheet(`
+        <div class="sheet-title">Choose the reward</div>
+        <div class="sheet-sub">Selecting one consumes this milestone's entitlement — the customer can't receive more than one from the same milestone.</div>
+        <div class="btn-row" style="flex-direction:column;gap:8px;margin-top:14px;">
+          ${CHOICE_REWARD_OPTIONS.map((opt) => `<button class="btn btn-outline btn-block" data-pick="${opt}">${escapeHtml(CHOICE_REWARD_OPTION_LABELS[opt])}</button>`).join("")}
+        </div>
+      `);
+      document.querySelectorAll("[data-pick]").forEach((btn) => btn.addEventListener("click", () => {
+        loyaltyOwnerSelectChoice(eid, btn.dataset.pick);
+        closeSheet(); toast("Choice selected"); render();
+      }));
+    });
+  });
+  document.querySelectorAll('[data-action="v2-skip"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const eid = el.dataset.eid;
+      openSheet(`
+        <div class="sheet-title">Skip / Decline</div>
+        <div class="sheet-sub">This stays on record — it's never deleted, only marked declined.</div>
+        <textarea id="v2-skip-note" class="sheet-textarea" placeholder="Reason (optional)"></textarea>
+        <div class="btn-row" style="margin-top:14px;">
+          <button class="btn btn-outline btn-block" id="v2-skip-cancel">Cancel</button>
+          <button class="btn btn-primary btn-block" id="v2-skip-ok">Confirm</button>
+        </div>
+      `);
+      document.getElementById("v2-skip-cancel").addEventListener("click", closeSheet);
+      document.getElementById("v2-skip-ok").addEventListener("click", () => {
+        const note = document.getElementById("v2-skip-note").value;
+        loyaltyOwnerSkip(eid, note);
+        closeSheet(); toast("Marked declined"); render();
+      });
+    });
+  });
+  document.querySelectorAll('[data-action="v2-add-note"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const eid = el.dataset.eid;
+      const existing = findLoyaltyLedgerEntry(eid);
+      openSheet(`
+        <div class="sheet-title">Owner Note</div>
+        <textarea id="v2-note-text" class="sheet-textarea" placeholder="Add a note for this entitlement...">${escapeHtml(existing ? existing.ownerNote || "" : "")}</textarea>
+        <div class="btn-row" style="margin-top:14px;">
+          <button class="btn btn-outline btn-block" id="v2-note-cancel">Cancel</button>
+          <button class="btn btn-primary btn-block" id="v2-note-ok">Save</button>
+        </div>
+      `);
+      document.getElementById("v2-note-cancel").addEventListener("click", closeSheet);
+      document.getElementById("v2-note-ok").addEventListener("click", () => {
+        loyaltyOwnerAddNote(eid, document.getElementById("v2-note-text").value);
+        closeSheet(); toast("Note saved"); render();
+      });
+    });
+  });
+  document.querySelectorAll('[data-action="v2-manual-grant"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const customerId = el.dataset.customer;
+      const customer = DB.data.customers.find((c) => c.id === customerId);
+      const options = [
+        ["lifetimeDays", "lifetime_manual", "Owner Manual Appreciation — Lifetime track"],
+        ["genuineVisits", "visits_manual", "Owner Manual Appreciation — Genuine Visits track"],
+        ["continuousStay", "stay_manual", "Owner Manual Appreciation — Continuous Stay track"],
+      ];
+      openSheet(`
+        <div class="sheet-title">Owner Manual Appreciation</div>
+        <div class="sheet-sub">Grant something the automatic rules haven't (yet) triggered. Clearly labeled as a manual override — this never changes the customer's actual visit/day/stay history.</div>
+        <div class="btn-row" style="flex-direction:column;gap:8px;margin-top:10px;">
+          ${options.map(([program, id, label]) => `<button class="btn btn-outline btn-block" data-grant="${program}:${id}">${escapeHtml(label)}</button>`).join("")}
+        </div>
+        <textarea id="v2-grant-note" class="sheet-textarea" placeholder="Reason (optional)" style="margin-top:10px;"></textarea>
+      `);
+      document.querySelectorAll("[data-grant]").forEach((btn) => btn.addEventListener("click", () => {
+        const [program, ladderId] = btn.dataset.grant.split(":");
+        const note = document.getElementById("v2-grant-note").value;
+        loyaltyOwnerGrantManual(customer, program, ladderId, note);
+        closeSheet(); toast("Manual appreciation granted"); render();
+      }));
+    });
+  });
+  document.querySelectorAll('[data-action="v2-open-message"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const eid = el.dataset.eid;
+      const customer = DB.data.customers.find((c) => c.id === el.dataset.customer);
+      const entry = findLoyaltyLedgerEntry(eid);
+      if (!entry || !customer) return;
+      if (state.messageDrafts[eid] === undefined) {
+        state.messageDrafts[eid] = { variant: 0, text: generateCustomerMessage(entry, customer, 0), edited: false };
+      }
+      renderMessageGuideSheet(eid, customer, entry);
+    });
+  });
+}
+
+function renderMessageGuideSheet(eid, customer, entry) {
+  const draft = state.messageDrafts[eid];
+  openSheet(`
+    <div class="sheet-title">Suggested Customer Message</div>
+    <div class="sheet-sub">For your reference only — this is never sent automatically. Copy it, edit it, and send it yourself whenever the timing feels right.</div>
+    <textarea id="v2-message-text" class="sheet-textarea" style="min-height:120px;">${escapeHtml(draft.text)}</textarea>
+    <div class="btn-row" style="margin-top:14px;flex-wrap:wrap;gap:8px;">
+      <button class="btn btn-outline btn-sm" id="v2-message-regenerate">Another Version</button>
+      <button class="btn btn-outline btn-sm" id="v2-message-copy">Copy</button>
+      <button class="btn btn-primary btn-sm" id="v2-message-close">Done</button>
+    </div>
+  `);
+  document.getElementById("v2-message-text").addEventListener("input", (e) => {
+    state.messageDrafts[eid].text = e.target.value;
+    state.messageDrafts[eid].edited = true;
+  });
+  document.getElementById("v2-message-regenerate").addEventListener("click", () => {
+    const d = state.messageDrafts[eid];
+    d.variant = (d.variant || 0) + 1;
+    d.text = generateCustomerMessage(entry, customer, d.variant);
+    d.edited = false;
+    renderMessageGuideSheet(eid, customer, entry);
+  });
+  document.getElementById("v2-message-copy").addEventListener("click", () => {
+    const text = document.getElementById("v2-message-text").value;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => toast("Copied")).catch(() => toast("Copy failed — select and copy manually"));
+    } else {
+      toast("Copy not supported here — select and copy manually");
+    }
+  });
+  document.getElementById("v2-message-close").addEventListener("click", closeSheet);
 }
 
 function wireImportScreenEvents() {
@@ -6982,5 +7799,6 @@ document.getElementById("gear-btn").addEventListener("click", () => navigate("se
 DB.load();
 navigate("home");
 pullRewardsFromCloud();
+pullLoyaltyLedgerFromCloud();
 
 })();
