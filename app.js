@@ -900,7 +900,7 @@ const RIDE_UPGRADE_NEXT = {
   "125cc": "Aerox Standard Key 155cc",
   "Aerox Standard Key 155cc": "Aerox Keyless/ABS 155cc",
   "NMAX White Standard Key 155cc": "NMAX Keyless/ABS 155cc",
-  "Aerox Keyless/ABS 155cc": "NMAX Keyless/ABS 155cc",
+  "Aerox Keyless/ABS 155cc": null,
   "NMAX Keyless/ABS 155cc": null, // top of the normal ladder
 };
 const RIDE_UPGRADE_LADDER_VISUAL = ["125cc", "Aerox Standard Key 155cc", "Aerox Keyless/ABS 155cc", "NMAX Keyless/ABS 155cc"];
