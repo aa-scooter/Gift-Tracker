@@ -6330,12 +6330,11 @@ function renderSettings() {
         <p class="muted" style="margin-bottom:12px;">Data is stored locally on this device — this is this app's own standalone database, separate from any other AA Scooters system. Export regularly and keep a backup.</p>
         <div class="btn-row">
           <button class="btn btn-outline btn-sm" id="export-data">Export JSON</button>
-          <span class="btn btn-outline btn-sm"
-          style="position:relative;overflow:hidden;display:inline-flex;align-items:center;">
-          Import JSON backup
-          <input type="file" id="import-file" accept="application/json"
-            style="position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;" />
-        </span>
+          <div id="json-drop-zone"
+          style="border:2px dashed #c99a16;border-radius:10px;padding:16px 18px;text-align:center;cursor:copy;min-width:240px;">
+          <strong>Drop JSON backup here</strong>
+          <div class="muted" style="font-size:12px;margin-top:4px;">Drag the backup file from Finder into this box</div>
+        </div>
           <button class="btn btn-danger btn-sm" id="wipe-data">Reset all data</button>
         </div>
       </div>
@@ -8171,11 +8170,28 @@ function wireScreenEvents() {
     );
   });
 
-  const importFile = document.getElementById("import-file");
-  if (importFile) {
-    importFile.addEventListener("change", async (e) => {
-      const file = e.target.files[0];
+  const dropZone = document.getElementById("json-drop-zone");
+  if (dropZone) {
+    ["dragenter", "dragover"].forEach(type => {
+      dropZone.addEventListener(type, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.style.opacity = "0.7";
+      });
+    });
+
+    ["dragleave", "drop"].forEach(type => {
+      dropZone.addEventListener(type, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.style.opacity = "1";
+      });
+    });
+
+    dropZone.addEventListener("drop", async (e) => {
+      const file = e.dataTransfer.files && e.dataTransfer.files[0];
       if (!file) return;
+
       try {
         const text = await file.text();
         DB.importJSON(text);
