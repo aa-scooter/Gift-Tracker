@@ -2664,6 +2664,10 @@ function renderManagerSyncScreen() {
         `;
       })() : ""}
 
+      ${state.managerSyncStatus === "backing-up" ? `
+        <div class="card"><p class="muted">Creating an automatic safety backup before applying Manager Sync…</p></div>
+      ` : ""}
+
       ${state.managerSyncStatus === "done" && state.managerSyncResult ? (() => {
         const r = state.managerSyncResult;
         return `
@@ -3444,6 +3448,18 @@ const AUDIT_ACTION_LABELS = {
 /* ---------------------------------------------------------------------- */
 /* LOYALTY V2 — versioned backups + safe restore                           */
 /* ---------------------------------------------------------------------- */
+// Human-readable labels for the backup "operation" enum — the machine-readable trigger stored
+// in every backup's filename and content, so the Backup History list can show "why" a backup
+// exists without downloading its full content. New operations can be added freely; an unknown
+// slug just displays as-is (see backupOperationLabel below) rather than breaking anything.
+const BACKUP_OPERATION_LABELS = {
+  manual: "Manual — Create Backup Now", manager_sync: "Before Manager Sync",
+  full_refresh: "Before Full Refresh", cloud_sync: "Before Cloud Loyalty Sync",
+  restore_safety: "Automatic — before a restore", migration: "Before production migration / write-back",
+  bulk_operation: "Before a bulk loyalty operation",
+};
+function backupOperationLabel(op) { return BACKUP_OPERATION_LABELS[op] || (op || "Unknown"); }
+
 // Snapshots the three persistent/owner-decision-bearing stores (ledger, audit log, and the
 // legacy rewards array) PLUS the source data (customers, rentals) so a restore can bring
 // back a fully consistent point-in-time state. Deliberately does NOT snapshot vehicles/
@@ -3455,24 +3471,57 @@ function buildLoyaltySnapshot() {
     meta: DB.data.meta,
   };
 }
+function loyaltyRecordCountsFor(snapshot) {
+  return {
+    customers: (snapshot.customers || []).length, rentals: (snapshot.rentals || []).length,
+    rewards: (snapshot.rewards || []).length, loyaltyLedger: (snapshot.loyaltyLedger || []).length,
+    loyaltyAuditLog: (snapshot.loyaltyAuditLog || []).length,
+  };
+}
 // Call this before any operation capable of changing multiple customer/reward records —
-// production migration, bulk loyalty changes, a full loyalty rebuild, or a ledger migration
-// — per the safety requirement. Each call creates a NEW, separately-named, never-overwritten
-// file (see api/loyalty-backup.js — it always creates, never updates). Returns a promise so
-// callers can await it before proceeding with the risky operation, and reject/no-op safely
-// if the network call fails rather than silently proceeding without a backup.
-function createLoyaltyBackup(reason, performedBy) {
+// production migration, bulk loyalty changes, a full loyalty rebuild, a ledger migration, or
+// any sync/reconcile that replaces customer/rental data — per the safety requirement. Each
+// call creates a NEW, separately-named, never-overwritten file (see api/loyalty-backup.js —
+// it always creates, never updates), named with BOTH a timestamp and the triggering operation
+// so the Backup History list can show "why" without downloading anything. Records the record
+// counts and, where available, a short description of the source/data version being applied
+// (e.g. "Manager Sync plan: 3 customers / 5 rows") so a backup is self-describing even before
+// anyone opens it. Returns a promise so callers can await it before proceeding with the risky
+// operation, and reject/no-op safely if the network call fails rather than silently proceeding
+// without a backup — see withAutomaticBackupBeforeBulkOp below, which is what every automatic
+// call site actually uses.
+function createLoyaltyBackup(reason, performedBy, operation, sourceVersion) {
   const snapshot = buildLoyaltySnapshot();
+  const recordCounts = loyaltyRecordCountsFor(snapshot);
+  const op = operation || "manual";
   return fetch(LOYALTY_BACKUP_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ reason: reason || "Manual", snapshot }),
+    body: JSON.stringify({ reason: reason || "Manual", performedBy: performedBy || "owner", operation: op, sourceVersion: sourceVersion || null, recordCounts, snapshot }),
   })
     .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Backup request failed: " + r.status))))
     .then((data) => {
-      appendAuditRecord(null, "backup_created", [{ field: "backup", previousValue: null, newValue: data.filename }], performedBy || "owner", reason || "Manual backup");
-      return data;
+      appendAuditRecord(null, "backup_created", [
+        { field: "operation", previousValue: null, newValue: op },
+        { field: "recordCounts", previousValue: null, newValue: recordCounts },
+        { field: "backupId", previousValue: null, newValue: data.fileId || null },
+        { field: "filename", previousValue: null, newValue: data.filename },
+        { field: "sourceVersion", previousValue: null, newValue: sourceVersion || null },
+      ], performedBy || "owner", reason || "Manual backup");
+      return Object.assign({ operation: op, recordCounts, sourceVersion: sourceVersion || null }, data);
     });
+}
+// The single choke point every current AND future bulk loyalty-data operation should go
+// through — Manager Sync, Full Refresh, Cloud Sync, a future production migration/write-back,
+// or any other future operation that can change multiple customer/reward records. Creates the
+// automatic pre-operation backup FIRST; `fn` (the actual risky operation) only ever runs if
+// that backup succeeds. If the backup fails, `fn` never runs and the operation is cancelled —
+// this is what makes "automatic" actually automatic rather than a reminder to click a button.
+function withAutomaticBackupBeforeBulkOp(operation, reason, sourceVersion, fn) {
+  return createLoyaltyBackup(reason, "system", operation, sourceVersion).then((backupResult) => {
+    fn();
+    return backupResult;
+  });
 }
 function listLoyaltyBackups() {
   return fetch(LOYALTY_BACKUP_API_URL)
@@ -3524,7 +3573,7 @@ function restoreDiffSummary(diff) {
 // — it only restores customers/rentals/rewards/loyaltyLedger, then appends one forward audit
 // record documenting that the restore happened.
 function restoreLoyaltyBackup(backupId, backupLabel, performedBy) {
-  return createLoyaltyBackup("Pre-restore safety backup (before restoring " + backupLabel + ")", performedBy)
+  return createLoyaltyBackup("Automatic — before restoring " + backupLabel, performedBy, "restore_safety", "Restoring from backup " + backupId)
     .then(() => fetchLoyaltyBackup(backupId))
     .then((data) => {
       const snap = data.snapshot;
@@ -5606,9 +5655,11 @@ function renderLoyaltyBackupsScreen() {
                 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
                   <div>
                     <div style="font-weight:600;">${escapeHtml(fmtDateTimeLabel(b.createdAt) || b.filename)}</div>
-                    <div class="muted" style="font-size:11.5px;">${escapeHtml(b.filename)}</div>
+                    <div class="muted" style="font-size:11.5px;">${escapeHtml(backupOperationLabel(b.operation))}</div>
+                    <div class="muted" style="font-size:10.5px;">${escapeHtml(b.filename)}</div>
                   </div>
                   <div class="btn-row" style="margin:0;">
+                    <button class="btn btn-ghost btn-sm" data-action="v2-inspect-backup" data-id="${escapeHtml(b.id)}" data-filename="${escapeHtml(b.filename)}">Inspect</button>
                     <button class="btn btn-outline btn-sm" data-action="v2-export-backup" data-id="${escapeHtml(b.id)}" data-filename="${escapeHtml(b.filename)}">Export</button>
                     <button class="btn btn-danger btn-sm" data-action="v2-restore-backup" data-id="${escapeHtml(b.id)}" data-filename="${escapeHtml(b.filename)}">Restore…</button>
                   </div>
@@ -5620,6 +5671,58 @@ function renderLoyaltyBackupsScreen() {
       ) : ""}
     </div>
   `;
+}
+
+// "Inspect" — read-only detail view for one backup: full reason, the operation that
+// triggered it, the record counts captured at backup time, and the source/data version
+// description where available. Downloads the backup's full content on demand (this is the
+// one place per backup where that cost is worth paying — the list itself stays cheap).
+function openBackupInspectSheet(backupId, backupLabel) {
+  openSheet(`<div class="sheet-title">Backup Details</div><div class="sheet-sub">Loading…</div>`);
+  fetchLoyaltyBackup(backupId)
+    .then((data) => {
+      const counts = data.recordCounts || {};
+      const countRows = [
+        ["Customers", counts.customers], ["Rentals", counts.rentals], ["Legacy Rewards", counts.rewards],
+        ["Loyalty Ledger entries", counts.loyaltyLedger], ["Audit log records", counts.loyaltyAuditLog],
+      ];
+      openSheet(`
+        <div class="sheet-title">Backup Details</div>
+        <div class="sheet-sub">${escapeHtml(fmtDateTimeLabel(data.createdAt) || backupLabel)}</div>
+        <div style="margin-top:10px;">
+          <div style="font-weight:600;margin-bottom:4px;">Triggered by</div>
+          <div class="muted" style="font-size:12.5px;margin-bottom:10px;">${escapeHtml(backupOperationLabel(data.operation))}${data.performedBy ? " · by " + escapeHtml(data.performedBy) : ""}</div>
+          ${data.reason ? `<div style="font-weight:600;margin-bottom:4px;">Reason</div><div class="muted" style="font-size:12.5px;margin-bottom:10px;">${escapeHtml(data.reason)}</div>` : ""}
+          ${data.sourceVersion ? `<div style="font-weight:600;margin-bottom:4px;">Source / data version</div><div class="muted" style="font-size:12.5px;margin-bottom:10px;">${escapeHtml(data.sourceVersion)}</div>` : ""}
+          <div style="font-weight:600;margin-bottom:4px;">Record counts at backup time</div>
+          ${countRows.map(([label, val]) => `<div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;border-bottom:1px solid var(--line);"><span>${escapeHtml(label)}</span><span class="muted">${val === undefined || val === null ? "—" : val}</span></div>`).join("")}
+        </div>
+        <div class="btn-row" style="margin-top:16px;">
+          <button class="btn btn-outline btn-sm" id="v2-inspect-export">Export</button>
+          <button class="btn btn-primary btn-block" id="v2-inspect-close">Close</button>
+        </div>
+      `);
+      document.getElementById("v2-inspect-close").addEventListener("click", closeSheet);
+      document.getElementById("v2-inspect-export").addEventListener("click", () => {
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = backupLabel || "loyalty_backup.json";
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      });
+    })
+    .catch((err) => {
+      openSheet(`
+        <div class="sheet-title">Backup Details</div>
+        <div class="sheet-sub" style="color:#c0392b;">Could not load that backup: ${escapeHtml(String((err && err.message) || err))}</div>
+        <div class="btn-row" style="margin-top:14px;"><button class="btn btn-outline btn-block" id="v2-inspect-close-err">Close</button></div>
+      `);
+      document.getElementById("v2-inspect-close-err").addEventListener("click", closeSheet);
+    });
 }
 
 // Shows a preview sheet (date/time, records affected, changed/added/removed counts) and
@@ -5656,7 +5759,7 @@ function renderRestorePreviewSheet(backupId, backupLabel, backupData, diff, summ
   ];
   openSheet(`
     <div class="sheet-title">Restore Preview</div>
-    <div class="sheet-sub">Backup date/time: <b>${escapeHtml(fmtDateTimeLabel(backupData.createdAt) || backupLabel)}</b>${backupData.reason ? ` · ${escapeHtml(backupData.reason)}` : ""}</div>
+    <div class="sheet-sub">Backup date/time: <b>${escapeHtml(fmtDateTimeLabel(backupData.createdAt) || backupLabel)}</b> · ${escapeHtml(backupOperationLabel(backupData.operation))}${backupData.reason ? ` · ${escapeHtml(backupData.reason)}` : ""}</div>
     <div class="reward-note" style="margin-top:10px;">
       This does <b>not</b> touch the audit history — every action ever recorded stays exactly as it is. Restoring is itself recorded as a new audit entry, and a fresh safety backup of the CURRENT state is taken automatically right before anything changes.
     </div>
@@ -5698,7 +5801,7 @@ function wireLoyaltyBackupEvents() {
   if (createBtn) createBtn.addEventListener("click", () => {
     state.loyaltyBackupCreateStatus = "creating";
     render();
-    createLoyaltyBackup("Manual", "owner")
+    createLoyaltyBackup("Manual — Create Backup Now", "owner", "manual")
       .then(() => {
         state.loyaltyBackupCreateStatus = "done";
         loyaltyBackupsListRefresh();
@@ -5711,6 +5814,10 @@ function wireLoyaltyBackupEvents() {
   });
   const refreshBtn = document.getElementById("v2-refresh-backups");
   if (refreshBtn) refreshBtn.addEventListener("click", loyaltyBackupsListRefresh);
+
+  document.querySelectorAll('[data-action="v2-inspect-backup"]').forEach((el) => {
+    el.addEventListener("click", () => openBackupInspectSheet(el.dataset.id, el.dataset.filename));
+  });
 
   document.querySelectorAll('[data-action="v2-export-backup"]').forEach((el) => {
     el.addEventListener("click", () => {
@@ -6185,6 +6292,7 @@ function renderSettings() {
             </div>
           </div>
         ` : ""}
+        ${state.fullRefreshStatus === "backing-up" ? `<p class="muted" style="margin-top:10px;">Creating an automatic safety backup before applying…</p>` : ""}
         ${state.fullRefreshStatus === "done" ? `<p class="muted" style="margin-top:10px;">Full refresh applied ✓</p>` : ""}
       </div>
 
@@ -6205,6 +6313,7 @@ function renderSettings() {
             </div>
           </div>
         ` : ""}
+        ${state.cloudSyncStatus === "backing-up" ? `<p class="muted" style="margin-top:10px;">Creating an automatic safety backup before applying…</p>` : ""}
         ${state.cloudSyncStatus === "done" ? `<p class="muted" style="margin-top:10px;">Baseline refreshed ✓</p>` : ""}
       </div>
 
@@ -7823,18 +7932,34 @@ function wireScreenEvents() {
     const newCustomerCount = plan.resolvedCustomers.filter((c) => c.isNew).length;
     const totalRows = plan.resolvedCustomers.reduce((s, c) => s + c.rows.length, 0);
     confirmSheet(
-      `This will use Manager Live rental data as the operational source for ${plan.resolvedCustomers.length} identified customer(s) (${newCustomerCount} new), covering ${totalRows} Manager row(s). Legacy Gift Tracker history stays archived, not deleted. Reward records are never touched. This app never writes back to the Manager Sheet.`,
+      `This will use Manager Live rental data as the operational source for ${plan.resolvedCustomers.length} identified customer(s) (${newCustomerCount} new), covering ${totalRows} Manager row(s). Legacy Gift Tracker history stays archived, not deleted. Reward records are never touched. This app never writes back to the Manager Sheet. An automatic safety backup is taken first, before anything changes.`,
       () => {
-        const result = executeManagerSync(plan);
-        if (result.success) {
-          state.managerSyncResult = result;
-          state.managerSyncStatus = "done";
-          state.managerSyncPlan = null;
-        } else {
-          state.managerSyncError = result.reason;
-          state.managerSyncStatus = "error";
-        }
+        state.managerSyncStatus = "backing-up";
         render();
+        withAutomaticBackupBeforeBulkOp(
+          "manager_sync",
+          `Automatic — before Manager Sync (${plan.resolvedCustomers.length} customer(s), ${totalRows} row(s))`,
+          `Manager Sync plan: ${plan.resolvedCustomers.length} customer(s) / ${totalRows} row(s), ${newCustomerCount} new`,
+          () => {
+            const result = executeManagerSync(plan);
+            if (result.success) {
+              state.managerSyncResult = result;
+              state.managerSyncStatus = "done";
+              state.managerSyncPlan = null;
+            } else {
+              state.managerSyncError = result.reason;
+              state.managerSyncStatus = "error";
+            }
+            render();
+          }
+        ).catch((err) => {
+          // The automatic safety backup itself failed — Manager Sync was NEVER applied.
+          // This is deliberate: an automatic backup that can silently fail isn't a safety
+          // net, so a failed backup blocks the risky operation rather than proceeding anyway.
+          state.managerSyncError = "Automatic safety backup failed — Manager Sync was NOT applied. " + String((err && err.message) || err);
+          state.managerSyncStatus = "error";
+          render();
+        });
       },
       "Apply Updates"
     );
@@ -7888,15 +8013,28 @@ function wireScreenEvents() {
     const preview = state.cloudSyncPreview;
     if (!preview) return;
     confirmSheet(
-      `This will replace the ${preview.localCustomerCount} imported baseline customer(s) and ${preview.localRentalCount} imported baseline rental(s) currently on this device with the ${preview.cloudCustomerCount} / ${preview.cloudRentalCount} version now in the cloud. Anything added via Manager Sync or the "+" buttons is never touched. This cannot be undone from within the app — use Export Backup first if unsure.`,
+      `This will replace the ${preview.localCustomerCount} imported baseline customer(s) and ${preview.localRentalCount} imported baseline rental(s) currently on this device with the ${preview.cloudCustomerCount} / ${preview.cloudRentalCount} version now in the cloud. Anything added via Manager Sync or the "+" buttons is never touched. An automatic safety backup is taken first, before anything changes.`,
       () => {
-        DB.data.customers = DB.data.customers.filter((c) => (c.id || "").indexOf("imp_") !== 0).concat(preview.customers);
-        DB.data.rentals = DB.data.rentals.filter((r) => (r.id || "").indexOf("imp_") !== 0).concat(preview.rentals);
-        DB.save();
-        state.cloudSyncStatus = "done";
-        state.cloudSyncPreview = null;
-        toast(`Loyalty baseline refreshed ✓ — ${preview.cloudCustomerCount} customers`);
+        state.cloudSyncStatus = "backing-up";
         render();
+        withAutomaticBackupBeforeBulkOp(
+          "cloud_sync",
+          `Automatic — before Cloud Loyalty Sync (${preview.cloudCustomerCount} customers / ${preview.cloudRentalCount} rentals from cloud)`,
+          `Cloud baseline: ${preview.cloudCustomerCount} customer(s) / ${preview.cloudRentalCount} rental(s)`,
+          () => {
+            DB.data.customers = DB.data.customers.filter((c) => (c.id || "").indexOf("imp_") !== 0).concat(preview.customers);
+            DB.data.rentals = DB.data.rentals.filter((r) => (r.id || "").indexOf("imp_") !== 0).concat(preview.rentals);
+            DB.save();
+            state.cloudSyncStatus = "done";
+            state.cloudSyncPreview = null;
+            toast(`Loyalty baseline refreshed ✓ — ${preview.cloudCustomerCount} customers`);
+            render();
+          }
+        ).catch((err) => {
+          state.cloudSyncError = "Automatic safety backup failed — Cloud Sync was NOT applied. " + String((err && err.message) || err);
+          state.cloudSyncStatus = "error";
+          render();
+        });
       },
       "Apply"
     );
@@ -7951,15 +8089,28 @@ function wireScreenEvents() {
     const preview = state.fullRefreshPreview;
     if (!preview) return;
     confirmSheet(
-      `This will replace the ${preview.localCustomerCount} imported baseline customer(s) and ${preview.localRentalCount} imported baseline rental(s) currently on this device with the freshly rebuilt ${preview.customers.length} / ${preview.rentals.length} version (live data + 2025 archive, renewals consolidated). Anything added via Manager Sync or the "+" buttons is never touched. This cannot be undone from within the app — use Export Backup first if unsure.`,
+      `This will replace the ${preview.localCustomerCount} imported baseline customer(s) and ${preview.localRentalCount} imported baseline rental(s) currently on this device with the freshly rebuilt ${preview.customers.length} / ${preview.rentals.length} version (live data + 2025 archive, renewals consolidated). Anything added via Manager Sync or the "+" buttons is never touched. An automatic safety backup is taken first, before anything changes.`,
       () => {
-        DB.data.customers = DB.data.customers.filter((c) => (c.id || "").indexOf("imp_") !== 0).concat(preview.customers);
-        DB.data.rentals = DB.data.rentals.filter((r) => (r.id || "").indexOf("imp_") !== 0).concat(preview.rentals);
-        DB.save();
-        state.fullRefreshStatus = "done";
-        state.fullRefreshPreview = null;
-        toast(`Full refresh applied ✓ — ${preview.customers.length} customers`);
+        state.fullRefreshStatus = "backing-up";
         render();
+        withAutomaticBackupBeforeBulkOp(
+          "full_refresh",
+          `Automatic — before Full Refresh (rebuilt to ${preview.customers.length} customers / ${preview.rentals.length} rentals)`,
+          `Full Refresh rebuild: ${preview.customers.length} customer(s) / ${preview.rentals.length} rental(s), ${preview.stats && preview.stats.consolidatedRentalCount || 0} consolidated`,
+          () => {
+            DB.data.customers = DB.data.customers.filter((c) => (c.id || "").indexOf("imp_") !== 0).concat(preview.customers);
+            DB.data.rentals = DB.data.rentals.filter((r) => (r.id || "").indexOf("imp_") !== 0).concat(preview.rentals);
+            DB.save();
+            state.fullRefreshStatus = "done";
+            state.fullRefreshPreview = null;
+            toast(`Full refresh applied ✓ — ${preview.customers.length} customers`);
+            render();
+          }
+        ).catch((err) => {
+          state.fullRefreshError = "Automatic safety backup failed — Full Refresh was NOT applied. " + String((err && err.message) || err);
+          state.fullRefreshStatus = "error";
+          render();
+        });
       },
       "Apply"
     );
