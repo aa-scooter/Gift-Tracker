@@ -1380,3 +1380,41 @@ p { margin: 0; }
 .loyalty-backup-row { padding: 12px 14px; }
 .activity-history-list { display: flex; flex-direction: column; gap: 10px; }
 .activity-history-item { padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--paper-dim); }
+
+/* ============================================================
+   LOYALTY V2 — Reward Recommendation cards (added 2026-08-24).
+   "Why earned" + Premium Ride / Extra Days / Appreciation Gift
+   cards + collapsible calculation detail, replacing the old
+   plain 3-button choice-reward row.
+   ============================================================ */
+.reward-why-earned { margin: 8px 0 10px; padding: 10px 12px; background: var(--paper-dim); border-radius: var(--radius-s); }
+.reward-why-earned-title { font-size: 11px; font-weight: 700; letter-spacing: 0.02em; text-transform: uppercase; color: var(--text-secondary); margin-bottom: 6px; }
+.reward-why-earned-list { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--text); line-height: 1.55; }
+.reward-choose-one-label { font-size: 11px; font-weight: 700; letter-spacing: 0.02em; text-transform: uppercase; color: var(--text-secondary); margin: 10px 0 6px; }
+
+.reward-recommend-cards { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.reward-recommend-card {
+  background: var(--paper-card);
+  border: 1.5px solid var(--orange-soft-line);
+  border-radius: var(--radius-m);
+  padding: 14px;
+}
+.reward-recommend-card-secondary { border-style: dashed; border-color: var(--line-strong); background: var(--paper-dim); }
+.reward-recommend-card-title { font-size: 11.5px; font-weight: 700; color: var(--orange-dark); text-transform: uppercase; letter-spacing: 0.01em; margin-bottom: 4px; }
+.reward-recommend-card-secondary .reward-recommend-card-title { color: var(--text-secondary); }
+.reward-recommend-card-bike { font-family: var(--font-display); font-weight: 700; font-size: 15px; color: var(--ink); }
+.reward-recommend-card-days { font-family: var(--font-display); font-weight: 800; font-size: 20px; color: var(--ink); margin-top: 2px; }
+.reward-recommend-card-value { font-size: 12.5px; font-weight: 600; color: var(--text); margin-top: 6px; }
+.reward-recommend-card-note { font-size: 11.5px; margin-top: 3px; }
+.reward-recommend-card-why { font-size: 11.5px; margin-top: 8px; line-height: 1.45; padding-top: 8px; border-top: 1px dashed var(--line); }
+.reward-recommend-card .pill { margin-top: 8px; display: inline-block; }
+.reward-recommend-card .btn-block { margin-top: 10px; }
+
+.reward-why-details { margin-top: 10px; font-size: 12.5px; }
+.reward-why-details summary { cursor: pointer; font-weight: 700; color: var(--text-secondary); list-style: revert; }
+.reward-why-details summary:hover { color: var(--ink); }
+.reward-why-body { margin-top: 8px; padding: 10px 12px; background: var(--paper-dim); border-radius: var(--radius-s); line-height: 1.6; color: var(--text); }
+
+@media (min-width: 640px) {
+  .reward-recommend-cards { grid-template-columns: repeat(3, 1fr); }
+}

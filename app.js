@@ -994,6 +994,254 @@ function customerFinancialSummary(customer, stats) {
 }
 
 /* ---------------------------------------------------------------------- */
+/* LOYALTY V2 — Reward Recommendation Engine (added 2026-08-24)            */
+/* ---------------------------------------------------------------------- */
+// Turns the three loyalty dimensions into a concrete, ready-to-act-on recommendation for
+// every "choice_reward" / "owner_appreciation_review" milestone, so the owner never has to
+// manually calculate or interpret a reward. Two reward paths are always presented as roughly
+// EQUIVALENT in value, never identical in day-count across customers:
+//   1. Premium Ride on Us — a temporary taste of Forza 300 / XMAX 300, 1 day by default.
+//   2. Extra Days on Us   — more days on the customer's OWN usual/appropriate bike, with the
+//      day count (1-3) calculated so its value roughly matches the Premium Ride option.
+// A third "Equivalent Appreciation Gift" path stays available but always secondary/owner-
+// selected, never the default. Every THB figure here reads from DB.data.meta.dailyValues
+// (Settings-editable — see dailyValueFor), so nothing about vehicle pricing is hardcoded;
+// the day-count/value-band heuristics themselves follow the same "business rule table, not a
+// Settings field" precedent already set by JOURNEY_GIFT_THRESHOLDS / QUALIFIED_RENTAL_THRESHOLDS.
+
+// Friendly display names for the fine-grained Ride Upgrade categories (dailyValueFor's keys)
+// -- matches the naming the owner actually uses day to day, distinct from the internal keys.
+const CATEGORY_DISPLAY_NAME = {
+  "125cc": "125cc",
+  "Aerox Standard Key 155cc": "Aerox Standard 155",
+  "NMAX White Standard Key 155cc": "NMAX Standard 155",
+  "Aerox Keyless/ABS 155cc": "Aerox Keyless 155",
+  "NMAX Keyless/ABS 155cc": "NMAX Keyless",
+  "Forza 300": "Forza 300",
+  "XMAX 300": "XMAX 300",
+};
+function categoryDisplayName(cat) { return CATEGORY_DISPLAY_NAME[cat] || cat || "their usual bike"; }
+
+// Baseline Extra Days recommended on the customer's OWN bike so its value lands close to one
+// Premium Ride day (Forza/XMAX average) -- cheaper bikes need more free days for an
+// equivalent appreciation value, pricier bikes need fewer. A "boosted" loyalty-strength
+// customer (see isLoyaltyBoosted below) gets +1 day above this baseline, capped at 3 --
+// except Forza/XMAX, already the top of the fleet, which stay at 1 (an owner-approved
+// Equivalent Appreciation Gift is the right lever for an exceptional Forza/XMAX rider, not an
+// ever-growing day count on the bike they already ride).
+const DEFAULT_EXTRA_DAY_BASELINE = {
+  "125cc": 2,
+  "Aerox Standard Key 155cc": 2,
+  "NMAX White Standard Key 155cc": 2,
+  "Aerox Keyless/ABS 155cc": 1,
+  "NMAX Keyless/ABS 155cc": 1,
+  "Forza 300": 1,
+  "XMAX 300": 1,
+};
+function extraDayBaselineFor(category) { return DEFAULT_EXTRA_DAY_BASELINE[category] ?? 2; }
+
+// Internal recommendation-value bands, one per loyalty-strength level -- guidance ranges
+// only, never a cashback calculation and never a percentage of Lifetime Revenue (that would
+// let a handful of very high-spend but low-loyalty bookings outrank someone who genuinely
+// keeps coming back, the opposite of what this program is for).
+const REWARD_STRENGTH_BANDS = [
+  { id: "returning", label: "Returning Loyalty", valueRange: [300, 500] },
+  { id: "strong", label: "Strong Loyalty", valueRange: [500, 700] },
+  { id: "aa_family", label: "AA Family", valueRange: [600, 900] },
+  { id: "exceptional", label: "Exceptional Loyalty", valueRange: [900, 1200] },
+];
+function rewardStrengthBand(id) { return REWARD_STRENGTH_BANDS.find((b) => b.id === id) || REWARD_STRENGTH_BANDS[0]; }
+
+// Which milestone unlocked this choice/review reward maps to a baseline loyalty-strength
+// level -- the milestone thresholds already encode "AA Family" vs "Exceptional" in
+// DEFAULT_LOYALTY_LADDERS above (visits_5, lifetime_180, stay_180 are the three "AA Family"-
+// equivalent choice_reward rungs; lifetime_365 is the sole "Exceptional Loyalty"
+// owner_appreciation_review rung), so this reuses that judgment instead of re-deriving it a
+// second, possibly inconsistent way. An entry with no qualifying milestone (a spontaneous
+// owner manual grant) starts at the lightest "Returning Loyalty" band -- the owner can always
+// adjust anything before recording, see loyaltyOwnerOverrideRecommendation below.
+function loyaltyStrengthBaseIdFor(entry) {
+  if (entry.qualifyingMilestone === "lifetime_365") return "exceptional";
+  if (entry.qualifyingMilestone === "visits_5" || entry.qualifyingMilestone === "lifetime_180" || entry.qualifyingMilestone === "stay_180") return "aa_family";
+  if (entry.qualifyingMilestone === "lifetime_90") return "strong";
+  return "returning";
+}
+// "Boosted" = this customer clearly exceeds the qualifying threshold on at least one
+// dimension, not just barely meeting it -- e.g. 7 genuine visits and 229 lifetime paid days
+// is meaningfully more loyal than someone who just crossed the 5-visit / 180-day line.
+// Boosted customers get +1 Extra Day (never +1 Premium Ride day -- that stays gated to the
+// "exceptional" milestone itself, see computeChoiceRewardRecommendation) and their reward
+// value leans toward the upper half of their band. This is what makes two AA Family
+// customers legitimately receive a different number of days -- never an arbitrary choice.
+function isLoyaltyBoosted(dims) {
+  return dims.genuineVisits >= 7 || dims.lifetimePaidDays >= 220 || dims.longestContinuousStayDays >= 220;
+}
+function loyaltyRewardStrengthFor(entry, dims) {
+  const baseId = loyaltyStrengthBaseIdFor(entry);
+  const boosted = baseId !== "returning" && isLoyaltyBoosted(dims);
+  const band = rewardStrengthBand(baseId);
+  const reasonParts = [];
+  if (dims.genuineVisits > 0) reasonParts.push(`${dims.genuineVisits} genuine visit${dims.genuineVisits === 1 ? "" : "s"}`);
+  if (dims.lifetimePaidDays > 0) reasonParts.push(`${dims.lifetimePaidDays} lifetime paid day${dims.lifetimePaidDays === 1 ? "" : "s"}`);
+  if (entry.program === "continuousStay" && dims.longestContinuousStayDays > 0) reasonParts.push(`${dims.longestContinuousStayDays} continuous days`);
+  return {
+    id: baseId,
+    displayLabel: (boosted ? "High " : "") + band.label,
+    boosted,
+    valueRange: boosted ? [Math.round((band.valueRange[0] + band.valueRange[1]) / 2), band.valueRange[1]] : band.valueRange,
+    reasonParts,
+  };
+}
+
+// The category this customer normally/most-recently rides -- what "Extra Days on Us" and the
+// existing-rate-benefit comparison are both anchored to. Prefers their CURRENT active rental,
+// then their most recent rental by start date, so it always reflects the bike they'd actually
+// recognize as "their usual bike" rather than an average across a possibly-mixed history.
+function usualBikeCategoryFor(customer, stats) {
+  if (stats.current) return rideUpgradeCategory(stats.current);
+  const sorted = (stats.rentals || []).slice().sort((a, b) => (a.startDate < b.startDate ? 1 : a.startDate > b.startDate ? -1 : 0));
+  if (sorted.length) return rideUpgradeCategory(sorted[0]);
+  return "Aerox Standard Key 155cc"; // safe generic default -- only reached for a customer with zero rentals on file
+}
+
+// Reports an existing long-term/preferential pricing benefit ONLY when a reliable actual
+// CONTRACTED rate (a real agreed rate for a specific rental period -- e.g. a quoted monthly
+// rate) and a directly comparable STANDARD rate for that same period and bike category are
+// both on file. This must NEVER be estimated by dividing Lifetime Revenue by Lifetime Paid
+// Days and comparing that average against the standard DAILY rate -- that arithmetic conflates
+// short bookings, gaps, discounts, and refunds into a fake "rate" that has no relationship to
+// any rate the customer actually agreed to, and reliably produces wildly wrong percentages.
+// This app currently has no field anywhere that stores an actual contracted rate for a
+// customer/period (only lifetime totals), so today this always reports "not enough data" --
+// that's correct and expected, not a bug. If a real contracted-rate field is ever added to the
+// data model, wire it in here explicitly; do not fall back to the revenue/days estimate.
+function customerRateBenefit(stats, usualCategory) {
+  const standardRate = dailyValueFor(usualCategory);
+  const contractedRate = null; // no reliable actual contracted rate is tracked in this app yet
+  const contractedRatePeriod = null;
+  let benefitPercent = 0;
+  const hasBenefit = false;
+  const note = "Not enough comparable rate data";
+  return { standardRate, actualRate: contractedRate, contractedRate, contractedRatePeriod, benefitPercent, hasBenefit, note };
+}
+
+// The full recommendation for one choice/review ledger entry, flattened directly into the
+// same field names attachRewardRecommendationSnapshot writes onto the entry -- this exact
+// object is what gets frozen the moment a milestone is first reached (or an owner manual
+// grant is created), so a later Settings change, ladder edit, Manager Sync, or Full Refresh
+// can never silently rewrite an already-shown or already-recorded recommendation (see
+// ensureLoyaltyLedgerEntries's own "never regenerate an existing row" rule, which this piggy-
+// backs on exactly).
+function computeChoiceRewardRecommendation(customer, stats, dims, entry) {
+  const usualCategory = usualBikeCategoryFor(customer, stats);
+  const usualCategoryLabel = categoryDisplayName(usualCategory);
+  const rate = customerRateBenefit(stats, usualCategory);
+  const strength = loyaltyRewardStrengthFor(entry, dims);
+  const isTopTier = usualCategory === "Forza 300" || usualCategory === "XMAX 300";
+
+  const premiumBikes = premiumRideOnUsOptions(); // ["Forza 300", "XMAX 300"]
+  const premiumBikeValues = premiumBikes.map((b) => dailyValueFor(b));
+  // Two Premium Ride Days is exceptional-loyalty-only AND always needs explicit owner
+  // approval before it's offered -- Premium Ride stays a temporary experience, never a
+  // backdoor permanent upgrade to the customer's normal rate/category.
+  const premiumDays = strength.id === "exceptional" ? 2 : 1;
+  const premiumRequiresApproval = premiumDays > 1;
+  const premiumValueMin = Math.min(...premiumBikeValues) * premiumDays;
+  const premiumValueMax = Math.max(...premiumBikeValues) * premiumDays;
+
+  let extraDays = extraDayBaselineFor(usualCategory);
+  if (strength.boosted && !isTopTier) extraDays = Math.min(extraDays + 1, 3);
+  extraDays = Math.max(1, Math.min(3, extraDays));
+  const extraDayValue = dailyValueFor(usualCategory) * extraDays;
+
+  const whyDaysParts = [`${strength.displayLabel} loyalty based on ${strength.reasonParts.length ? strength.reasonParts.join(" and ") : entry.milestoneLabel}.`];
+  if (rate.hasBenefit) whyDaysParts.push("Existing preferential rental pricing was considered.");
+  whyDaysParts.push(`${extraDays} ${usualCategoryLabel} day${extraDays === 1 ? "" : "s"} provides an appropriate equivalent appreciation value versus the Premium Ride option.`);
+
+  const calculationReason = [
+    `Earned because: ${strength.reasonParts.length ? strength.reasonParts.join(", ") : entry.milestoneLabel}.`,
+    `Reward level: ${strength.displayLabel}.`,
+    `Recommended reward value: approximately THB ${strength.valueRange[0]} to ${strength.valueRange[1]}.`,
+    `Usual bike: ${usualCategoryLabel}.`,
+    `Existing pricing benefit: ${rate.note}`,
+    `Recommended: ${premiumDays} Premium Ride Day${premiumDays === 1 ? "" : "s"} (${premiumBikes.join(" or ")}) OR ${extraDays} ${usualCategoryLabel} Extra Day${extraDays === 1 ? "" : "s"}.`,
+  ].join("\n");
+
+  return {
+    usualBikeCategory: usualCategory,
+    loyaltyLevelAtReward: strength.displayLabel,
+    standardRate: rate.standardRate,
+    actualCustomerRate: rate.actualRate,
+    existingRateBenefitPercent: rate.benefitPercent,
+    recommendedRewardValue: `THB ${strength.valueRange[0]} to ${strength.valueRange[1]}`,
+    recommendedPremiumBike: premiumBikes.join(" or "),
+    recommendedPremiumDays: premiumDays,
+    recommendedPremiumValueLabel: premiumValueMin === premiumValueMax ? `THB ${premiumValueMin}` : `THB ${premiumValueMin} to ${premiumValueMax}`,
+    recommendedPremiumRequiresApproval: premiumRequiresApproval,
+    recommendedExtraDayBike: usualCategoryLabel,
+    recommendedExtraDays: extraDays,
+    recommendedExtraDaysValueLabel: `THB ${extraDayValue}`,
+    whyDaysExplanation: whyDaysParts.join(" "),
+    calculationReason,
+  };
+}
+
+// Idempotently fills in the REPORTING snapshot fields on one ledger entry -- called once, the
+// moment an entry is first created (ensureLoyaltyLedgerEntries / loyaltyOwnerGrantManual), and
+// again as a one-time backfill for any older entry that predates this feature (see the
+// backfill loop inside ensureLoyaltyLedgerEntries). Never overwrites a field that's already
+// been recorded, so it can never silently alter an already-decided/already-recorded reward.
+// Returns true if it changed anything (the caller uses this to decide whether to save+sync).
+function attachRewardRecommendationSnapshot(entry, customer, stats, dims) {
+  let changed = false;
+  if (entry.genuineVisitsAtReward === undefined) { entry.genuineVisitsAtReward = dims.genuineVisits; changed = true; }
+  if (entry.lifetimePaidDaysAtReward === undefined) { entry.lifetimePaidDaysAtReward = dims.lifetimePaidDays; changed = true; }
+  if (entry.continuousStayDaysAtReward === undefined) { entry.continuousStayDaysAtReward = dims.longestContinuousStayDays; changed = true; }
+  if (entry.lifetimeRevenueAtReward === undefined) { entry.lifetimeRevenueAtReward = stats.lifetimeRevenueTotal; changed = true; }
+  if (entry.usedDate === undefined) { entry.usedDate = null; changed = true; }
+  if (entry.recommendationOverridden === undefined) { entry.recommendationOverridden = false; changed = true; }
+  if (entry.recommendationOverrideNote === undefined) { entry.recommendationOverrideNote = ""; changed = true; }
+  if (entry.ownerSelectedReward === undefined) { entry.ownerSelectedReward = entry.selectedChoice || null; changed = true; }
+  if ((entry.rewardType === "choice_reward" || entry.rewardType === "owner_appreciation_review") && !entry.calculationReason) {
+    Object.assign(entry, computeChoiceRewardRecommendation(customer, stats, dims, entry));
+    changed = true;
+  }
+  return changed;
+}
+
+// Owner override — adjusts the recommended bike/day-count/value BEFORE the owner records a
+// choice. Never touches genuine visits / paid days / continuous stay (the underlying facts),
+// only the recommendation offered on top of them. Always logged to the audit trail.
+function loyaltyOwnerOverrideRecommendation(entitlementId, overrides, performedBy, reason) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  if (!before) return;
+  const prevSnapshot = {
+    recommendedPremiumDays: before.recommendedPremiumDays, recommendedExtraDayBike: before.recommendedExtraDayBike,
+    recommendedExtraDays: before.recommendedExtraDays, recommendedRewardValue: before.recommendedRewardValue,
+  };
+  const ok = withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    if (overrides.premiumDays) {
+      entry.recommendedPremiumDays = overrides.premiumDays;
+      entry.recommendedPremiumRequiresApproval = overrides.premiumDays > 1;
+      const vals = premiumRideOnUsOptions().map(dailyValueFor);
+      const min = Math.min(...vals) * overrides.premiumDays, max = Math.max(...vals) * overrides.premiumDays;
+      entry.recommendedPremiumValueLabel = min === max ? `THB ${min}` : `THB ${min} to ${max}`;
+    }
+    if (overrides.extraDayCategory) { entry.usualBikeCategory = overrides.extraDayCategory; entry.recommendedExtraDayBike = categoryDisplayName(overrides.extraDayCategory); }
+    if (overrides.extraDays) entry.recommendedExtraDays = overrides.extraDays;
+    if (overrides.extraDayCategory || overrides.extraDays) entry.recommendedExtraDaysValueLabel = `THB ${dailyValueFor(entry.usualBikeCategory) * entry.recommendedExtraDays}`;
+    entry.recommendationOverridden = true;
+    entry.recommendationOverrideNote = reason || "";
+  });
+  if (ok) {
+    appendAuditRecord(before.customerCanonicalId, "owner_override",
+      [{ field: "recommendation", previousValue: prevSnapshot, newValue: overrides }], performedBy, reason, entitlementId);
+  }
+}
+
+/* ---------------------------------------------------------------------- */
 /* DATA AUDIT (PHASE 1) — strictly READ-ONLY. Compares each customer's     */
 /* CURRENTLY STORED rentals (whatever is already in this browser's         */
 /* localStorage, loaded into DB.data) against CANONICAL rentals — the      */
@@ -3287,6 +3535,12 @@ function ensureLoyaltyLedgerEntries(customer, stats, dims) {
       const entitlementId = loyaltyEntitlementId(customer.id, program, rung.id);
       if (findLoyaltyLedgerEntry(entitlementId)) return; // already exists — never regenerate/overwrite
       const isChoice = rung.rewardType === "choice_reward";
+      // Owner-approval-required rewards (currently just lifetime_365 "Exceptional Loyalty")
+      // now get the SAME Premium Ride / Extra Days / Appreciation Gift cards as a normal
+      // choice reward -- the Premium Ride card itself carries the "Requires Owner Approval"
+      // badge for its 2-day recommendation (see computeChoiceRewardRecommendation), which IS
+      // the owner-review/approval step, rather than a separate dead-end status with no action
+      // available at all.
       const isReview = rung.rewardType === "owner_appreciation_review";
       const entry = {
         id: uid("led"), entitlementId,
@@ -3304,7 +3558,7 @@ function ensureLoyaltyLedgerEntries(customer, stats, dims) {
         continuousRentalDays: program === "continuousStay" ? dims.longestContinuousStayDays : null,
         automaticEligibility: true,
         ownerOverride: null, overrideReason: null,
-        availableChoices: isChoice ? CHOICE_REWARD_OPTIONS.slice() : [],
+        availableChoices: (isChoice || isReview) ? CHOICE_REWARD_OPTIONS.slice() : [],
         selectedChoice: null, selectionDate: null,
         quantity: rung.quantity || null,
         status: (rung.rewardType === null || rung.rewardType === "recognition") ? "recognition" : isReview ? "review_needed" : isChoice ? "pending_choice" : "ready",
@@ -3312,6 +3566,7 @@ function ensureLoyaltyLedgerEntries(customer, stats, dims) {
         source: program === "genuineVisits" ? "returning_customer_milestone" : program === "continuousStay" ? "long_term_appreciation" : "lifetime_paid_days_ladder",
         createdAt: nowISO, updatedAt: nowISO,
       };
+      attachRewardRecommendationSnapshot(entry, customer, stats, dims);
       DB.data.loyaltyLedger.push(entry);
       changed = true;
       appendAuditRecord(customer.id, "system_milestone_reached",
@@ -3319,6 +3574,10 @@ function ensureLoyaltyLedgerEntries(customer, stats, dims) {
         "system", "Milestone reached automatically: " + entry.milestoneLabel, entitlementId);
     });
   });
+  // One-time backfill for any older entry (created before the recommendation engine existed)
+  // that's still missing its REPORTING snapshot fields — never touches an entry that already
+  // has them, so an already-recorded/already-shown reward is never altered.
+  loyaltyLedgerFor(customer.id).forEach((entry) => { if (attachRewardRecommendationSnapshot(entry, customer, stats, dims)) changed = true; });
   if (changed) { DB.save(); syncLoyaltyLedgerToCloud(); }
   return loyaltyLedgerFor(customer.id);
 }
@@ -3440,7 +3699,7 @@ function pullLoyaltyAuditLogFromCloud() {
 const AUDIT_ACTION_LABELS = {
   manual_grant: "Manual Grant", grant_early: "Grant Early", change_reward: "Reward Changed",
   change_quantity: "Quantity Changed", select_alternative: "Reward Selected", mark_given: "Marked Given",
-  mark_redeemed: "Marked Redeemed", decline_skip: "Skipped / Declined", owner_override: "Owner Override",
+  mark_redeemed: "Marked Redeemed", mark_used: "Marked Used (customer rode it)", decline_skip: "Skipped / Declined", owner_override: "Owner Override",
   owner_note_edit: "Note Updated", correction_of_status: "Corrected / Undone", manual_backtrack: "Manual Backtrack",
   system_milestone_reached: "Milestone Reached (automatic)", backup_created: "Backup Created", backup_restored: "Backup Restored",
 };
@@ -3606,6 +3865,8 @@ function loyaltyOwnerGrantManual(customer, program, ladderId, note, isEarly, per
   // qualified — the owner's decision, clearly labeled, not a recalculated fact.
   const entitlementId = loyaltyEntitlementId(customer.id, program, ladderId);
   const existedBefore = !!findLoyaltyLedgerEntry(entitlementId);
+  const stats = customerStats(customer);
+  const dims = computeLoyaltyDimensions(customer, stats);
   const ok = withAtomicLedgerUpdate(() => {
     let entry = findLoyaltyLedgerEntry(entitlementId);
     const ladder = loyaltyLadders()[program] || [];
@@ -3628,6 +3889,7 @@ function loyaltyOwnerGrantManual(customer, program, ladderId, note, isEarly, per
         givenDate: null, grantedBy: performedBy || "owner", ownerNote: note || "",
         source: "owner_manual_appreciation", createdAt: nowISO, updatedAt: nowISO,
       };
+      attachRewardRecommendationSnapshot(entry, customer, stats, dims);
       DB.data.loyaltyLedger.push(entry);
     } else {
       entry.ownerOverride = isEarly ? "grant_early" : "manual_grant";
@@ -3649,6 +3911,7 @@ function loyaltyOwnerSelectChoice(entitlementId, choice, grantedBy, reason) {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
     entry.selectedChoice = choice;
+    entry.ownerSelectedReward = choice;
     entry.selectionDate = todayISO();
     entry.status = "selected";
     entry.grantedBy = grantedBy || entry.grantedBy || "owner";
@@ -3659,17 +3922,56 @@ function loyaltyOwnerSelectChoice(entitlementId, choice, grantedBy, reason) {
       grantedBy, reason, entitlementId);
   }
 }
+// Clears a recorded choice back to a pending state — used by "Change Choice" on the
+// redesigned reward cards, so the owner can re-pick from Premium Ride / Extra Days /
+// Appreciation Gift without going through Undo (which is for reverting a GIVEN reward, a
+// different action). The frozen recommendation numbers (bike/days/value) are left untouched —
+// only which one was picked resets.
+function loyaltyOwnerClearChoice(entitlementId, performedBy) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  if (!before) return;
+  const prevChoice = before.selectedChoice;
+  const ok = withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    entry.selectedChoice = null;
+    entry.ownerSelectedReward = null;
+    entry.selectionDate = null;
+    entry.status = entry.rewardType === "owner_appreciation_review" ? "review_needed" : "pending_choice";
+  });
+  if (ok) {
+    appendAuditRecord(before.customerCanonicalId, "change_reward",
+      [{ field: "selectedChoice", previousValue: prevChoice, newValue: null }], performedBy, "Cleared for re-selection", entitlementId);
+  }
+}
+// Premium Ride on Us is a "keep on standby until actually used" entitlement (see PREMIUM RIDE
+// RULES) — being given/selected is a separate fact from the customer actually riding it.
+// usedDate is the ONLY thing this touches; status/givenDate are untouched, so an unavailable
+// bike never has to be marked used or expired just to move the entry along.
+function loyaltyOwnerMarkUsed(entitlementId, performedBy) {
+  const before = findLoyaltyLedgerEntry(entitlementId);
+  if (!before) return;
+  const ok = withAtomicLedgerUpdate(() => {
+    const entry = findLoyaltyLedgerEntry(entitlementId);
+    if (!entry) throw new Error("Entitlement not found");
+    entry.usedDate = todayISO();
+  });
+  if (ok) {
+    appendAuditRecord(before.customerCanonicalId, "mark_used",
+      [{ field: "usedDate", previousValue: null, newValue: todayISO() }], performedBy, "", entitlementId);
+  }
+}
 function loyaltyOwnerMarkGiven(entitlementId, performedBy) {
   const before = findLoyaltyLedgerEntry(entitlementId);
   const prevStatus = before ? before.status : null;
   const ok = withAtomicLedgerUpdate(() => {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
-    entry.status = entry.rewardType === "choice_reward" ? "redeemed" : "given";
+    entry.status = (entry.rewardType === "choice_reward" || entry.rewardType === "owner_appreciation_review") ? "redeemed" : "given";
     entry.givenDate = todayISO();
   });
   if (ok) {
-    const newStatus = before.rewardType === "choice_reward" ? "redeemed" : "given";
+    const newStatus = (before.rewardType === "choice_reward" || before.rewardType === "owner_appreciation_review") ? "redeemed" : "given";
     appendAuditRecord(before.customerCanonicalId, newStatus === "redeemed" ? "mark_redeemed" : "mark_given",
       [{ field: "status", previousValue: prevStatus, newValue: newStatus }, { field: "givenDate", previousValue: null, newValue: todayISO() }],
       performedBy, "", entitlementId);
@@ -3682,7 +3984,7 @@ function loyaltyOwnerUndo(entitlementId, performedBy, reason) {
   const ok = withAtomicLedgerUpdate(() => {
     const entry = findLoyaltyLedgerEntry(entitlementId);
     if (!entry) throw new Error("Entitlement not found");
-    entry.status = entry.selectedChoice ? "selected" : entry.rewardType === "choice_reward" ? "pending_choice" : entry.rewardType === null ? "recognition" : "ready";
+    entry.status = entry.selectedChoice ? "selected" : entry.rewardType === "choice_reward" ? "pending_choice" : entry.rewardType === "owner_appreciation_review" ? "review_needed" : entry.rewardType === null ? "recognition" : "ready";
     entry.givenDate = null;
   });
   if (ok) {
@@ -4945,8 +5247,27 @@ const CUSTOMER_MESSAGE_TEMPLATES = {
     (n) => `Hey ${n}! This one isn't from any automatic reward or promotion. We just wanted to do something nice for you ❤️ We've really appreciated having you with us, so there's a little thank you waiting for you.`,
   ],
 };
+// Choice/review rewards get a dynamic message built from THIS customer's exact recommended
+// bike(s) and day count — never a generic template — following the AA voice rules: warm,
+// natural, short, no technical calculations, no Lifetime Revenue, no corporate language, no
+// dash characters, plain-English, 0-2 simple emoji. Several independent phrasings so
+// "Regenerate" gives a genuinely different version each time, but every version always
+// presents BOTH options and lets the customer choose, matching how the cards themselves work.
+function choiceRewardMessageVariants(entry) {
+  const premiumDays = entry.recommendedPremiumDays || 1;
+  const extraDays = entry.recommendedExtraDays || 1;
+  const premiumBike = entry.recommendedPremiumBike || "Forza 300 or XMAX 300";
+  const extraBike = entry.recommendedExtraDayBike || "your usual bike";
+  const premiumPhrase = `${premiumDays} day${premiumDays > 1 ? "s" : ""} on a ${premiumBike}`;
+  const extraPhrase = `${extraDays} extra day${extraDays > 1 ? "s" : ""} on your usual ${extraBike}`;
+  return [
+    (n) => `Hi ${n} 😊 We have a little loyalty thank you waiting for you. You've been riding with AA for quite a while now, so this time we'd love to let you choose one treat from us. You can enjoy ${premiumPhrase} when one is available, or take ${extraPhrase}. Just let us know which one you'd enjoy more ❤️`,
+    (n) => `Hey ${n}! A small thank you from all of us at AA 😊 You've earned a treat, and this time you get to pick. Choose between ${premiumPhrase}, subject to availability, or ${extraPhrase} instead if that suits you better. Whichever you'd like, just let us know ✨`,
+    (n) => `Hi ${n}, we wanted to do something nice for you 😊 As a thank you for sticking with AA, you can pick between ${premiumPhrase}, or ${extraPhrase}. Take your time deciding, no rush at all, and just let us know when you're ready ❤️`,
+  ];
+}
 function customerMessageKindFor(entry) {
-  if (entry.selectedChoice === "premium_ride_on_us") return "premium_ride_on_us";
+  if ((entry.rewardType === "choice_reward" || entry.rewardType === "owner_appreciation_review") && entry.recommendedPremiumBike) return "aa_loyalty_choice_reward";
   if (entry.ownerOverride === "manual_grant" && !entry.program) return "owner_manual";
   if (entry.program === "lifetimeDays") return entry.rewardType === "choice_reward" ? "lifetime_choice" : "lifetime_extra_day";
   if (entry.program === "genuineVisits") return entry.rewardType === "choice_reward" ? "genuine_visit_choice" : "genuine_visit_extra_day";
@@ -4955,14 +5276,28 @@ function customerMessageKindFor(entry) {
 }
 function generateCustomerMessage(entry, customer, variantIndex) {
   const kind = customerMessageKindFor(entry);
+  const name = firstNameOf(customer.name) || customer.name;
+  if (kind === "aa_loyalty_choice_reward") {
+    const templates = choiceRewardMessageVariants(entry);
+    const idx = ((variantIndex || 0) % templates.length + templates.length) % templates.length;
+    return templates[idx](name);
+  }
   const templates = CUSTOMER_MESSAGE_TEMPLATES[kind] || CUSTOMER_MESSAGE_TEMPLATES.owner_manual;
   const idx = ((variantIndex || 0) % templates.length + templates.length) % templates.length;
-  return templates[idx](firstNameOf(customer.name) || customer.name);
+  return templates[idx](name);
 }
 
 /* ---------------------------------------------------------------------- */
 /* LOYALTY V2 — Loyalty Summary render                                     */
 /* ---------------------------------------------------------------------- */
+// Human-readable "what was actually selected" for reports/CSV — the exact bike and day count
+// for this specific customer when available (choice/review entries), falling back to the
+// generic option label otherwise.
+function loyaltySelectedRewardSummary(entry) {
+  if (entry.selectedChoice === "premium_ride_on_us" && entry.recommendedPremiumBike) return `${entry.recommendedPremiumBike}, ${entry.recommendedPremiumDays} day(s)`;
+  if (entry.selectedChoice === "extra_day_on_us" && entry.recommendedExtraDayBike) return `${entry.recommendedExtraDays} ${entry.recommendedExtraDayBike} day(s)`;
+  return CHOICE_REWARD_OPTION_LABELS[entry.selectedChoice] || entry.selectedChoice;
+}
 function loyaltyLedgerStatusDisplay(entry) {
   if (entry.status === "given" || entry.status === "redeemed") return { emoji: "✅", text: entry.status === "redeemed" ? "Redeemed" : "Given", cls: "given" };
   if (entry.status === "declined") return { emoji: "—", text: "Declined", cls: "not-yet" };
@@ -4974,21 +5309,132 @@ function loyaltyLedgerStatusDisplay(entry) {
   return { emoji: "🎁", text: "Ready", cls: "eligible" };
 }
 
+// The redesigned "why + choose one reward + why this many days" block for a choice_reward /
+// owner_appreciation_review entry — everything here reads directly off the entry's own
+// FROZEN recommended*/*AtReward fields (see attachRewardRecommendationSnapshot), never
+// recomputed at render time, so what the owner sees while deciding is exactly what gets
+// recorded, and a later Settings/ladder change can never move the numbers under them.
+function renderChoiceRewardCards(customer, entry) {
+  const isDecided = entry.status === "selected" || entry.status === "given" || entry.status === "redeemed" || entry.status === "manual";
+  const isDeclined = entry.status === "declined";
+  const showChooser = !isDecided && !isDeclined;
+
+  const whyEarnedItems = [
+    `${entry.genuineVisitsAtReward ?? 0} Genuine Visits`,
+    `${entry.lifetimePaidDaysAtReward ?? 0} Lifetime Paid Days`,
+  ];
+  if (entry.continuousStayDaysAtReward) whyEarnedItems.push(`${entry.continuousStayDaysAtReward} days Longest Continuous Stay`);
+  whyEarnedItems.push(`Lifetime Revenue: ${fmtMoney(entry.lifetimeRevenueAtReward || 0)}`);
+  // Never trust entry.existingRateBenefitPercent directly here -- older ledger entries can
+  // still carry a pre-fix frozen value (computed by the since-corrected Lifetime Revenue /
+  // Lifetime Paid Days estimate in customerRateBenefit, which produced wildly wrong numbers
+  // like "71%"). attachRewardRecommendationSnapshot deliberately never rewrites an existing
+  // entry's frozen recommendation fields, so a legacy bad value would otherwise display
+  // forever. Recompute fresh with the corrected logic at render time instead -- this only
+  // changes what's DISPLAYED, it never mutates the stored entry or any historical decision.
+  const rateBenefit = customerRateBenefit(null, entry.usualBikeCategory);
+  if (rateBenefit.hasBenefit) whyEarnedItems.push(`Existing long-term pricing benefit: about ${rateBenefit.benefitPercent}% below the standard rate`);
+
+  // The frozen calculationReason narrative (see computeChoiceRewardRecommendation) embeds its
+  // own "Existing pricing benefit: ..." line built from the SAME rate.note this entry was
+  // created with -- a legacy entry can carry a pre-fix note here too (e.g. one that spelled
+  // out the old bad percentage). Swap just that one line for the freshly-computed note,
+  // same rationale as rateBenefit above: fix what's shown, never rewrite what's stored.
+  const calculationReasonDisplay = (entry.calculationReason || "").replace(/^Existing pricing benefit:.*$/m, `Existing pricing benefit: ${rateBenefit.note}`);
+
+  // Same fix-what's-shown-never-rewrite-what's-stored rationale as calculationReasonDisplay
+  // above, applied to the frozen "Why N days?" sentence: a legacy entry created before
+  // customerRateBenefit was corrected can still carry "Existing preferential rental pricing
+  // was considered." even though no reliable comparable rate data actually backs that claim.
+  // Strip that clause whenever the freshly-computed rateBenefit says there's no reliable
+  // benefit data on file -- never mention preferential/existing pricing without it.
+  const whyDaysExplanationDisplay = rateBenefit.hasBenefit
+    ? (entry.whyDaysExplanation || "")
+    : (entry.whyDaysExplanation || "").replace(/\s*Existing preferential rental pricing was considered\.\s*/g, " ").replace(/\s{2,}/g, " ").trim();
+
+  const premiumDays = entry.recommendedPremiumDays || 1;
+  const extraDays = entry.recommendedExtraDays || 1;
+  const approvalBadge = entry.recommendedPremiumRequiresApproval ? `<span class="pill pill-amber">Requires Owner Approval</span>` : "";
+
+  const cardsHtml = `
+    <div class="reward-recommend-cards">
+      <div class="reward-recommend-card">
+        <div class="reward-recommend-card-title">Premium Ride on Us</div>
+        <div class="reward-recommend-card-bike">${escapeHtml(entry.recommendedPremiumBike || "")}</div>
+        <div class="reward-recommend-card-days">${premiumDays} DAY${premiumDays > 1 ? "S" : ""}</div>
+        <div class="reward-recommend-card-value">Approx reward value: ${escapeHtml(entry.recommendedPremiumValueLabel || "")}</div>
+        <div class="reward-recommend-card-note muted">Subject to availability</div>
+        ${approvalBadge}
+        ${showChooser ? `<button class="btn btn-orange btn-sm btn-block" data-action="v2-choose-premium" data-eid="${entry.entitlementId}">Choose Premium Ride</button>` : ""}
+      </div>
+      <div class="reward-recommend-card">
+        <div class="reward-recommend-card-title">Extra Days on Us</div>
+        <div class="reward-recommend-card-bike">${escapeHtml(entry.recommendedExtraDayBike || "")}</div>
+        <div class="reward-recommend-card-days">${extraDays} FREE DAY${extraDays > 1 ? "S" : ""}</div>
+        <div class="reward-recommend-card-value">Approx reward value: ${escapeHtml(entry.recommendedExtraDaysValueLabel || "")}</div>
+        <div class="reward-recommend-card-why muted"><b>Why ${extraDays} day${extraDays > 1 ? "s" : ""}?</b> ${escapeHtml(whyDaysExplanationDisplay)}</div>
+        ${showChooser ? `<button class="btn btn-orange btn-sm btn-block" data-action="v2-choose-extra" data-eid="${entry.entitlementId}">Choose ${extraDays} Extra Day${extraDays > 1 ? "s" : ""}</button>` : ""}
+      </div>
+      <div class="reward-recommend-card reward-recommend-card-secondary">
+        <div class="reward-recommend-card-title">Equivalent Appreciation Gift</div>
+        <div class="reward-recommend-card-value">Approx reward value: ${escapeHtml(entry.recommendedRewardValue || "")}</div>
+        <div class="reward-recommend-card-note muted">Owner-selected — use when neither bike option fits.</div>
+        ${showChooser ? `<button class="btn btn-outline btn-sm btn-block" data-action="v2-choose-appreciation" data-eid="${entry.entitlementId}">Choose Other Appreciation</button>` : ""}
+      </div>
+    </div>
+  `;
+
+  const selectedLabel = entry.selectedChoice === "premium_ride_on_us"
+    ? `${entry.recommendedPremiumBike}, ${premiumDays} day${premiumDays > 1 ? "s" : ""}`
+    : entry.selectedChoice === "extra_day_on_us"
+      ? `${extraDays} ${entry.recommendedExtraDayBike} day${extraDays > 1 ? "s" : ""}`
+      : entry.selectedChoice === "appreciation_gift" ? "Equivalent Appreciation Gift" : null;
+  const selectedSummary = selectedLabel ? `
+    <div class="reward-row-v2-reason" style="margin-top:8px;">
+      <b>Selected:</b> ${escapeHtml(selectedLabel)} (${fmtDate(entry.selectionDate)})
+      ${entry.selectedChoice === "premium_ride_on_us" ? (entry.usedDate ? ` · Used ${fmtDate(entry.usedDate)}` : ` · Subject to availability — kept on standby until used`) : ""}
+    </div>
+  ` : "";
+
+  return `
+    <div class="reward-why-earned">
+      <div class="reward-why-earned-title">Why this customer earned it</div>
+      <ul class="reward-why-earned-list">${whyEarnedItems.map((l) => `<li>${escapeHtml(l)}</li>`).join("")}</ul>
+    </div>
+    ${showChooser ? `<div class="reward-choose-one-label">Choose one reward</div>` : ""}
+    ${cardsHtml}
+    ${selectedSummary}
+    ${showChooser ? `<button class="link-btn" data-action="v2-edit-recommendation" data-eid="${entry.entitlementId}" style="font-size:11.5px;margin-top:6px;">Adjust recommendation before recording</button>` : ""}
+    ${entry.recommendationOverridden ? `<div class="loyalty-override-tag">Owner adjusted the recommendation${entry.recommendationOverrideNote ? " — " + escapeHtml(entry.recommendationOverrideNote) : ""}</div>` : ""}
+    <details class="reward-why-details">
+      <summary>Why this reward?</summary>
+      <div class="reward-why-body">${escapeHtml(calculationReasonDisplay).replace(/\n/g, "<br/>")}</div>
+    </details>
+  `;
+}
+
 function renderLoyaltyLedgerEntryCard(customer, entry) {
   const status = loyaltyLedgerStatusDisplay(entry);
   const pillClass = status.cls === "given" ? "pill-green" : status.cls === "not-yet" ? "pill-neutral" : "pill-orange";
-  const panelId = "led-" + entry.id;
-  const draft = state.messageDrafts[entry.entitlementId];
+  const isChoiceStyle = entry.rewardType === "choice_reward" || entry.rewardType === "owner_appreciation_review";
 
   let actionHtml = "";
-  if (entry.status === "given" || entry.status === "redeemed" || entry.status === "declined") {
+  if (isChoiceStyle) {
+    if (entry.status === "given" || entry.status === "redeemed" || entry.status === "declined") {
+      actionHtml = `<button class="btn btn-ghost btn-sm" data-action="v2-undo" data-eid="${entry.entitlementId}">Undo / Correct</button>`;
+    } else if (entry.status === "selected" || entry.status === "manual") {
+      actionHtml += `<button class="btn btn-orange btn-sm" data-action="v2-mark-given" data-eid="${entry.entitlementId}">Mark Given</button>`;
+      if (entry.selectedChoice === "premium_ride_on_us" && !entry.usedDate) actionHtml += `<button class="btn btn-outline btn-sm" data-action="v2-mark-used" data-eid="${entry.entitlementId}">Mark Used</button>`;
+      if (entry.status === "selected") actionHtml += `<button class="btn btn-ghost btn-sm" data-action="v2-clear-choice" data-eid="${entry.entitlementId}">Change Choice</button>`;
+      actionHtml += `<button class="btn btn-ghost btn-sm" data-action="v2-skip" data-eid="${entry.entitlementId}">Skip / Decline</button>`;
+    } else if (entry.status === "pending_choice" || entry.status === "review_needed") {
+      actionHtml += `<button class="btn btn-ghost btn-sm" data-action="v2-skip" data-eid="${entry.entitlementId}">Skip / Decline</button>`;
+    }
+  } else if (entry.status === "given" || entry.status === "redeemed" || entry.status === "declined") {
     actionHtml = `<button class="btn btn-ghost btn-sm" data-action="v2-undo" data-eid="${entry.entitlementId}">Undo / Correct</button>`;
   } else {
-    if (entry.status === "pending_choice") {
-      actionHtml += CHOICE_REWARD_OPTIONS.map((opt) => `<button class="btn btn-outline btn-sm" data-action="v2-select-choice" data-eid="${entry.entitlementId}" data-choice="${opt}">${escapeHtml(CHOICE_REWARD_OPTION_LABELS[opt].split(" (")[0])}</button>`).join("");
-    } else if (entry.status === "ready" || entry.status === "manual" || entry.status === "selected") {
+    if (entry.status === "ready" || entry.status === "manual") {
       actionHtml += `<button class="btn btn-orange btn-sm" data-action="v2-mark-given" data-eid="${entry.entitlementId}">Mark Given</button>`;
-      if (entry.status === "selected") actionHtml += `<button class="btn btn-ghost btn-sm" data-action="v2-select-choice" data-eid="${entry.entitlementId}" data-choice="">Change Choice</button>`;
     }
     if (entry.status !== "recognition" && entry.status !== "review_needed") {
       actionHtml += `<button class="btn btn-ghost btn-sm" data-action="v2-skip" data-eid="${entry.entitlementId}">Skip / Decline</button>`;
@@ -5007,8 +5453,8 @@ function renderLoyaltyLedgerEntryCard(customer, entry) {
           </div>
           <div class="reward-row-v2-reason">${escapeHtml(entry.qualificationReason)}</div>
           ${entry.program === "continuousStay" && entry.continuousRentalStartDate ? `<div class="reward-row-v2-reason muted">Continuous rental start: ${fmtDate(entry.continuousRentalStartDate)} · ${entry.continuousRentalDays} continuous days · threshold ${entry.qualificationThreshold}</div>` : ""}
-          ${entry.availableChoices && entry.availableChoices.length ? `<div class="reward-row-v2-reason muted">Available choices: ${entry.availableChoices.map((o) => escapeHtml(CHOICE_REWARD_OPTION_LABELS[o])).join(" · ")}</div>` : ""}
-          ${entry.selectedChoice ? `<div class="reward-row-v2-reason"><b>Selected:</b> ${escapeHtml(CHOICE_REWARD_OPTION_LABELS[entry.selectedChoice] || entry.selectedChoice)} (${fmtDate(entry.selectionDate)})</div>` : ""}
+          ${isChoiceStyle ? renderChoiceRewardCards(customer, entry) : ""}
+          ${!isChoiceStyle && entry.selectedChoice ? `<div class="reward-row-v2-reason"><b>Selected:</b> ${escapeHtml(CHOICE_REWARD_OPTION_LABELS[entry.selectedChoice] || entry.selectedChoice)} (${fmtDate(entry.selectionDate)})</div>` : ""}
           ${entry.quantity ? `<div class="reward-row-v2-reason muted">Quantity: ${entry.quantity}</div>` : ""}
           ${entry.ownerOverride ? `<div class="loyalty-override-tag">Owner Override — ${escapeHtml(entry.overrideReason || entry.ownerOverride)}</div>` : ""}
           ${entry.ownerNote ? `<div class="reward-note">Owner note: ${escapeHtml(entry.ownerNote)}</div>` : ""}
@@ -5524,7 +5970,7 @@ function renderLoyaltyLedgerReportScreen() {
       rewardsGiven: given.length,
       manualGrants: manual.length,
       ownerOverrides: overrides.length,
-      selectedRewards: selected.map((e) => `${e.milestoneLabel}: ${CHOICE_REWARD_OPTION_LABELS[e.selectedChoice] || e.selectedChoice}`).join(" | "),
+      selectedRewards: selected.map((e) => `${e.milestoneLabel}: ${loyaltySelectedRewardSummary(e)}`).join(" | "),
       qualificationReasons: ledger.map((e) => e.qualificationReason).join(" | "),
       ownerNotes: ledger.filter((e) => e.ownerNote).map((e) => e.ownerNote).join(" | "),
     };
@@ -5580,7 +6026,7 @@ function exportLoyaltyReportCsv() {
       c.name, c.id, dims.genuineVisits, dims.currentContinuousStayDays, dims.longestContinuousStayDays, dims.lifetimePaidDays,
       ledger.map((e) => e.milestoneLabel).join(" | "), nextByProgram.map((n) => n.label).join(" | "),
       ready.length, given.length, manual.length, overrides.length,
-      selected.map((e) => `${e.milestoneLabel}: ${e.selectedChoice}`).join(" | "),
+      selected.map((e) => `${e.milestoneLabel}: ${loyaltySelectedRewardSummary(e)}`).join(" | "),
       ledger.map((e) => e.qualificationReason).join(" | "),
       ledger.filter((e) => e.ownerNote).map((e) => e.ownerNote).join(" | "),
     ];
@@ -8239,23 +8685,38 @@ function wireLoyaltyV2Events() {
       confirmSheet("Undo this and return it to its previous status?", () => { loyaltyOwnerUndo(el.dataset.eid); toast("Reverted"); render(); }, "Undo");
     });
   });
-  document.querySelectorAll('[data-action="v2-select-choice"]').forEach((el) => {
+  document.querySelectorAll('[data-action="v2-choose-premium"]').forEach((el) => {
     el.addEventListener("click", () => {
       const eid = el.dataset.eid;
-      const choice = el.dataset.choice;
-      if (choice) { loyaltyOwnerSelectChoice(eid, choice); toast("Choice selected"); render(); return; }
-      openSheet(`
-        <div class="sheet-title">Choose the reward</div>
-        <div class="sheet-sub">Selecting one consumes this milestone's entitlement — the customer can't receive more than one from the same milestone.</div>
-        <div class="btn-row" style="flex-direction:column;gap:8px;margin-top:14px;">
-          ${CHOICE_REWARD_OPTIONS.map((opt) => `<button class="btn btn-outline btn-block" data-pick="${opt}">${escapeHtml(CHOICE_REWARD_OPTION_LABELS[opt])}</button>`).join("")}
-        </div>
-      `);
-      document.querySelectorAll("[data-pick]").forEach((btn) => btn.addEventListener("click", () => {
-        loyaltyOwnerSelectChoice(eid, btn.dataset.pick);
-        closeSheet(); toast("Choice selected"); render();
-      }));
+      const entry = findLoyaltyLedgerEntry(eid);
+      const msg = entry && entry.recommendedPremiumRequiresApproval
+        ? `This recommends ${entry.recommendedPremiumDays} Premium Ride Days — exceptional loyalty, requires your approval. Record Premium Ride on Us for this customer?`
+        : "Record Premium Ride on Us for this customer?";
+      confirmSheet(msg, () => { loyaltyOwnerSelectChoice(eid, "premium_ride_on_us"); toast("Premium Ride selected"); render(); }, "Choose Premium Ride");
     });
+  });
+  document.querySelectorAll('[data-action="v2-choose-extra"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const eid = el.dataset.eid;
+      confirmSheet("Record Extra Days on Us for this customer?", () => { loyaltyOwnerSelectChoice(eid, "extra_day_on_us"); toast("Extra Days selected"); render(); }, "Choose Extra Days");
+    });
+  });
+  document.querySelectorAll('[data-action="v2-choose-appreciation"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      const eid = el.dataset.eid;
+      confirmSheet("Record an Equivalent Appreciation Gift for this customer? You can note what it was under Add Owner Note.", () => { loyaltyOwnerSelectChoice(eid, "appreciation_gift"); toast("Appreciation gift selected"); render(); }, "Choose Appreciation");
+    });
+  });
+  document.querySelectorAll('[data-action="v2-clear-choice"]').forEach((el) => {
+    el.addEventListener("click", () => { loyaltyOwnerClearChoice(el.dataset.eid); toast("Choice cleared — pick again"); render(); });
+  });
+  document.querySelectorAll('[data-action="v2-mark-used"]').forEach((el) => {
+    el.addEventListener("click", () => {
+      confirmSheet("Mark this Premium Ride as actually used by the customer?", () => { loyaltyOwnerMarkUsed(el.dataset.eid); toast("Marked used"); render(); }, "Mark Used");
+    });
+  });
+  document.querySelectorAll('[data-action="v2-edit-recommendation"]').forEach((el) => {
+    el.addEventListener("click", () => openRecommendationOverrideSheet(el.dataset.eid));
   });
   document.querySelectorAll('[data-action="v2-skip"]').forEach((el) => {
     el.addEventListener("click", () => {
@@ -8338,6 +8799,40 @@ function wireLoyaltyV2Events() {
       }
       renderMessageGuideSheet(eid, customer, entry);
     });
+  });
+}
+
+// Owner manual override — lets the owner adjust the recommended Extra Days bike/day-count and
+// Premium Ride day-count BEFORE recording a choice (requirement 9: owner always has final say
+// over the auto-calculated recommendation). Never touches genuine visits / paid days /
+// continuous stay — only what's being offered on top of them.
+function openRecommendationOverrideSheet(eid) {
+  const entry = findLoyaltyLedgerEntry(eid);
+  if (!entry) return;
+  const categories = Object.keys(DEFAULT_DAILY_VALUES);
+  openSheet(`
+    <div class="sheet-title">Adjust Recommendation</div>
+    <div class="sheet-sub">Owner override — change the bike or day count before recording. This never changes the customer's actual visit/day history, only what's being offered.</div>
+    <div class="field">
+      <label>Extra Days — bike category</label>
+      <select id="ov-extra-cat">${categories.map((c) => `<option value="${escapeHtml(c)}" ${c === entry.usualBikeCategory ? "selected" : ""}>${escapeHtml(categoryDisplayName(c))}</option>`).join("")}</select>
+    </div>
+    <div class="field"><label>Extra Days — number of days (1-3)</label><input type="number" min="1" max="3" id="ov-extra-days" value="${entry.recommendedExtraDays || 1}" /></div>
+    <div class="field"><label>Premium Ride — number of days (1-2, 2 requires approval)</label><input type="number" min="1" max="2" id="ov-premium-days" value="${entry.recommendedPremiumDays || 1}" /></div>
+    <textarea id="ov-note" class="sheet-textarea" placeholder="Reason for adjusting (optional)" style="margin-top:4px;"></textarea>
+    <div class="btn-row" style="margin-top:14px;">
+      <button class="btn btn-outline btn-block" id="ov-cancel">Cancel</button>
+      <button class="btn btn-primary btn-block" id="ov-save">Save</button>
+    </div>
+  `);
+  document.getElementById("ov-cancel").addEventListener("click", closeSheet);
+  document.getElementById("ov-save").addEventListener("click", () => {
+    const extraDayCategory = document.getElementById("ov-extra-cat").value;
+    const extraDays = Math.max(1, Math.min(3, Number(document.getElementById("ov-extra-days").value) || entry.recommendedExtraDays || 1));
+    const premiumDays = Math.max(1, Math.min(2, Number(document.getElementById("ov-premium-days").value) || entry.recommendedPremiumDays || 1));
+    const note = document.getElementById("ov-note").value;
+    loyaltyOwnerOverrideRecommendation(eid, { extraDayCategory, extraDays, premiumDays }, "owner", note);
+    closeSheet(); toast("Recommendation updated"); render();
   });
 }
 
