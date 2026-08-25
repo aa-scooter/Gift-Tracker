@@ -119,6 +119,16 @@ const LOYALTY_AUDIT_API_URL = "/api/loyalty-audit";
 // backup is its OWN Drive file (loyalty_backup_<timestamp>.json, see api/loyalty-backup.js),
 // never updated once written, so an older backup can never be silently lost by a newer one.
 const LOYALTY_BACKUP_API_URL = "/api/loyalty-backup";
+// Vehicle Renewal cloud sync — added 2026-08-25 so a Tax/Por Ror Bor edit made on one device
+// (e.g. iPhone) is visible on every other device (e.g. MacBook), same same-origin pattern as
+// the loyalty syncs above, backed by its own vehicle_renewal_current.json file in the same
+// Drive folder (see api/vehicle-renewal.js). Completely separate from every loyalty_*.json
+// file — never read or written by any loyalty sync, and vice versa.
+const VEHICLE_RENEWAL_API_URL = "/api/vehicle-renewal";
+// Read-only listing/inspection of the automatic, timestamped, never-overwritten Vehicle
+// Renewal backups api/vehicle-renewal.js creates before every overwrite (see api/vehicle-
+// renewal-backup.js). Kept in its own screen, never mixed with Loyalty Backups.
+const VEHICLE_RENEWAL_BACKUP_API_URL = "/api/vehicle-renewal-backup";
 
 // Premium Ride Experience / VIP Extra Day both use the same cycle mechanic: 180+ cumulative
 // PAID days (an active rental counts in full — no requirement to return first) since the
@@ -395,6 +405,11 @@ const DB = {
     if (!this.data.meta.vipThresholds) this.data.meta.vipThresholds = JSON.parse(JSON.stringify(DEFAULT_VIP_THRESHOLDS));
     if (!this.data.meta.healthThresholds) this.data.meta.healthThresholds = Object.assign({}, DEFAULT_HEALTH_THRESHOLDS);
     if (!this.data.meta.loyaltyLadders) this.data.meta.loyaltyLadders = JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS));
+    // Vehicle Renewal cloud sync bookkeeping — the last cloud updatedAt/updatedBy this device
+    // actually saw, used both to show sync status and as the optimistic-concurrency
+    // baseUpdatedAt on the next save (see api/vehicle-renewal.js). null/null means this device
+    // has never successfully synced with the cloud yet.
+    if (!this.data.meta.vehicleRenewalSync) this.data.meta.vehicleRenewalSync = { cloudUpdatedAt: null, cloudUpdatedBy: null };
     if (!this.data.customers) this.data.customers = [];
     if (!this.data.rentals) this.data.rentals = [];
     if (!this.data.vehicles) this.data.vehicles = [];
@@ -415,6 +430,10 @@ const DB = {
       if (v.modelYear === undefined) v.modelYear = "";
       if (v.taxOverduePending === undefined) v.taxOverduePending = false;
       if (v.renewalNote === undefined) v.renewalNote = "";
+      // Cloud sync fields — added 2026-08-25. null means "never edited/synced since this field
+      // existed", which is fine; the next successful cloud save stamps a real value.
+      if (v.updatedAt === undefined) v.updatedAt = null;
+      if (v.updatedBy === undefined) v.updatedBy = null;
     });
     if (!this.data.rewards) this.data.rewards = [];
     if (!this.data.needsReview) this.data.needsReview = [];
@@ -503,7 +522,7 @@ const DB = {
       // customers can be credited for qualifying past bookings rather than being treated
       // as ineligible purely for having rented before the app existed. Adjust in Settings
       // if you'd rather the program only apply going forward.
-      meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)) },
+      meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)), vehicleRenewalSync: { cloudUpdatedAt: null, cloudUpdatedBy: null } },
       customers, rentals, vehicles, rewards, needsReview, loyaltyLedger: [], loyaltyAuditLog: [],
     };
   },
@@ -513,6 +532,11 @@ const DB = {
     const parsed = JSON.parse(json);
     this.data = parsed;
     this.save();
+    // An older export (or one from before Vehicle Renewal cloud sync existed) may be missing
+    // meta.vehicleRenewalSync or the per-vehicle updatedAt/updatedBy fields — re-run load()'s
+    // migration safety net so this session never crashes reading them, exactly as a fresh page
+    // load with this same localStorage content would.
+    this.load();
   },
   wipe() {
     // loyaltyAuditLog is intentionally included here even though "Reset all data" is a
@@ -520,7 +544,7 @@ const DB = {
     // must survive — omitting it would leave DB.data.loyaltyAuditLog undefined until the next
     // full page load, and the very next ensureLoyaltyLedgerEntries() call (opening any
     // customer profile right after wiping) would crash trying to .push() onto it.
-    this.data = { meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)) }, customers: [], rentals: [], vehicles: [], rewards: [], needsReview: [], loyaltyLedger: [], loyaltyAuditLog: [] };
+    this.data = { meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)), vehicleRenewalSync: { cloudUpdatedAt: null, cloudUpdatedBy: null } }, customers: [], rentals: [], vehicles: [], rewards: [], needsReview: [], loyaltyLedger: [], loyaltyAuditLog: [] };
     this.save();
   },
 };
@@ -4453,7 +4477,16 @@ const state = { route: "home", customerId: null, vehicleId: null, search: "", ex
   // LOYALTY V2 — Persistent Backup + Audit History UI state.
   loyaltyBackupsStatus: "idle", loyaltyBackupsList: [], loyaltyBackupsError: null,
   loyaltyBackupCreateStatus: "idle", loyaltyBackupCreateError: null,
-  loyaltyRestoreStatus: "idle", loyaltyRestoreError: null, loyaltyRestorePreview: null };
+  loyaltyRestoreStatus: "idle", loyaltyRestoreError: null, loyaltyRestorePreview: null,
+  // Vehicle Renewal cloud sync UI state.
+  vehicleSyncStatus: "idle", // idle | loading | synced | offline | error
+  vehicleSyncError: null,
+  vehicleMigrationStatus: "idle", // idle | prompt | seeding | done | error
+  vehicleMigrationError: null,
+  vehicleSaveStatus: "idle", // idle | saving | error | conflict
+  vehicleSaveError: null,
+  vehicleBackupsStatus: "idle", vehicleBackupsList: [], vehicleBackupsError: null,
+  vehicleRestoreStatus: "idle", vehicleRestoreError: null };
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -6288,7 +6321,413 @@ function wireLoyaltyBackupEvents() {
   });
 }
 
+/* ---------------------------------------------------------------------- */
+/* VEHICLE RENEWAL — cloud sync (shared state across devices)              */
+/* ---------------------------------------------------------------------- */
+// Added 2026-08-25. Cloud (vehicle_renewal_current.json, via api/vehicle-renewal.js) is the
+// source of truth. DB.data.vehicles / localStorage (DB.save()) is only ever a cache/fallback:
+// a successful pull fully replaces it with the cloud copy; a successful save updates it only
+// AFTER the server confirms; if the cloud is unreachable, whatever was last cached keeps
+// displaying, clearly marked offline. Completely separate from every loyalty_*.json sync above
+// — never reads or writes any of those files, and vice versa.
+
+function vehicleSyncPayload(vehicles, reason) {
+  return {
+    vehicles,
+    baseUpdatedAt: DB.data.meta.vehicleRenewalSync.cloudUpdatedAt,
+    updatedBy: "owner",
+    reason: reason || "Vehicle Renewal save",
+  };
+}
+
+// Pulls the shared cloud state and makes it the source of truth on this device. Triggered once
+// per session the first time Vehicle Renewal is opened (see the lazy "idle" checks in
+// renderVehiclesList/renderVehicleDetail below) and again any time "Refresh from Cloud" is
+// pressed.
+function pullVehicleRenewalFromCloud() {
+  state.vehicleSyncStatus = "loading";
+  render();
+  return fetch(VEHICLE_RENEWAL_API_URL)
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Cloud fetch failed: " + r.status))))
+    .then((data) => {
+      if (!data.exists) {
+        // No cloud state yet. Offer an explicit migration seed ONLY if this device already has
+        // vehicles worth preserving, and only ever as an owner-confirmed action — never automatic.
+        DB.data.meta.vehicleRenewalSync.cloudUpdatedAt = null;
+        DB.data.meta.vehicleRenewalSync.cloudUpdatedBy = null;
+        if (DB.data.vehicles.length && state.vehicleMigrationStatus === "idle") state.vehicleMigrationStatus = "prompt";
+        state.vehicleSyncStatus = "synced"; // cloud answered — it's just empty, not unreachable
+        state.vehicleSyncError = null;
+        render();
+        return data;
+      }
+      state.vehicleMigrationStatus = "done";
+      DB.data.vehicles = data.vehicles;
+      DB.data.meta.vehicleRenewalSync.cloudUpdatedAt = data.updatedAt;
+      DB.data.meta.vehicleRenewalSync.cloudUpdatedBy = data.updatedBy;
+      DB.save();
+      state.vehicleSyncStatus = "synced";
+      state.vehicleSyncError = null;
+      render();
+      return data;
+    })
+    .catch((err) => {
+      // Cloud unreachable — keep showing whatever's cached, just mark it clearly as
+      // offline/cached rather than silently pretending it's live.
+      state.vehicleSyncStatus = "offline";
+      state.vehicleSyncError = String((err && err.message) || err);
+      render();
+    });
+}
+
+// Explicit, owner-confirmed one-time seed: this device's current vehicles become the cloud's
+// initial state. Only reachable when the cloud has no vehicle_renewal_current.json yet — the
+// server itself also refuses to let this silently overwrite an existing cloud file (a truthy
+// baseUpdatedAt is required once a file exists, see api/vehicle-renewal.js).
+function seedVehicleRenewalCloud() {
+  state.vehicleMigrationStatus = "seeding";
+  state.vehicleMigrationError = null;
+  render();
+  return fetch(VEHICLE_RENEWAL_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ vehicles: DB.data.vehicles, baseUpdatedAt: null, updatedBy: "owner", reason: "Migration — seed cloud from existing device data" }),
+  })
+    .then((r) => (r.ok ? r.json() : r.json().catch(() => ({})).then((d) => Promise.reject(new Error((d && d.error) || ("Seed failed: " + r.status))))))
+    .then((data) => {
+      DB.data.vehicles = data.vehicles;
+      DB.data.meta.vehicleRenewalSync.cloudUpdatedAt = data.updatedAt;
+      DB.data.meta.vehicleRenewalSync.cloudUpdatedBy = data.updatedBy;
+      DB.save();
+      state.vehicleMigrationStatus = "done";
+      state.vehicleSyncStatus = "synced";
+      toast("Cloud seeded with this device's " + data.vehicles.length + " vehicle(s)");
+      render();
+    })
+    .catch((err) => {
+      state.vehicleMigrationStatus = "error";
+      state.vehicleMigrationError = String((err && err.message) || err);
+      render();
+    });
+}
+
+// The single choke point every Vehicle Renewal edit (add vehicle, edit vehicle, renew Tax/Por
+// Ror Bor, restore from backup) saves through. Only marks the save successful, and only updates
+// the local cache (DB.save()), after the server confirms — a failed or conflicting save leaves
+// DB.data.vehicles exactly as the caller left it (the edit stays visible) and never touches
+// localStorage, so an edit is never silently lost.
+function saveVehiclesToCloud(vehicles, reason) {
+  state.vehicleSaveStatus = "saving";
+  state.vehicleSaveError = null;
+  render();
+  return fetch(VEHICLE_RENEWAL_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(vehicleSyncPayload(vehicles, reason)),
+  })
+    .then((r) => {
+      if (r.status === 409) return r.json().then((data) => { throw Object.assign(new Error("conflict"), { conflict: true, current: data.current }); });
+      if (!r.ok) return r.json().catch(() => ({})).then((data) => { throw new Error((data && data.error) || ("Save failed: " + r.status)); });
+      return r.json();
+    })
+    .then((data) => {
+      DB.data.vehicles = data.vehicles;
+      DB.data.meta.vehicleRenewalSync.cloudUpdatedAt = data.updatedAt;
+      DB.data.meta.vehicleRenewalSync.cloudUpdatedBy = data.updatedBy;
+      DB.save();
+      state.vehicleSaveStatus = "idle";
+      state.vehicleSyncStatus = "synced";
+      return data;
+    })
+    .catch((err) => {
+      if (err && err.conflict) {
+        state.vehicleSaveStatus = "conflict";
+        state.vehicleSaveError = "This vehicle was updated from another device since you last refreshed. Refresh from Cloud, then redo your change.";
+      } else {
+        state.vehicleSaveStatus = "error";
+        state.vehicleSaveError = String((err && err.message) || err);
+      }
+      render();
+      throw err;
+    });
+}
+
+// Wires a sheet's Save button to go through the cloud save pipeline. `validateAndMutate` runs
+// exactly once (on the first click) — it validates the form, mutates DB.data.vehicles in place,
+// and returns false (after its own toast()) if invalid, or true to proceed. Every click after
+// that (a retry after a failed/conflicting save) re-attempts the same already-applied mutation
+// rather than re-running validateAndMutate, so a retry can never double-apply a change (e.g.
+// double-push a renewal-history entry). On conflict, offers "Close & Refresh from Cloud"
+// instead of a blind retry, since a conflicting save must never silently overwrite what another
+// device wrote.
+function wireVehicleSaveButton(buttonId, statusElId, validateAndMutate, reason, successToast, onSuccess) {
+  const btn = document.getElementById(buttonId);
+  if (!btn) return;
+  let applied = false;
+  btn.addEventListener("click", () => {
+    if (!applied) {
+      if (validateAndMutate() === false) return;
+      applied = true;
+    }
+    const statusEl = document.getElementById(statusElId);
+    if (statusEl) statusEl.innerHTML = "";
+    btn.disabled = true;
+    btn.textContent = "Saving…";
+    saveVehiclesToCloud(DB.data.vehicles, reason)
+      .then(() => {
+        closeSheet();
+        toast(successToast);
+        if (onSuccess) onSuccess(); else render();
+      })
+      .catch(() => {
+        btn.disabled = false;
+        btn.textContent = "Retry Save";
+        if (statusEl) {
+          statusEl.innerHTML = `<p style="color:#c0392b;font-size:12.5px;margin:8px 0 0;">${escapeHtml(state.vehicleSaveError || "Save failed.")}</p>` +
+            (state.vehicleSaveStatus === "conflict" ? `<button class="btn btn-outline btn-sm" style="margin-top:8px;" id="${statusElId}-refresh">Close &amp; Refresh from Cloud</button>` : "");
+          const refreshBtn = document.getElementById(`${statusElId}-refresh`);
+          if (refreshBtn) refreshBtn.addEventListener("click", () => { closeSheet(); pullVehicleRenewalFromCloud(); });
+        }
+      });
+  });
+}
+
+// Small status line shown at the top of Vehicle Renewal — "Cloud synced ✓ / Last updated: …",
+// "Unsaved changes", or "Offline / cached data", per the cross-device sync spec.
+function vehicleSyncStatusLine() {
+  if (state.vehicleSaveStatus === "conflict") return { text: "⚠ Unsaved changes — newer data on cloud", cls: "err" };
+  if (state.vehicleSaveStatus === "error") return { text: "⚠ Unsaved changes — save failed", cls: "err" };
+  if (state.vehicleSaveStatus === "saving") return { text: "Saving to cloud…", cls: "muted" };
+  if (state.vehicleSyncStatus === "loading") return { text: "Syncing…", cls: "muted" };
+  if (state.vehicleSyncStatus === "offline") return { text: "Offline / cached data", cls: "err" };
+  if (state.vehicleSyncStatus === "synced") {
+    const ts = fmtDateTimeLabel(DB.data.meta.vehicleRenewalSync.cloudUpdatedAt);
+    return { text: "Cloud synced ✓" + (ts ? " · Last updated: " + ts : " · no cloud data yet"), cls: "ok" };
+  }
+  return { text: "Not yet synced", cls: "muted" };
+}
+
+function renderVehicleSyncBanner() {
+  const line = vehicleSyncStatusLine();
+  const color = line.cls === "err" ? "#c0392b" : line.cls === "ok" ? "#2e7d32" : "var(--text-secondary)";
+  const migrationPrompt = state.vehicleMigrationStatus === "prompt" ? `
+    <div class="card" style="margin-top:10px; margin-bottom:0;">
+      <p class="muted" style="margin-bottom:10px;">This device has ${DB.data.vehicles.length} vehicle(s) saved locally, but no shared cloud copy exists yet. Seed the cloud with this device's data so every device sees the same Vehicle Renewal data from now on?</p>
+      <div class="btn-row">
+        <button class="btn btn-primary btn-sm" id="vr-seed-cloud">Seed Cloud From This Device</button>
+        <button class="btn btn-outline btn-sm" id="vr-dismiss-migration">Not Now</button>
+      </div>
+    </div>
+  ` : state.vehicleMigrationStatus === "seeding" ? `<p class="muted" style="margin-top:8px;">Seeding cloud…</p>`
+    : state.vehicleMigrationStatus === "error" ? `<p style="margin-top:8px;color:#c0392b;">${escapeHtml(state.vehicleMigrationError || "Seeding failed.")}</p>` : "";
+  const conflictNote = state.vehicleSaveStatus === "conflict" ? `<p style="margin-top:6px;font-size:12.5px;color:#c0392b;">${escapeHtml(state.vehicleSaveError || "")}</p>` : "";
+  return `
+    <div class="card" style="margin-bottom:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <span style="font-weight:600;font-size:13px;color:${color};">${escapeHtml(line.text)}</span>
+        <div class="btn-row" style="margin:0;">
+          <button class="btn btn-outline btn-sm" id="vr-refresh-cloud" ${state.vehicleSyncStatus === "loading" ? "disabled" : ""}>Refresh from Cloud</button>
+          <button class="btn btn-ghost btn-sm" data-goto="vehicle-backups">Backups</button>
+        </div>
+      </div>
+      ${conflictNote}
+      ${migrationPrompt}
+    </div>
+  `;
+}
+
+function wireVehicleSyncEvents() {
+  const refreshBtn = document.getElementById("vr-refresh-cloud");
+  if (refreshBtn) refreshBtn.addEventListener("click", () => pullVehicleRenewalFromCloud());
+  const seedBtn = document.getElementById("vr-seed-cloud");
+  if (seedBtn) seedBtn.addEventListener("click", () => seedVehicleRenewalCloud());
+  const dismissBtn = document.getElementById("vr-dismiss-migration");
+  if (dismissBtn) dismissBtn.addEventListener("click", () => { state.vehicleMigrationStatus = "done"; render(); });
+}
+
+/* ---------------------------------------------------------------------- */
+/* VEHICLE RENEWAL — Backups (own screen, never mixed with Loyalty Backups) */
+/* ---------------------------------------------------------------------- */
+// Read-only here by design: every backup already gets created automatically, server-side,
+// right before api/vehicle-renewal.js overwrites vehicle_renewal_current.json (including for a
+// restore itself — see restoreVehicleBackup below) — see that file's header for why. This
+// screen only lists, inspects, and restores what already exists.
+
+function listVehicleBackups() {
+  return fetch(VEHICLE_RENEWAL_BACKUP_API_URL)
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("List backups failed: " + r.status))))
+    .then((data) => (data && Array.isArray(data.backups) ? data.backups : []));
+}
+function fetchVehicleBackup(id) {
+  return fetch(VEHICLE_RENEWAL_BACKUP_API_URL + "?id=" + encodeURIComponent(id))
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("Fetch backup failed: " + r.status))));
+}
+function vehicleBackupsListRefresh() {
+  state.vehicleBackupsStatus = "loading";
+  render();
+  listVehicleBackups()
+    .then((backups) => { state.vehicleBackupsList = backups; state.vehicleBackupsStatus = "loaded"; render(); })
+    .catch((err) => { state.vehicleBackupsError = String((err && err.message) || err); state.vehicleBackupsStatus = "error"; render(); });
+}
+
+function renderVehicleBackupsScreen() {
+  if (state.vehicleBackupsStatus === "idle") { state.vehicleBackupsStatus = "loading"; setTimeout(vehicleBackupsListRefresh, 0); }
+  const backups = state.vehicleBackupsList || [];
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="vehicles">‹ Vehicle Renewal</button>
+      <h1 class="screen-title" style="margin-top:8px;">Vehicle Renewal Backups</h1>
+      <p class="screen-sub">Every save creates a new, timestamped, never-overwritten snapshot — completely separate from Loyalty Backups.</p>
+    </header>
+    <div class="screen-body">
+      <div class="card" style="margin-bottom:14px;">
+        <div class="btn-row"><button class="btn btn-outline btn-sm" id="vr-backups-refresh">Refresh List</button></div>
+      </div>
+      ${state.vehicleBackupsStatus === "loading" ? `<p class="muted">Loading backups…</p>` : ""}
+      ${state.vehicleBackupsStatus === "error" ? `<p style="color:#c0392b;">${escapeHtml(state.vehicleBackupsError || "Could not load backups.")}</p>` : ""}
+      ${state.vehicleRestoreStatus === "error" ? `<p style="color:#c0392b;margin-bottom:10px;">${escapeHtml(state.vehicleRestoreError || "Restore failed.")}</p>` : ""}
+      ${state.vehicleBackupsStatus === "loaded" ? (
+        backups.length ? `
+          <div class="loyalty-backup-list">
+            ${backups.map((b) => `
+              <div class="card loyalty-backup-row" style="margin-bottom:10px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+                  <div>
+                    <div style="font-weight:600;">${escapeHtml(fmtDateTimeLabel(b.createdAt) || b.filename)}</div>
+                    <div class="muted" style="font-size:10.5px;">${escapeHtml(b.filename)}</div>
+                  </div>
+                  <div class="btn-row" style="margin:0;">
+                    <button class="btn btn-ghost btn-sm" data-action="vr-inspect-backup" data-id="${escapeHtml(b.id)}" data-filename="${escapeHtml(b.filename)}">Inspect</button>
+                    <button class="btn btn-danger btn-sm" data-action="vr-restore-backup" data-id="${escapeHtml(b.id)}" data-filename="${escapeHtml(b.filename)}">Restore…</button>
+                  </div>
+                </div>
+              </div>
+            `).join("")}
+          </div>
+        ` : `<div class="muted">No backups yet — one is created automatically the first time Vehicle Renewal data is saved.</div>`
+      ) : ""}
+    </div>
+  `;
+}
+
+function openVehicleBackupInspectSheet(backupId, backupLabel) {
+  openSheet(`<div class="sheet-title">Backup Details</div><div class="sheet-sub">Loading…</div>`);
+  fetchVehicleBackup(backupId)
+    .then((data) => {
+      const vehicles = (data.snapshot && Array.isArray(data.snapshot.vehicles)) ? data.snapshot.vehicles : [];
+      openSheet(`
+        <div class="sheet-title">Backup Details</div>
+        <div class="sheet-sub">${escapeHtml(fmtDateTimeLabel(data.createdAt) || backupLabel)}</div>
+        <div style="margin-top:10px;">
+          <div style="font-weight:600;margin-bottom:4px;">Reason</div>
+          <div class="muted" style="font-size:12.5px;margin-bottom:10px;">${escapeHtml(data.reason || "—")}${data.performedBy ? " · by " + escapeHtml(data.performedBy) : ""}</div>
+          <div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0;border-bottom:1px solid var(--line);"><span>Vehicles in this snapshot</span><span class="muted">${vehicles.length}</span></div>
+        </div>
+        <div class="btn-row" style="margin-top:16px;">
+          <button class="btn btn-primary btn-block" id="vr-inspect-close">Close</button>
+        </div>
+      `);
+      document.getElementById("vr-inspect-close").addEventListener("click", closeSheet);
+    })
+    .catch((err) => {
+      openSheet(`
+        <div class="sheet-title">Backup Details</div>
+        <div class="sheet-sub" style="color:#c0392b;">Could not load that backup: ${escapeHtml(String((err && err.message) || err))}</div>
+        <div class="btn-row" style="margin-top:14px;"><button class="btn btn-outline btn-block" id="vr-inspect-close-err">Close</button></div>
+      `);
+      document.getElementById("vr-inspect-close-err").addEventListener("click", closeSheet);
+    });
+}
+
+// Same by-id diff shape as buildRestoreDiff() for Loyalty Backups, scoped to just vehicles —
+// never touches customers/rentals/rewards/loyaltyLedger/loyaltyAuditLog.
+function buildVehicleRestoreDiff(backupVehicles) {
+  const currentById = {}; DB.data.vehicles.forEach((v) => { currentById[v.id] = v; });
+  const backupById = {}; (backupVehicles || []).forEach((v) => { backupById[v.id] = v; });
+  const changed = [], added = [], removed = [];
+  Object.keys(backupById).forEach((id) => {
+    const cur = currentById[id];
+    if (!cur) added.push(id);
+    else if (JSON.stringify(cur) !== JSON.stringify(backupById[id])) changed.push(id);
+  });
+  Object.keys(currentById).forEach((id) => { if (!backupById[id]) removed.push(id); });
+  return { changed, added, removed, total: changed.length + added.length + removed.length };
+}
+
+function openVehicleRestorePreviewSheet(backupId, backupLabel) {
+  openSheet(`<div class="sheet-title">Restore Preview</div><div class="sheet-sub">Loading backup…</div>`);
+  fetchVehicleBackup(backupId)
+    .then((data) => {
+      const vehicles = data.snapshot && Array.isArray(data.snapshot.vehicles) ? data.snapshot.vehicles : null;
+      if (!vehicles) throw new Error("Backup has no vehicle data");
+      const diff = buildVehicleRestoreDiff(vehicles);
+      openSheet(`
+        <div class="sheet-title">Restore Preview</div>
+        <div class="sheet-sub">Backup date/time: <b>${escapeHtml(fmtDateTimeLabel(data.createdAt) || backupLabel)}</b>${data.reason ? ` · ${escapeHtml(data.reason)}` : ""}</div>
+        <div class="reward-note" style="margin-top:10px;">A safety backup of the CURRENT Vehicle Renewal state is taken automatically right before anything changes — this restore can itself always be undone.</div>
+        <div style="margin-top:12px;display:flex;justify-content:space-between;font-size:12.5px;padding:4px 0;border-bottom:1px solid var(--line);">
+          <span>Vehicles that would change</span><span class="muted">${diff.changed.length} changed · ${diff.added.length} added back · ${diff.removed.length} would be removed</span>
+        </div>
+        ${diff.total === 0 ? `<p class="muted" style="margin-top:10px;">No differences — current state already matches this backup.</p>` : ""}
+        <div id="vr-restore-status"></div>
+        <div class="btn-row" style="margin-top:16px;">
+          <button class="btn btn-outline btn-block" id="vr-restore-cancel">Cancel</button>
+          <button class="btn btn-danger btn-block" id="vr-restore-confirm" ${diff.total === 0 ? "disabled" : ""}>Confirm Restore</button>
+        </div>
+      `);
+      document.getElementById("vr-restore-cancel").addEventListener("click", closeSheet);
+      const confirmBtn = document.getElementById("vr-restore-confirm");
+      if (confirmBtn) confirmBtn.addEventListener("click", () => {
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Restoring…";
+        restoreVehicleBackup(vehicles, backupLabel)
+          .then(() => { closeSheet(); toast("Vehicle Renewal restored from backup"); render(); })
+          .catch((err) => {
+            confirmBtn.disabled = false;
+            confirmBtn.textContent = "Retry Restore";
+            const statusEl = document.getElementById("vr-restore-status");
+            if (statusEl) statusEl.innerHTML = `<p style="color:#c0392b;font-size:12.5px;margin:8px 0 0;">${escapeHtml(state.vehicleSaveError || String((err && err.message) || err))}</p>`;
+          });
+      });
+    })
+    .catch((err) => {
+      openSheet(`
+        <div class="sheet-title">Restore Preview</div>
+        <div class="sheet-sub" style="color:#c0392b;">Could not load that backup: ${escapeHtml(String((err && err.message) || err))}</div>
+        <div class="btn-row" style="margin-top:14px;"><button class="btn btn-outline btn-block" id="vr-restore-preview-close">Close</button></div>
+      `);
+      document.getElementById("vr-restore-preview-close").addEventListener("click", closeSheet);
+    });
+}
+
+// Restoring is just a normal conflict-checked cloud save of the backup's vehicle list — see
+// saveVehiclesToCloud. That gets it the exact same automatic pre-overwrite backup every other
+// save gets, which for a restore IS the required pre-restore safety backup — no separate code
+// path needed.
+function restoreVehicleBackup(backupVehicles, backupLabel) {
+  return saveVehiclesToCloud(backupVehicles, "Restore Vehicle Renewal backup " + (backupLabel || "")).then((data) => {
+    state.vehicleBackupsStatus = "idle"; // force the list to refresh — the pre-restore safety backup is new
+    state.vehicleRestoreStatus = "done";
+    return data;
+  });
+}
+
+function wireVehicleBackupEvents() {
+  const refreshBtn = document.getElementById("vr-backups-refresh");
+  if (refreshBtn) refreshBtn.addEventListener("click", vehicleBackupsListRefresh);
+  document.querySelectorAll('[data-action="vr-inspect-backup"]').forEach((el) => {
+    el.addEventListener("click", () => openVehicleBackupInspectSheet(el.dataset.id, el.dataset.filename));
+  });
+  document.querySelectorAll('[data-action="vr-restore-backup"]').forEach((el) => {
+    el.addEventListener("click", () => openVehicleRestorePreviewSheet(el.dataset.id, el.dataset.filename));
+  });
+}
+
 function renderVehiclesList() {
+  // Lazy first-load, same pattern as renderLoyaltyBackupsScreen — pull the shared cloud state
+  // once per session the first time Vehicle Renewal is opened; render() runs again once it
+  // arrives (or fails). The explicit "Refresh from Cloud" button re-triggers this any time.
+  if (state.vehicleSyncStatus === "idle") { state.vehicleSyncStatus = "loading"; setTimeout(pullVehicleRenewalFromCloud, 0); }
   const withStatus = DB.data.vehicles.map((v) => ({ v, st: vehicleStatus(v) }));
   const needsAttention = withStatus.filter((x) => x.st.tax.level !== "green" || x.st.prb.level !== "green");
   const allOk = withStatus.filter((x) => x.st.tax.level === "green" && x.st.prb.level === "green");
@@ -6315,6 +6754,7 @@ function renderVehiclesList() {
       <p class="screen-sub">${DB.data.vehicles.length} vehicle(s) tracked</p>
     </header>
     <div class="screen-body">
+      ${renderVehicleSyncBanner()}
       <div class="vehicle-summary-strip">
         <div class="vehicle-summary-tile red">
           <div class="vehicle-summary-count">${expiredCount}</div>
@@ -6358,6 +6798,7 @@ function renderVehiclesList() {
 }
 
 function renderVehicleDetail() {
+  if (state.vehicleSyncStatus === "idle") { state.vehicleSyncStatus = "loading"; setTimeout(pullVehicleRenewalFromCloud, 0); }
   const v = DB.data.vehicles.find((x) => x.id === state.vehicleId);
   if (!v) { navigate("vehicles"); return ""; }
   const st = vehicleStatus(v);
@@ -6375,6 +6816,7 @@ function renderVehicleDetail() {
       <p class="screen-sub mono">${escapeHtml(v.plate)}${v.modelYear ? " · " + escapeHtml(String(v.modelYear)) : ""}</p>
     </header>
     <div class="screen-body">
+      ${renderVehicleSyncBanner()}
 
       <div class="hero-card">
         <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;">
@@ -7928,8 +8370,10 @@ function sheetAddVehicle() {
       <select id="f-status"><option value="active">Active</option><option value="maintenance">In maintenance</option><option value="retired">Retired</option></select>
     </div>
     <button class="btn btn-primary btn-block" id="save-vehicle">Save vehicle</button>
+    <div id="vr-add-status"></div>
   `);
-  document.getElementById("save-vehicle").addEventListener("click", () => {
+  let newVehicleId = null;
+  wireVehicleSaveButton("save-vehicle", "vr-add-status", () => {
     const v = {
       id: uid("v"), bikeName: document.getElementById("f-bikename").value.trim(),
       modelYear: document.getElementById("f-year").value.trim(),
@@ -7941,17 +8385,16 @@ function sheetAddVehicle() {
       currentKm: Number(document.getElementById("f-km").value) || 0,
       nextServiceKm: Number(document.getElementById("f-nextkm").value) || 0,
       status: document.getElementById("f-status").value, notes: "",
+      updatedAt: new Date().toISOString(), updatedBy: "owner",
     };
-    if (!v.bikeName) { toast("Enter a bike name"); return; }
-    if (!v.plate) { toast("Enter a plate number"); return; }
+    if (!v.bikeName) { toast("Enter a bike name"); return false; }
+    if (!v.plate) { toast("Enter a plate number"); return false; }
     const dup = DB.data.vehicles.find((x) => normalizeText(x.plate) === normalizeText(v.plate));
-    if (dup) { toast("That plate number is already in the fleet"); return; }
+    if (dup) { toast("That plate number is already in the fleet"); return false; }
     DB.data.vehicles.push(v);
-    DB.save();
-    closeSheet();
-    toast("Vehicle added");
-    navigate("vehicle", { vehicleId: v.id });
-  });
+    newVehicleId = v.id;
+    return true;
+  }, "Add vehicle", "Vehicle added", () => navigate("vehicle", { vehicleId: newVehicleId }));
 }
 
 function sheetEditVehicle(id) {
@@ -7977,12 +8420,13 @@ function sheetEditVehicle(id) {
     <div class="field"><label>Renewal note / reason</label><input id="f-renewal-note" type="text" value="${escapeHtml(v.renewalNote || "")}" placeholder="e.g. waiting for vehicle inspection (ตรอ.)" /></div>
     <div class="field"><label>Notes</label><textarea id="f-notes" rows="2">${escapeHtml(v.notes || "")}</textarea></div>
     <button class="btn btn-primary btn-block" id="save-vehicle">Save changes</button>
+    <div id="vr-edit-status"></div>
   `);
-  document.getElementById("save-vehicle").addEventListener("click", () => {
+  wireVehicleSaveButton("save-vehicle", "vr-edit-status", () => {
     const newPlate = document.getElementById("f-plate").value.trim();
     const dup = DB.data.vehicles.find((x) => x.id !== v.id && normalizeText(x.plate) === normalizeText(newPlate));
-    if (!newPlate) { toast("Enter a plate number"); return; }
-    if (dup) { toast("That plate number is already used by another vehicle"); return; }
+    if (!newPlate) { toast("Enter a plate number"); return false; }
+    if (dup) { toast("That plate number is already used by another vehicle"); return false; }
     v.bikeName = document.getElementById("f-bikename").value.trim();
     v.modelYear = document.getElementById("f-year").value.trim();
     v.plate = newPlate;
@@ -7991,11 +8435,9 @@ function sheetEditVehicle(id) {
     v.status = document.getElementById("f-status").value;
     v.renewalNote = document.getElementById("f-renewal-note").value.trim();
     v.notes = document.getElementById("f-notes").value.trim();
-    DB.save();
-    closeSheet();
-    toast("Saved");
-    render();
-  });
+    v.updatedAt = new Date().toISOString(); v.updatedBy = "owner";
+    return true;
+  }, "Edit vehicle", "Saved");
 }
 
 // Renewal workflow: editing Tax or Por Ror Bor always goes through here so the previous
@@ -8020,6 +8462,7 @@ function sheetRenewDocument(vehicleId, docType) {
     <div class="field"><label>Renewal note / reason (optional)</label><input id="f-note" type="text" value="${escapeHtml(v.renewalNote || "")}" placeholder="e.g. waiting for vehicle inspection (ตรอ.)" /></div>
     <p class="muted" style="margin-top:-8px;">This only changes ${label}. ${isTax ? "Por Ror Bor" : "Tax"} stays exactly as it is.</p>
     <button class="btn btn-primary btn-block" id="save-renewal">Save ${label}</button>
+    <div id="vr-renewal-status"></div>
   `);
 
   if (isTax) {
@@ -8030,7 +8473,7 @@ function sheetRenewDocument(vehicleId, docType) {
     pendingCheckbox.addEventListener("change", syncDateVisibility);
   }
 
-  document.getElementById("save-renewal").addEventListener("click", () => {
+  wireVehicleSaveButton("save-renewal", "vr-renewal-status", () => {
     const note = document.getElementById("f-note").value.trim();
 
     if (isTax) {
@@ -8045,7 +8488,7 @@ function sheetRenewDocument(vehicleId, docType) {
         v.renewalNote = note;
       } else {
         const newExpiry = document.getElementById("f-new-expiry").value;
-        if (!newExpiry) { toast("Enter a date, or check the pending box"); return; }
+        if (!newExpiry) { toast("Enter a date, or check the pending box"); return false; }
         if (!v.taxHistory) v.taxHistory = [];
         if (v.taxExpiryDate || v.taxOverduePending) v.taxHistory.push({ previousExpiry: previousDisplay, renewedOn: todayISO(), note });
         v.taxExpiryDate = newExpiry;
@@ -8054,16 +8497,14 @@ function sheetRenewDocument(vehicleId, docType) {
       }
     } else {
       const newExpiry = document.getElementById("f-new-expiry").value;
-      if (!newExpiry) { toast("Enter a date"); return; }
+      if (!newExpiry) { toast("Enter a date"); return false; }
       if (!v.porRorBorHistory) v.porRorBorHistory = [];
       if (v.porRorBorExpiryDate) v.porRorBorHistory.push({ previousExpiry: fmtDate(v.porRorBorExpiryDate), renewedOn: todayISO(), note });
       v.porRorBorExpiryDate = newExpiry;
     }
-    DB.save();
-    closeSheet();
-    toast(`${label} updated`);
-    render();
-  });
+    v.updatedAt = new Date().toISOString(); v.updatedBy = "owner";
+    return true;
+  }, `Renew ${label} — ${v.bikeName}`, `${label} updated`);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -8086,6 +8527,7 @@ function render() {
     case "loyalty-backups": html = renderLoyaltyBackupsScreen(); break;
     case "vehicles": html = renderVehiclesList(); break;
     case "vehicle": html = renderVehicleDetail(); break;
+    case "vehicle-backups": html = renderVehicleBackupsScreen(); break;
     case "settings": html = renderSettings(); break;
     case "data-audit": html = renderDataAuditScreen(); break;
     case "reconcile-preview": html = renderReconcilePreviewScreen(); break;
@@ -8663,6 +9105,8 @@ function wireScreenEvents() {
 
   wireLoyaltyV2Events();
   wireLoyaltyBackupEvents();
+  wireVehicleSyncEvents();
+  wireVehicleBackupEvents();
   wireImportScreenEvents();
 }
 
@@ -8921,9 +9365,37 @@ function wireImportScreenEvents() {
 
   const commitBtn = document.getElementById("commit-import");
   if (commitBtn) commitBtn.addEventListener("click", () => {
-    commitImport();
-    toast("Import complete");
-    render();
+    if (importState.type === "vehicles") {
+      // Vehicle CSV import also mutates DB.data.vehicles, so it needs the same cloud sync as
+      // every other Vehicle Renewal edit. Deliberately does NOT pull from cloud first — the
+      // duplicate-vs-new decision for every row (rec._existing) was already resolved against
+      // DB.data.vehicles back when the file was mapped/previewed, by object reference; replacing
+      // DB.data.vehicles with a freshly-pulled array here would detach those references and
+      // silently drop the update-vs-create decisions. commitImport() runs unchanged against
+      // whatever's currently cached (same as before this feature existed); only the push to
+      // cloud afterward is new. If this device's cloud knowledge turns out to be stale, the
+      // conflict-checked push below fails loudly (never silently overwrites the cloud) and the
+      // owner re-runs the import after refreshing — consistent with the conflict-safety rule
+      // used everywhere else in Vehicle Renewal.
+      commitImport();
+      const originalLabel = commitBtn.textContent;
+      commitBtn.disabled = true;
+      commitBtn.textContent = "Saving to cloud…";
+      saveVehiclesToCloud(DB.data.vehicles, "Bulk import vehicles")
+        .then(() => { toast("Import complete — saved to cloud"); render(); })
+        .catch(() => {
+          // saveVehiclesToCloud already surfaced the error/conflict via vehicleSaveStatus and
+          // re-rendered. The import result itself is still applied and cached locally (DB.save()
+          // already ran inside commitImport()) — nothing is lost, just not yet cloud-confirmed.
+          toast("Import saved locally — cloud sync failed, check Vehicle Renewal for details");
+          render();
+        })
+        .finally(() => { commitBtn.disabled = false; commitBtn.textContent = originalLabel; });
+    } else {
+      commitImport();
+      toast("Import complete");
+      render();
+    }
   });
 }
 
