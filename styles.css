@@ -1418,3 +1418,34 @@ p { margin: 0; }
 @media (min-width: 640px) {
   .reward-recommend-cards { grid-template-columns: repeat(3, 1fr); }
 }
+
+/* ============================================================
+   OFFLINE EXPORTS — Vehicle Renewal / Loyalty / Business
+   Snapshot printable reports. Separate from Backups (JSON) —
+   these are human-readable hard copies for print or Save as PDF.
+   ============================================================ */
+.print-report { background: var(--paper-card); border: 1px solid var(--line); border-radius: var(--radius-m); padding: 20px; }
+.print-report-header { text-align: center; margin-bottom: 12px; }
+.print-report-brand { font-size: 13px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-secondary); }
+.print-report-title { font-family: var(--font-display); font-size: 22px; font-weight: 800; color: var(--ink); margin-top: 2px; }
+.print-report-meta { font-size: 12.5px; color: var(--text-secondary); line-height: 1.7; margin-bottom: 16px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.print-section-title { font-weight: 700; font-size: 14px; margin: 18px 0 8px; color: var(--ink); }
+.print-report-footnote { font-size: 11.5px; color: var(--text-secondary); margin-top: 18px; }
+
+/* Printing / "Save as PDF" from the browser — hide app chrome (header, nav, export/print
+   buttons themselves) and let only .print-report flow onto the page, full width, in plain
+   black-on-white. Works the same on Mac Safari/Chrome and iPhone Safari's Print/Share sheet. */
+@media print {
+  [data-no-print] { display: none !important; }
+  body { background: #fff !important; }
+  .screen-body { padding: 0 !important; }
+  .print-report { border: none !important; padding: 0 !important; background: #fff !important; }
+  .report-table-wrap { overflow: visible !important; border: none !important; }
+  .report-table { font-size: 11px !important; white-space: normal !important; }
+  .report-table th {
+    position: static !important;
+    background: #eee !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

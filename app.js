@@ -5899,6 +5899,9 @@ function renderLoyaltyReportsScreen() {
       <p class="screen-sub">Customer Loyalty only — separate from Vehicle Renewal</p>
     </header>
     <div class="screen-body">
+      <div class="btn-row" style="margin-bottom:12px;">
+        <button class="btn btn-outline btn-block" data-goto="loyalty-export">Export Loyalty Report</button>
+      </div>
       <div class="period-tabs">
         ${periods.map(([id, label]) => `<button class="period-tab ${state.reportsPeriod === id ? "active" : ""}" data-action="set-reports-period" data-period="${id}">${label}</button>`).join("")}
       </div>
@@ -5966,6 +5969,23 @@ function renderLoyaltyV2ReportSummaryCard() {
 function csvEscape(v) {
   const s = String(v === null || v === undefined ? "" : v);
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// Shared download trigger for every offline EXPORT (CSV) this app creates — a UTF-8 BOM is
+// prefixed so Excel/Numbers on Mac and iOS Files correctly detect UTF-8 and render Thai text
+// instead of mojibake. Read-only: only ever creates a throwaway Blob URL and clicks a
+// throwaway <a download>, never touches DB.data, the cloud, or any backup file. Works on
+// Safari/iPhone and installed-PWA the same as a normal browser download/share sheet.
+function downloadTextFile(content, filename, mime) {
+  const blob = new Blob(["\uFEFF" + content], { type: mime || "text/plain;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // Owner-facing, exportable, printable per-customer Loyalty Report — every field from the
@@ -6075,6 +6095,214 @@ function exportLoyaltyReportCsv() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+/* ---------------------------------------------------------------------- */
+/* CUSTOMER LOYALTY — offline-readable EXPORT (CSV + printable report).    */
+/* Strictly READ-ONLY: reuses the same lazy ensureLoyaltyLedgerEntries()   */
+/* every other loyalty screen already calls (idempotent — never touches an */
+/* existing ledger row) and never writes anything new. Completely separate */
+/* from Loyalty Backups (JSON, for recovery/restore) and from the "Full    */
+/* Loyalty Report" screen above (kept exactly as-is) — this is the         */
+/* section-based, business-readable hard copy for when the app or cloud    */
+/* is unavailable. Deliberately omits the "existing pricing benefit"       */
+/* percentage: customerRateBenefit() always returns hasBenefit:false today */
+/* (no reliable contracted-rate data exists anywhere in this app), so       */
+/* there is nothing real to show here — never estimated from revenue÷days. */
+/* ---------------------------------------------------------------------- */
+
+const LOYALTY_STRENGTH_RANK = { returning: 0, strong: 1, aa_family: 2, exceptional: 3 };
+
+// The highest loyalty-strength band this customer has ever actually reached, read straight
+// off each ledger entry's own FROZEN loyaltyLevelAtReward (see attachRewardRecommendationSnapshot)
+// — never recomputed here, so it can't drift from what a reward card already shows.
+function customerLoyaltyLevelLabel(ledger) {
+  let best = null, bestRank = -1;
+  ledger.forEach((e) => {
+    if (!e.loyaltyLevelAtReward) return;
+    const baseLabel = e.loyaltyLevelAtReward.replace(/^High /, "");
+    const band = REWARD_STRENGTH_BANDS.find((b) => b.label === baseLabel);
+    const rank = band ? LOYALTY_STRENGTH_RANK[band.id] : -1;
+    if (rank > bestRank) { bestRank = rank; best = e.loyaltyLevelAtReward; }
+  });
+  return best || "Not Yet Qualified";
+}
+
+// navigator.onLine is the only live connectivity signal already available everywhere in this
+// app without a dedicated tracker — unlike Vehicle Renewal, the Loyalty V2 ledger sync never
+// surfaces a persistent "last synced" UI status (see syncLoyaltyLedgerToCloud). Used only to
+// label the export; never gates or changes any loyalty calculation.
+function loyaltyExportSourceLabel() {
+  return (typeof navigator !== "undefined" && navigator.onLine === false) ? "Cached local data" : "Shared cloud data";
+}
+
+// One row per customer — never duplicated. Where a customer has more than one loyalty
+// entitlement, the single most operationally relevant one drives the reward-specific columns
+// (needs owner review > needs a choice > already selected/manual grant > merely ready > most
+// recently given), exactly the same priority order the rest of this app already treats as
+// "what's currently in front of the owner" for that customer.
+function buildLoyaltyExportRows() {
+  const priorityStatus = ["review_needed", "pending_choice", "selected", "manual", "ready"];
+  return DB.data.customers.map((c) => {
+    const stats = customerStats(c);
+    const dims = computeLoyaltyDimensions(c, stats);
+    const ledger = ensureLoyaltyLedgerEntries(c, stats, dims);
+    const given = ledger.filter((e) => e.status === "given" || e.status === "redeemed")
+      .slice().sort((a, b) => (b.givenDate || "").localeCompare(a.givenDate || ""));
+    let primary = null;
+    for (const s of priorityStatus) { primary = ledger.find((e) => e.status === s); if (primary) break; }
+    if (!primary) primary = given[0] || null;
+    const readyCount = ledger.filter((e) => ["ready", "pending_choice", "selected", "manual", "review_needed"].includes(e.status)).length;
+    const pendingCount = ledger.filter((e) => e.status === "pending_choice" || e.status === "review_needed").length;
+    const lastUpdated = ledger.reduce((max, e) => ((e.updatedAt || "") > max ? e.updatedAt : max), "");
+    return {
+      customer: c, stats, dims, ledger, given, primary,
+      isActiveRider: !!stats.current,
+      needsReview: ledger.some((e) => e.status === "review_needed"),
+      readyCount, pendingCount, lastUpdated,
+    };
+  }).sort((a, b) => cleanCustomerDisplayName(a.customer.name).localeCompare(cleanCustomerDisplayName(b.customer.name)));
+}
+
+// Flattens one export row into the exact display-ready field set the CSV columns and the
+// printable report's per-section tables both read from — one place, so the two can never
+// disagree with each other.
+function loyaltyExportRowFields(row) {
+  const c = row.customer, p = row.primary;
+  return {
+    name: cleanCustomerDisplayName(c.name),
+    contact: c.phone || "",
+    genuineVisits: row.dims.genuineVisits,
+    lifetimePaidDays: row.dims.lifetimePaidDays,
+    longestContinuousStay: row.dims.longestContinuousStayDays,
+    currentContinuousStay: row.stats.current ? row.dims.currentContinuousStayDays : "",
+    lifetimeRevenue: fmtMoney(row.stats.lifetimeRevenueTotal),
+    loyaltyLevel: customerLoyaltyLevelLabel(row.ledger),
+    rewardsReady: row.readyCount,
+    pendingRewards: row.pendingCount,
+    rewardSelected: p && p.selectedChoice ? loyaltySelectedRewardSummary(p) : "—",
+    rewardGivenStatus: p ? loyaltyLedgerStatusDisplay(p).text : "—",
+    rewardGivenDate: p && p.givenDate ? fmtDate(p.givenDate) : "—",
+    rewardUsedDate: p && p.usedDate ? fmtDate(p.usedDate) : "—",
+    recommendedPremiumRide: p ? (p.recommendedPremiumBike || "") : "",
+    recommendedPremiumDays: p ? (p.recommendedPremiumDays || "") : "",
+    recommendedExtraDayBike: p ? (p.recommendedExtraDayBike || "") : "",
+    recommendedExtraDays: p ? (p.recommendedExtraDays || "") : "",
+    approxRewardValue: p ? (p.recommendedRewardValue || "") : "",
+    calculationReason: p ? (p.calculationReason || p.qualificationReason || "") : "",
+    ownerNote: c.notes || "",
+    lastUpdated: row.lastUpdated ? fmtDateTimeLabel(row.lastUpdated) : "—",
+  };
+}
+
+function exportLoyaltyExportCsv() {
+  const rows = buildLoyaltyExportRows();
+  const header = [
+    "Customer Name", "Customer Contact", "Genuine Visits", "Lifetime Paid Days", "Longest Continuous Stay",
+    "Current Continuous Stay", "Lifetime Revenue", "Loyalty Level / Tier", "Rewards Ready", "Pending Rewards",
+    "Reward Selected", "Reward Given Status", "Reward Given Date", "Reward Used Date",
+    "Recommended Premium Ride", "Recommended Premium Days", "Recommended Extra Day Bike", "Recommended Extra Days",
+    "Approximate Reward Value", "Calculation Reason / Why This Reward", "Owner Note", "Last Updated",
+  ];
+  const csvRows = rows.map((row) => {
+    const f = loyaltyExportRowFields(row);
+    return [f.name, f.contact, f.genuineVisits, f.lifetimePaidDays, f.longestContinuousStay, f.currentContinuousStay,
+      f.lifetimeRevenue, f.loyaltyLevel, f.rewardsReady, f.pendingRewards, f.rewardSelected, f.rewardGivenStatus,
+      f.rewardGivenDate, f.rewardUsedDate, f.recommendedPremiumRide, f.recommendedPremiumDays, f.recommendedExtraDayBike,
+      f.recommendedExtraDays, f.approxRewardValue, f.calculationReason, f.ownerNote, f.lastUpdated];
+  });
+  const csv = [header, ...csvRows].map((r) => r.map(csvEscape).join(",")).join("\n");
+  downloadTextFile(csv, "AA_Loyalty_Report_" + todayISO() + ".csv", "text/csv;charset=utf-8;");
+}
+
+function renderLoyaltyExportSectionTable(rows, columns) {
+  if (!rows.length) return `<p class="muted">None.</p>`;
+  return `
+    <div class="report-table-wrap">
+      <table class="report-table">
+        <thead><tr>${columns.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map((row) => {
+          const f = loyaltyExportRowFields(row);
+          return `<tr>${columns.map(([key]) => `<td>${escapeHtml(String(f[key] ?? ""))}</td>`).join("")}</tr>`;
+        }).join("")}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderLoyaltyExportScreen() {
+  const rows = buildLoyaltyExportRows();
+  const rewardsReady = rows.filter((r) => r.readyCount > 0);
+  const needsReview = rows.filter((r) => r.needsReview);
+  const activeRiders = rows.filter((r) => r.isActiveRider);
+  const historyRows = [];
+  rows.forEach((row) => row.given.forEach((e) => historyRows.push({ row, entry: e })));
+  historyRows.sort((a, b) => (b.entry.givenDate || "").localeCompare(a.entry.givenDate || ""));
+
+  const idCols = [["name", "Customer"], ["contact", "Contact"], ["loyaltyLevel", "Loyalty Level"]];
+  const readyCols = [...idCols, ["rewardsReady", "Rewards Ready"], ["pendingRewards", "Pending"], ["rewardSelected", "Selected"], ["approxRewardValue", "Approx. Value"]];
+  const reviewCols = [...idCols, ["calculationReason", "Why This Reward"]];
+  const activeCols = [...idCols, ["currentContinuousStay", "Current Continuous Stay (days)"], ["genuineVisits", "Genuine Visits"], ["lifetimeRevenue", "Lifetime Revenue"]];
+
+  return `
+    <header class="screen-header" data-no-print>
+      <button class="back-btn" data-goto="loyalty-reports">‹ Loyalty Reports</button>
+      <h1 class="screen-title" style="margin-top:8px;">Export Loyalty Report</h1>
+      <p class="screen-sub">Human-readable copy for offline / print use — not a backup.</p>
+    </header>
+    <div class="screen-body">
+      <div class="btn-row" data-no-print style="margin-bottom:14px;">
+        <button class="btn btn-primary btn-sm" data-action="export-loyalty-export-csv">Export CSV</button>
+        <button class="btn btn-outline btn-sm" data-action="print-loyalty-export-report">Printable Report (Save as PDF)</button>
+      </div>
+
+      <div class="print-report">
+        <div class="print-report-header">
+          <div class="print-report-brand">AA Scooter Rental Chiang Mai</div>
+          <div class="print-report-title">Customer Loyalty Report</div>
+        </div>
+        <div class="print-report-meta">
+          <div>Export generated: ${escapeHtml(nowDateTimeLabel())}</div>
+          <div>Total customers: ${DB.data.customers.length}</div>
+          <div>Active riders: ${activeRiders.length}</div>
+          <div>Rewards ready: ${rewardsReady.length}</div>
+          <div>Needs review: ${needsReview.length}</div>
+          <div><strong>Source: ${loyaltyExportSourceLabel()}</strong></div>
+        </div>
+
+        <div class="print-section-title">1. Rewards Ready (${rewardsReady.length})</div>
+        ${renderLoyaltyExportSectionTable(rewardsReady, readyCols)}
+
+        <div class="print-section-title">2. Needs Review (${needsReview.length})</div>
+        ${renderLoyaltyExportSectionTable(needsReview, reviewCols)}
+
+        <div class="print-section-title">3. Active Riders (${activeRiders.length})</div>
+        ${renderLoyaltyExportSectionTable(activeRiders, activeCols)}
+
+        <div class="print-section-title">4. Reward History / Given Rewards (${historyRows.length})</div>
+        ${historyRows.length === 0 ? `<p class="muted">None.</p>` : `
+          <div class="report-table-wrap">
+            <table class="report-table">
+              <thead><tr><th>Customer</th><th>Milestone</th><th>Reward</th><th>Status</th><th>Given Date</th><th>Used Date</th></tr></thead>
+              <tbody>
+                ${historyRows.map(({ row, entry }) => `
+                  <tr>
+                    <td>${escapeHtml(cleanCustomerDisplayName(row.customer.name))}</td>
+                    <td>${escapeHtml(entry.milestoneLabel || "")}</td>
+                    <td>${escapeHtml(entry.selectedChoice ? loyaltySelectedRewardSummary(entry) : (entry.rewardType === "extra_day" ? `${entry.quantity || 1} Extra Day(s)` : "—"))}</td>
+                    <td>${escapeHtml(loyaltyLedgerStatusDisplay(entry).text)}</td>
+                    <td>${escapeHtml(fmtDate(entry.givenDate))}</td>
+                    <td>${escapeHtml(entry.usedDate ? fmtDate(entry.usedDate) : "—")}</td>
+                  </tr>
+                `).join("")}
+              </tbody>
+            </table>
+          </div>
+        `}
+        <p class="print-report-footnote">Full per-reward calculation reasons and audit history are available in the app under each customer's Loyalty Summary.</p>
+      </div>
+    </div>
+  `;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -6755,6 +6983,9 @@ function renderVehiclesList() {
     </header>
     <div class="screen-body">
       ${renderVehicleSyncBanner()}
+      <div class="btn-row" style="margin-bottom:12px;">
+        <button class="btn btn-outline btn-block" data-goto="vehicle-renewal-export">Export Vehicle Renewal</button>
+      </div>
       <div class="vehicle-summary-strip">
         <div class="vehicle-summary-tile red">
           <div class="vehicle-summary-count">${expiredCount}</div>
@@ -6872,6 +7103,136 @@ function renderVehicleDetail() {
           <span class="pill pill-neutral" style="text-transform:capitalize;">${escapeHtml(v.status)}</span>
           ${v.notes ? `<div class="reward-note" style="margin-top:12px;">${escapeHtml(v.notes)}</div>` : ""}
         </div>
+      </div>
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------------- */
+/* VEHICLE RENEWAL — offline-readable EXPORT (CSV + printable report).     */
+/* Strictly READ-ONLY: never writes to DB.data, cloud sync, or any backup  */
+/* file — only reads DB.data.vehicles and the existing vehicleStatus()     */
+/* calculation. Completely separate from Vehicle Renewal Backups (JSON,   */
+/* for recovery/restore) — this is a human-readable hard copy for when the */
+/* app, Vercel, the API, or cloud sync is unavailable.                     */
+/* ---------------------------------------------------------------------- */
+
+// "OVERDUE" / "DUE SOON" / "OK" — readable text labels so renewal status is never conveyed
+// by color alone in the export, matching the level buckets vehicleStatus() already computes.
+function renewalLevelReportLabel(level) {
+  if (level === "red") return "OVERDUE";
+  if (level === "green") return "OK";
+  return "DUE SOON"; // amber, or "unset" (no date on file yet — still needs attention)
+}
+
+// True only when this device currently holds the confirmed shared cloud copy — the exact
+// same state vehicleSyncStatusLine() already uses for the on-screen "Cloud synced ✓" banner.
+// Any other state (loading/offline/idle/error) means what's on screen is this device's own
+// cached copy, so the export must say so rather than imply it's the live shared record.
+function vehicleRenewalSourceLabel() {
+  return state.vehicleSyncStatus === "synced" ? "Shared cloud data" : "Cached local data";
+}
+
+// Every tracked vehicle, grouped exactly per the export spec: 0 Needs Attention (Tax or Por
+// Ror Bor overdue), 1 Due Soon (amber/unset), 2 All OK — sorted by group, then name.
+function buildVehicleRenewalExportRows() {
+  return DB.data.vehicles.map((v) => {
+    const st = vehicleStatus(v);
+    const group = st.overall === "red" ? 0 : st.overall === "green" ? 2 : 1;
+    return { v, st, group };
+  }).sort((a, b) => a.group - b.group || (a.v.bikeName || "").localeCompare(b.v.bikeName || ""));
+}
+
+function exportVehicleRenewalCsv() {
+  const rows = buildVehicleRenewalExportRows();
+  const header = ["Vehicle Name", "Plate", "Model Year", "Tax Due Date", "Tax Status", "Por Ror Bor Due Date", "Por Ror Bor Status", "Overall Renewal Status", "Service Status", "Current KM", "Next Service KM", "Vehicle Status", "Notes", "Last Updated"];
+  const csvRows = rows.map(({ v, st }) => [
+    v.bikeName, v.plate, v.modelYear || "",
+    v.taxOverduePending ? "Overdue — Renewal Pending" : fmtDate(v.taxExpiryDate),
+    renewalLevelReportLabel(st.tax.level),
+    fmtDate(v.porRorBorExpiryDate),
+    renewalLevelReportLabel(st.prb.level),
+    renewalLevelReportLabel(st.overall),
+    renewalLevelReportLabel(st.service.level),
+    Number(v.currentKm) || 0,
+    Number(v.nextServiceKm) || 0,
+    v.status || "",
+    v.notes || "",
+    fmtDateTimeLabel(v.updatedAt) || "—",
+  ]);
+  const csv = [header, ...csvRows].map((row) => row.map(csvEscape).join(",")).join("\n");
+  downloadTextFile(csv, "AA_Vehicle_Renewal_" + todayISO() + ".csv", "text/csv;charset=utf-8;");
+}
+
+function renderVehicleRenewalReportTable(rows) {
+  if (!rows.length) return `<p class="muted">None.</p>`;
+  return `
+    <div class="report-table-wrap">
+      <table class="report-table">
+        <thead><tr>
+          <th>Vehicle</th><th>Plate</th><th>Tax Due Date</th><th>Tax Status</th>
+          <th>Por Ror Bor Due Date</th><th>Por Ror Bor Status</th><th>Overall Status</th><th>Last Updated</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map(({ v, st }) => `
+            <tr>
+              <td>${escapeHtml(v.bikeName)}</td>
+              <td class="mono">${escapeHtml(v.plate)}</td>
+              <td>${v.taxOverduePending ? "Overdue — Renewal Pending" : escapeHtml(fmtDate(v.taxExpiryDate))}</td>
+              <td>${renewalLevelReportLabel(st.tax.level)}</td>
+              <td>${escapeHtml(fmtDate(v.porRorBorExpiryDate))}</td>
+              <td>${renewalLevelReportLabel(st.prb.level)}</td>
+              <td><strong>${renewalLevelReportLabel(st.overall)}</strong></td>
+              <td>${escapeHtml(fmtDateTimeLabel(v.updatedAt) || "—")}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderVehicleRenewalExportScreen() {
+  const rows = buildVehicleRenewalExportRows();
+  const needsAttention = rows.filter((r) => r.group === 0);
+  const dueSoon = rows.filter((r) => r.group === 1);
+  const allOk = rows.filter((r) => r.group === 2);
+  const cloudTs = fmtDateTimeLabel(DB.data.meta.vehicleRenewalSync.cloudUpdatedAt);
+
+  return `
+    <header class="screen-header" data-no-print>
+      <button class="back-btn" data-goto="vehicles">‹ Vehicle Renewal</button>
+      <h1 class="screen-title" style="margin-top:8px;">Export Vehicle Renewal</h1>
+      <p class="screen-sub">Human-readable copy for offline / print use — not a backup.</p>
+    </header>
+    <div class="screen-body">
+      <div class="btn-row" data-no-print style="margin-bottom:14px;">
+        <button class="btn btn-primary btn-sm" data-action="export-vehicle-renewal-csv">Export CSV</button>
+        <button class="btn btn-outline btn-sm" data-action="print-vehicle-renewal-report">Printable Report (Save as PDF)</button>
+      </div>
+
+      <div class="print-report">
+        <div class="print-report-header">
+          <div class="print-report-brand">AA Scooter Rental Chiang Mai</div>
+          <div class="print-report-title">Vehicle Renewal Report</div>
+        </div>
+        <div class="print-report-meta">
+          <div>Export generated: ${escapeHtml(nowDateTimeLabel())}</div>
+          <div>Number of vehicles: ${DB.data.vehicles.length}</div>
+          <div>Cloud state last updated: ${cloudTs ? escapeHtml(cloudTs) : "—"}</div>
+          <div><strong>Source: ${vehicleRenewalSourceLabel()}</strong></div>
+        </div>
+
+        <div class="print-section-title">1. Needs Attention (${needsAttention.length})</div>
+        ${renderVehicleRenewalReportTable(needsAttention)}
+
+        <div class="print-section-title">2. Due Soon (${dueSoon.length})</div>
+        ${renderVehicleRenewalReportTable(dueSoon)}
+
+        <div class="print-section-title">3. All OK (${allOk.length})</div>
+        ${renderVehicleRenewalReportTable(allOk)}
+
+        <p class="print-report-footnote">Status labels OVERDUE / DUE SOON / OK are shown as text, never by color alone.</p>
       </div>
     </div>
   `;
@@ -7205,6 +7566,14 @@ function renderSettings() {
         ${state.cloudSyncStatus === "done" ? `<p class="muted" style="margin-top:10px;">Baseline refreshed ✓</p>` : ""}
       </div>
 
+      <div class="section-title">Offline Exports &amp; Hard Copies</div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px;">Human-readable CSV/printable copies for reading, printing, or saving offline — for when the app, Vercel, the API, or cloud sync is unavailable. These are exports, not backups: they can't be restored from, and creating one never changes any customer, reward, vehicle, cloud, or backup data. Vehicle Renewal and Customer Loyalty each have their own detailed export (see their own screens); this one combines both into a single emergency hard copy.</p>
+        <div class="btn-row">
+          <button class="btn btn-outline btn-sm" data-goto="business-snapshot">Export Business Snapshot</button>
+        </div>
+      </div>
+
       <div class="section-title">Loyalty Backups &amp; Audit History</div>
       <div class="card">
         <p class="muted" style="margin-bottom:12px;">Versioned, timestamped snapshots of loyalty data (customers, rentals, rewards, the loyalty ledger, and the audit log). Every backup is a brand-new file — none of them are ever overwritten. Every owner/staff action that changes loyalty state (grants, overrides, status changes, notes) is separately recorded forever in an append-only audit log, never erased by a sync, refresh, or restore.</p>
@@ -7230,6 +7599,75 @@ function renderSettings() {
       <div class="section-title">About</div>
       <div class="card">
         <p class="muted">AA Scooter Rental — Customer &amp; Loyalty Manager. Internal tool only, not a customer-facing app. Rewards shown here are recommendations for staff — never promise a reward to a customer before checking availability.</p>
+      </div>
+    </div>
+  `;
+}
+
+/* ---------------------------------------------------------------------- */
+/* BUSINESS SNAPSHOT — one combined, offline-readable, printable hard copy */
+/* of BOTH Vehicle Renewal and Customer Loyalty. Strictly READ-ONLY, and   */
+/* purely a thinner combined view over the same buildVehicleRenewalExportRows()  */
+/* / buildLoyaltyExportRows() the two detailed exports already use — never */
+/* a replacement for them (see their own "Export Vehicle Renewal" /       */
+/* "Export Loyalty Report" screens for the full detail).                   */
+/* ---------------------------------------------------------------------- */
+function renderBusinessSnapshotScreen() {
+  const vRows = buildVehicleRenewalExportRows();
+  const vNeedsAttention = vRows.filter((r) => r.group === 0);
+  const vDueSoon = vRows.filter((r) => r.group === 1);
+  const vAllOk = vRows.filter((r) => r.group === 2);
+  const vCloudTs = fmtDateTimeLabel(DB.data.meta.vehicleRenewalSync.cloudUpdatedAt);
+
+  const lRows = buildLoyaltyExportRows();
+  const lRewardsReady = lRows.filter((r) => r.readyCount > 0);
+  const lNeedsReview = lRows.filter((r) => r.needsReview);
+  const lActiveRiders = lRows.filter((r) => r.isActiveRider);
+
+  return `
+    <header class="screen-header" data-no-print>
+      <button class="back-btn" data-goto="settings">‹ Settings</button>
+      <h1 class="screen-title" style="margin-top:8px;">Export Business Snapshot</h1>
+      <p class="screen-sub">One combined offline hard copy — Vehicle Renewal + Customer Loyalty. Not a backup.</p>
+    </header>
+    <div class="screen-body">
+      <div class="btn-row" data-no-print style="margin-bottom:14px;">
+        <button class="btn btn-outline btn-sm" data-action="print-business-snapshot">Printable Report (Save as PDF)</button>
+      </div>
+
+      <div class="print-report">
+        <div class="print-report-header">
+          <div class="print-report-brand">AA Scooter Rental Chiang Mai</div>
+          <div class="print-report-title">Business Snapshot</div>
+        </div>
+        <div class="print-report-meta">
+          <div>Export generated: ${escapeHtml(nowDateTimeLabel())}</div>
+          <div>Vehicle Renewal source: ${vehicleRenewalSourceLabel()}</div>
+          <div>Customer Loyalty source: ${loyaltyExportSourceLabel()}</div>
+        </div>
+
+        <div class="print-section-title" style="font-size:16px;">SECTION 1 — Vehicle Renewal Summary</div>
+        <div class="print-report-meta">
+          <div>Vehicles tracked: ${DB.data.vehicles.length}</div>
+          <div>Cloud state last updated: ${vCloudTs ? escapeHtml(vCloudTs) : "—"}</div>
+          <div>Needs Attention: ${vNeedsAttention.length} · Due Soon: ${vDueSoon.length} · All OK: ${vAllOk.length}</div>
+        </div>
+        <div class="print-section-title">Needs Attention</div>
+        ${renderVehicleRenewalReportTable(vNeedsAttention)}
+        <div class="print-section-title">Due Soon</div>
+        ${renderVehicleRenewalReportTable(vDueSoon)}
+
+        <div class="print-section-title" style="font-size:16px;">SECTION 2 — Customer Loyalty Summary</div>
+        <div class="print-report-meta">
+          <div>Total customers: ${DB.data.customers.length}</div>
+          <div>Active riders: ${lActiveRiders.length} · Rewards ready: ${lRewardsReady.length} · Needs review: ${lNeedsReview.length}</div>
+        </div>
+        <div class="print-section-title">Rewards Ready</div>
+        ${renderLoyaltyExportSectionTable(lRewardsReady, [["name", "Customer"], ["contact", "Contact"], ["loyaltyLevel", "Loyalty Level"], ["rewardSelected", "Selected"], ["approxRewardValue", "Approx. Value"]])}
+        <div class="print-section-title">Needs Review</div>
+        ${renderLoyaltyExportSectionTable(lNeedsReview, [["name", "Customer"], ["contact", "Contact"], ["calculationReason", "Why This Reward"]])}
+
+        <p class="print-report-footnote">For full vehicle and customer detail, use Export Vehicle Renewal and Export Loyalty Report separately.</p>
       </div>
     </div>
   `;
@@ -8525,9 +8963,12 @@ function render() {
     case "loyalty-reports": html = renderLoyaltyReportsScreen(); break;
     case "loyalty-ledger-report": html = renderLoyaltyLedgerReportScreen(); break;
     case "loyalty-backups": html = renderLoyaltyBackupsScreen(); break;
+    case "loyalty-export": html = renderLoyaltyExportScreen(); break;
     case "vehicles": html = renderVehiclesList(); break;
     case "vehicle": html = renderVehicleDetail(); break;
     case "vehicle-backups": html = renderVehicleBackupsScreen(); break;
+    case "vehicle-renewal-export": html = renderVehicleRenewalExportScreen(); break;
+    case "business-snapshot": html = renderBusinessSnapshotScreen(); break;
     case "settings": html = renderSettings(); break;
     case "data-audit": html = renderDataAuditScreen(); break;
     case "reconcile-preview": html = renderReconcilePreviewScreen(); break;
@@ -9108,6 +9549,28 @@ function wireScreenEvents() {
   wireVehicleSyncEvents();
   wireVehicleBackupEvents();
   wireImportScreenEvents();
+  wireOfflineExportEvents();
+}
+
+/* ---------------------------------------------------------------------- */
+/* OFFLINE EXPORTS — event wiring for Export Vehicle Renewal / Export      */
+/* Loyalty Report / Export Business Snapshot. Every handler either         */
+/* triggers a read-only CSV download or calls window.print() — never       */
+/* writes to DB.data, cloud, or any backup.                                */
+/* ---------------------------------------------------------------------- */
+function wireOfflineExportEvents() {
+  const vCsv = document.querySelector('[data-action="export-vehicle-renewal-csv"]');
+  if (vCsv) vCsv.addEventListener("click", exportVehicleRenewalCsv);
+  const vPrint = document.querySelector('[data-action="print-vehicle-renewal-report"]');
+  if (vPrint) vPrint.addEventListener("click", () => window.print());
+
+  const lCsv = document.querySelector('[data-action="export-loyalty-export-csv"]');
+  if (lCsv) lCsv.addEventListener("click", exportLoyaltyExportCsv);
+  const lPrint = document.querySelector('[data-action="print-loyalty-export-report"]');
+  if (lPrint) lPrint.addEventListener("click", () => window.print());
+
+  const snapPrint = document.querySelector('[data-action="print-business-snapshot"]');
+  if (snapPrint) snapPrint.addEventListener("click", () => window.print());
 }
 
 /* ---------------------------------------------------------------------- */
