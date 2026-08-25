@@ -410,6 +410,11 @@ const DB = {
     // baseUpdatedAt on the next save (see api/vehicle-renewal.js). null/null means this device
     // has never successfully synced with the cloud yet.
     if (!this.data.meta.vehicleRenewalSync) this.data.meta.vehicleRenewalSync = { cloudUpdatedAt: null, cloudUpdatedBy: null };
+    // Loyalty reward/ledger cloud sync bookkeeping — added 2026-08-25 so the Customer Loyalty
+    // dashboard (Rewards Ready / Needs Review) can show a real "last synced" time and so the
+    // one-time pre-sync safety backup (see ensureLoyaltyCloudSyncMigrationBackup) only ever
+    // fires once per device, never on every load.
+    if (!this.data.meta.loyaltyCloudSync) this.data.meta.loyaltyCloudSync = { lastSyncedAt: null, migrationBackupDone: false };
     if (!this.data.customers) this.data.customers = [];
     if (!this.data.rentals) this.data.rentals = [];
     if (!this.data.vehicles) this.data.vehicles = [];
@@ -522,7 +527,7 @@ const DB = {
       // customers can be credited for qualifying past bookings rather than being treated
       // as ineligible purely for having rented before the app existed. Adjust in Settings
       // if you'd rather the program only apply going forward.
-      meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)), vehicleRenewalSync: { cloudUpdatedAt: null, cloudUpdatedBy: null } },
+      meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)), vehicleRenewalSync: { cloudUpdatedAt: null, cloudUpdatedBy: null }, loyaltyCloudSync: { lastSyncedAt: null, migrationBackupDone: false } },
       customers, rentals, vehicles, rewards, needsReview, loyaltyLedger: [], loyaltyAuditLog: [],
     };
   },
@@ -544,7 +549,7 @@ const DB = {
     // must survive — omitting it would leave DB.data.loyaltyAuditLog undefined until the next
     // full page load, and the very next ensureLoyaltyLedgerEntries() call (opening any
     // customer profile right after wiping) would crash trying to .push() onto it.
-    this.data = { meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)), vehicleRenewalSync: { cloudUpdatedAt: null, cloudUpdatedBy: null } }, customers: [], rentals: [], vehicles: [], rewards: [], needsReview: [], loyaltyLedger: [], loyaltyAuditLog: [] };
+    this.data = { meta: { loyaltyEffectiveDate: "2026-08-10", loyaltyLadders: JSON.parse(JSON.stringify(DEFAULT_LOYALTY_LADDERS)), vehicleRenewalSync: { cloudUpdatedAt: null, cloudUpdatedBy: null }, loyaltyCloudSync: { lastSyncedAt: null, migrationBackupDone: false } }, customers: [], rentals: [], vehicles: [], rewards: [], needsReview: [], loyaltyLedger: [], loyaltyAuditLog: [] };
     this.save();
   },
 };
@@ -3606,16 +3611,57 @@ function ensureLoyaltyLedgerEntries(customer, stats, dims) {
   return loyaltyLedgerFor(customer.id);
 }
 
+// True if two ledger/reward records are the same in every field EXCEPT updatedAt — used by the
+// conflict detectors below so two devices that independently converge on the exact same value
+// (just stamped with different timestamps) are never flagged as a false conflict; only a real
+// difference in content counts.
+function sameContentIgnoringUpdatedAt(a, b) {
+  return JSON.stringify(Object.assign({}, a, { updatedAt: undefined })) === JSON.stringify(Object.assign({}, b, { updatedAt: undefined }));
+}
+
+// Generic union-by-id merge used by every loyalty*.json pull (ledger, rewards) — reused
+// verbatim by pullLoyaltyLedgerFromCloud and pullRewardsFromCloud so the two arrays are
+// reconciled exactly the same way. Never drops a record either side has; where both sides
+// have the same id, whichever has the newer `updatedAt` wins (a record with no updatedAt at
+// all — written before this field existed — always loses to one that's been touched since,
+// but is still kept, never dropped, if the other side doesn't have it at all). This is what
+// makes the cross-device merge non-destructive by construction: a device with 5 rewards ready
+// and a device with 8 never resolve by picking one side, only by union.
+function mergeByIdNewestWins(localArr, remoteArr) {
+  const localById = {};
+  localArr.forEach((e) => { localById[e.id] = e; });
+  const merged = localArr.slice();
+  const mergedIndexById = {};
+  merged.forEach((e, i) => { mergedIndexById[e.id] = i; });
+  let changed = false;
+  remoteArr.forEach((remote) => {
+    const local = localById[remote.id];
+    if (!local) { merged.push(remote); changed = true; }
+    else if ((remote.updatedAt || "") > (local.updatedAt || "")) { merged[mergedIndexById[remote.id]] = remote; changed = true; }
+  });
+  return { merged, changed };
+}
+
 // ATOMIC update wrapper for the ledger, mirroring withAtomicRewardUpdate exactly — snapshot,
-// mutate, verify, save+sync, or roll back to the snapshot on any thrown error.
+// mutate, verify, save+sync, or roll back to the snapshot on any thrown error. Also captures
+// exactly which entries THIS action touched (dirtyIds) plus their pre-edit copy (baseById), so
+// syncLoyaltyLedgerToCloud can tell a genuine cross-device conflict (someone else changed the
+// SAME entry after this device's own pre-edit copy) apart from an ordinary, non-overlapping
+// cloud change that's always safe to merge silently.
 function withAtomicLedgerUpdate(fn) {
+  const beforeArr = JSON.parse(JSON.stringify(DB.data.loyaltyLedger));
+  const beforeById = {};
+  beforeArr.forEach((e) => { beforeById[e.id] = e; });
   const snapshot = JSON.stringify(DB.data.loyaltyLedger);
   try {
     fn();
     const nowISO = new Date().toISOString();
     DB.data.loyaltyLedger.forEach((e) => { if (e.updatedAt === undefined) e.updatedAt = nowISO; });
     DB.save();
-    syncLoyaltyLedgerToCloud();
+    const dirtyIds = DB.data.loyaltyLedger
+      .filter((e) => JSON.stringify(beforeById[e.id]) !== JSON.stringify(e))
+      .map((e) => e.id);
+    syncLoyaltyLedgerToCloud({ ids: dirtyIds, baseById: beforeById });
     return true;
   } catch (err) {
     DB.data.loyaltyLedger = JSON.parse(snapshot);
@@ -3625,38 +3671,95 @@ function withAtomicLedgerUpdate(fn) {
   }
 }
 
-function syncLoyaltyLedgerToCloud() {
-  fetch(LOYALTY_LEDGER_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ loyaltyLedger: DB.data.loyaltyLedger }),
-  }).catch((err) => { console.warn("Loyalty ledger cloud sync failed (will retry on next ledger action):", err); });
-}
-
-function pullLoyaltyLedgerFromCloud() {
+// Pushes the local ledger to the shared cloud store. `dirty` (optional) is the
+// { ids, baseById } produced by withAtomicLedgerUpdate for the specific action that just ran —
+// when present, this pulls the current cloud copy FIRST and checks whether any of THIS
+// action's own touched entries were ALSO changed on another device since this device's
+// pre-edit copy (a genuine conflict, per the cross-device sync spec: never silently overwrite
+// newer cloud data with older local data, and vice versa). A conflicting id is left exactly as
+// this device has it — NOT pushed — and recorded in state.loyaltyConflicts for the owner to
+// resolve (see resolveLoyaltyConflict); every other, non-conflicting change still saves
+// normally in the same call. Calls with no `dirty` (ensureLoyaltyLedgerEntries' system-
+// generated backfill, restore-from-backup, or a plain re-push after a pull) never conflict-
+// check — there is no specific owner edit to protect there — and just merge + push, exactly
+// like this function did before conflict detection existed.
+function syncLoyaltyLedgerToCloud(dirty) {
+  state.loyaltySaveStatus = "saving";
+  state.loyaltySaveError = null;
+  render();
   fetch(LOYALTY_LEDGER_API_URL)
     .then((r) => (r.ok ? r.json() : null))
     .then((data) => {
-      if (!data || !Array.isArray(data.loyaltyLedger)) return;
-      const localById = {};
-      DB.data.loyaltyLedger.forEach((e) => { localById[e.id] = e; });
-      const merged = DB.data.loyaltyLedger.slice();
-      const mergedIndexById = {};
-      merged.forEach((e, i) => { mergedIndexById[e.id] = i; });
-      let changed = false;
-      data.loyaltyLedger.forEach((remote) => {
-        const local = localById[remote.id];
-        if (!local) { merged.push(remote); changed = true; }
-        else if ((remote.updatedAt || "") > (local.updatedAt || "")) { merged[mergedIndexById[remote.id]] = remote; changed = true; }
-      });
+      const remoteArr = (data && Array.isArray(data.loyaltyLedger)) ? data.loyaltyLedger : null;
+      if (remoteArr && dirty && dirty.ids && dirty.ids.length) {
+        const remoteById = {};
+        remoteArr.forEach((e) => { remoteById[e.id] = e; });
+        const newConflicts = [];
+        dirty.ids.forEach((id) => {
+          const base = dirty.baseById[id]; // undefined = this entry is brand new locally — can't conflict
+          const remote = remoteById[id];
+          if (base && remote && (remote.updatedAt || "") > (base.updatedAt || "") && !sameContentIgnoringUpdatedAt(remote, DB.data.loyaltyLedger.find((e) => e.id === id))) {
+            newConflicts.push({ kind: "ledger", id, local: DB.data.loyaltyLedger.find((e) => e.id === id), remote, detectedAt: new Date().toISOString() });
+          }
+        });
+        if (newConflicts.length) {
+          state.loyaltyConflicts = state.loyaltyConflicts.filter((c) => !newConflicts.some((n) => n.kind === c.kind && n.id === c.id)).concat(newConflicts);
+          state.loyaltySaveStatus = "error";
+          state.loyaltySaveError = newConflicts.length + " reward update" + (newConflicts.length === 1 ? "" : "s") + " conflicted with a change made on another device — review before continuing.";
+          render();
+          return "conflict";
+        }
+      }
+      if (remoteArr) {
+        const { merged, changed } = mergeByIdNewestWins(DB.data.loyaltyLedger, remoteArr);
+        if (changed) { DB.data.loyaltyLedger = merged; DB.save(); }
+      }
+      return fetch(LOYALTY_LEDGER_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ loyaltyLedger: DB.data.loyaltyLedger }),
+      }).then((r) => { if (!r.ok) throw new Error("Save failed: " + r.status); });
+    })
+    .then((result) => {
+      if (result === "conflict") return; // status/error already set above
+      state.loyaltySaveStatus = "idle";
+      state.loyaltySaveError = null;
+      DB.data.meta.loyaltyCloudSync.lastSyncedAt = new Date().toISOString();
+      DB.save();
+      render();
+    })
+    .catch((err) => {
+      console.warn("Loyalty ledger cloud sync failed (will retry on next ledger action):", err);
+      state.loyaltySaveStatus = "error";
+      state.loyaltySaveError = "Saved on this device — cloud sync failed, will retry.";
+      render();
+    });
+}
+
+// Pull-and-merge: brings in any ledger action taken on a different device since this browser
+// last synced (Mark Given, Select Choice, Owner Override, Add Note, Manual Grant, etc.). Union
+// by id; per id, whichever side has the newer updatedAt wins. Called at app load, whenever
+// Customer Loyalty is opened if the last sync is stale (see navigate()), and by the "Refresh
+// Loyalty from Cloud" button (see refreshLoyaltyFromCloud). Returns a promise so callers can
+// wait for it and detect failure via state.loyaltyPullErrors.ledger.
+function pullLoyaltyLedgerFromCloud() {
+  return fetch(LOYALTY_LEDGER_API_URL)
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("status " + r.status))))
+    .then((data) => {
+      if (!data || !Array.isArray(data.loyaltyLedger)) { state.loyaltyPullErrors.ledger = false; return; }
+      const { merged, changed } = mergeByIdNewestWins(DB.data.loyaltyLedger, data.loyaltyLedger);
       if (changed) {
         DB.data.loyaltyLedger = merged;
         DB.save();
         render();
-        syncLoyaltyLedgerToCloud();
+        syncLoyaltyLedgerToCloud(); // push the merged union back so every device converges
       }
+      state.loyaltyPullErrors.ledger = false;
     })
-    .catch((err) => { console.warn("Loyalty ledger cloud pull failed (staying on local data):", err); });
+    .catch((err) => {
+      console.warn("Loyalty ledger cloud pull failed (staying on local data):", err);
+      state.loyaltyPullErrors.ledger = true;
+    });
 }
 
 /* ---------------------------------------------------------------------- */
@@ -3698,11 +3801,13 @@ function syncLoyaltyAuditLogToCloud() {
     body: JSON.stringify({ loyaltyAuditLog: DB.data.loyaltyAuditLog }),
   }).catch((err) => { console.warn("Loyalty audit log cloud sync failed (will retry on next audited action):", err); });
 }
+// Returns a promise (see pullLoyaltyLedgerFromCloud) so refreshLoyaltyFromCloud can wait for
+// it and detect failure via state.loyaltyPullErrors.audit.
 function pullLoyaltyAuditLogFromCloud() {
-  fetch(LOYALTY_AUDIT_API_URL)
-    .then((r) => (r.ok ? r.json() : null))
+  return fetch(LOYALTY_AUDIT_API_URL)
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("status " + r.status))))
     .then((data) => {
-      if (!data || !Array.isArray(data.loyaltyAuditLog)) return;
+      if (!data || !Array.isArray(data.loyaltyAuditLog)) { state.loyaltyPullErrors.audit = false; return; }
       // Pure union by auditId — audit records are immutable once created (nothing ever
       // edits one), so unlike the ledger/rewards merge there is no "newer wins" comparison
       // to make, only "do we already have this record".
@@ -3714,8 +3819,12 @@ function pullLoyaltyAuditLogFromCloud() {
         render();
         syncLoyaltyAuditLogToCloud();
       }
+      state.loyaltyPullErrors.audit = false;
     })
-    .catch((err) => { console.warn("Loyalty audit log cloud pull failed (staying on local data):", err); });
+    .catch((err) => {
+      console.warn("Loyalty audit log cloud pull failed (staying on local data):", err);
+      state.loyaltyPullErrors.audit = true;
+    });
 }
 
 // Human-readable labels for the audit action enum — used only by the Activity History UI;
@@ -3804,6 +3913,56 @@ function withAutomaticBackupBeforeBulkOp(operation, reason, sourceVersion, fn) {
   return createLoyaltyBackup(reason, "system", operation, sourceVersion).then((backupResult) => {
     fn();
     return backupResult;
+  });
+}
+
+// One-time-per-device safety net for the cross-device loyalty cloud sync introduced
+// 2026-08-25: before the very first cloud pull-merge this device ever performs under the new
+// conflict-aware sync (see syncLoyaltyLedgerToCloud/syncRewardsToCloud), take one Loyalty
+// Backup of exactly what this device had locally — so if this device's local ledger/rewards
+// state (which may have been drifting from the shared cloud copy, e.g. the Mac/iPhone
+// Rewards-Ready/Needs-Review mismatch this sync fixes) turns out to differ from what other
+// devices already pushed, nothing this device had is ever unrecoverable. Guarded by
+// meta.loyaltyCloudSync.migrationBackupDone so it only ever runs once per device, never on
+// every load. Never blocks the UI — if the backup call fails (e.g. offline on first run), the
+// flag is left false so it's simply retried the next time refreshLoyaltyFromCloud runs.
+function ensureLoyaltyCloudSyncMigrationBackup() {
+  if (DB.data.meta.loyaltyCloudSync.migrationBackupDone) return Promise.resolve();
+  if (!DB.data.loyaltyLedger.length && !DB.data.rewards.length) {
+    // Nothing local worth protecting yet — mark done without wasting a backup call.
+    DB.data.meta.loyaltyCloudSync.migrationBackupDone = true;
+    DB.save();
+    return Promise.resolve();
+  }
+  return createLoyaltyBackup(
+    "Automatic — one-time safety backup before this device's first cross-device loyalty cloud sync",
+    "system", "migration", "Pre cloud-sync-v2 device snapshot"
+  ).then(() => {
+    DB.data.meta.loyaltyCloudSync.migrationBackupDone = true;
+    DB.save();
+  }).catch((err) => {
+    console.warn("Loyalty cloud sync migration backup failed (will retry next load):", err);
+  });
+}
+
+// Single entry point for "fetch current shared reward/ledger state" — called at app load,
+// whenever Customer Loyalty is opened if the last sync is stale (see navigate()), and by the
+// "Refresh Loyalty from Cloud" button on the Customer Loyalty home screen. Refreshes rewards,
+// the V2 ledger, and the audit log in parallel; never touches customers/rentals/vehicles or
+// re-runs any matching pipeline — that stays exclusively Manager Sync's and Full Refresh's job.
+function refreshLoyaltyFromCloud() {
+  state.loyaltySyncStatus = "loading";
+  render();
+  return ensureLoyaltyCloudSyncMigrationBackup().then(() =>
+    Promise.all([
+      pullRewardsFromCloud(),
+      pullLoyaltyLedgerFromCloud(),
+      pullLoyaltyAuditLogFromCloud(),
+    ])
+  ).then(() => {
+    const failed = state.loyaltyPullErrors.rewards || state.loyaltyPullErrors.ledger || state.loyaltyPullErrors.audit;
+    state.loyaltySyncStatus = failed ? "offline" : "synced";
+    render();
   });
 }
 function listLoyaltyBackups() {
@@ -4486,7 +4645,16 @@ const state = { route: "home", customerId: null, vehicleId: null, search: "", ex
   vehicleSaveStatus: "idle", // idle | saving | error | conflict
   vehicleSaveError: null,
   vehicleBackupsStatus: "idle", vehicleBackupsList: [], vehicleBackupsError: null,
-  vehicleRestoreStatus: "idle", vehicleRestoreError: null };
+  vehicleRestoreStatus: "idle", vehicleRestoreError: null,
+  // Loyalty reward/ledger cross-device cloud sync UI state — added 2026-08-25. Mirrors the
+  // Vehicle Renewal pattern above (loyaltySyncStatus/loyaltySaveStatus) but stays completely
+  // separate: never read or set by any Vehicle Renewal code, and vice versa.
+  loyaltySyncStatus: "idle", // idle | loading | synced | offline
+  loyaltyPullErrors: { rewards: false, ledger: false, audit: false },
+  loyaltySaveStatus: "idle", // idle | saving | error
+  loyaltySaveError: null,
+  loyaltyConflicts: [] // [{ kind: "ledger"|"rewards", id, local, remote, detectedAt }]
+};
 
 // Import wizard state — lives outside `state` since it holds parsed file data,
 // not something to preserve across normal navigation.
@@ -4509,9 +4677,19 @@ function navigate(route, params = {}) {
   render();
   document.getElementById("app").scrollTo?.(0, 0);
   window.scrollTo(0, 0);
+  // Fetch current shared reward/ledger state whenever Customer Loyalty is opened, per the
+  // cross-device sync spec — but only if the last sync is more than a minute old, so paging
+  // back and forth inside the module (customer -> back -> customer) doesn't hammer the API on
+  // every tap. The very first open after app load is always covered by the boot-time
+  // refreshLoyaltyFromCloud() call in the IIFE below.
+  if (route === "customers" && state.loyaltySyncStatus !== "loading") {
+    const last = DB.data.meta.loyaltyCloudSync.lastSyncedAt;
+    const staleMs = last ? (Date.now() - new Date(last).getTime()) : Infinity;
+    if (staleMs > 60000) refreshLoyaltyFromCloud();
+  }
 }
 function topLevel(route) {
-  if (route.startsWith("customer") || route === "needs-review" || route === "rewards-ready" || route === "active-riders" || route === "reward-history" || route === "loyalty-reports" || route === "loyalty-ledger-report") return "customers";
+  if (route.startsWith("customer") || route === "needs-review" || route === "loyalty-needs-review" || route === "rewards-ready" || route === "active-riders" || route === "reward-history" || route === "loyalty-reports" || route === "loyalty-ledger-report" || route === "loyalty-conflicts") return "customers";
   if (route.startsWith("vehicle")) return "vehicles";
   return "settings"; // settings/import — no bottom tab, reached via gear icon
 }
@@ -4616,12 +4794,30 @@ function computeHomeInsights() {
   });
 
   // "Rewards Ready" combines Welcome Gift / Ride Upgrade / Premium / VIP items (rewardsDueMap)
-  // with Journey Gift items due at return — same underlying eligibility, just one card.
+  // with Journey Gift items due at return (same underlying eligibility, just one card) AND, as
+  // of 2026-08-25, every customer with a ready/pending-choice/selected/manual/review-needed V2
+  // loyalty ledger entry (Genuine Visits / Continuous Stay / Lifetime Paid Days) — see
+  // computeLoyaltyLedgerRollup(). This is additive only: a customer already shown for a legacy
+  // reason keeps their legacy items AND gains their ledger items; nothing is ever removed.
+  // Needed because the ledger is this app's only fully cloud-synced reward-state store — the
+  // legacy `rewards` array is also cloud-synced but only covers Welcome/Journey/Ride Upgrade/
+  // Premium/VIP, so a dashboard driven by legacy data alone can genuinely disagree between two
+  // devices whenever the divergence is actually in ledger-only reward activity.
   const rewardsReadyMap = new Map();
   rewardsDueMap.forEach((v, k) => rewardsReadyMap.set(k, { customer: v.customer, items: [...v.items] }));
   journeyGiftsDueMap.forEach((v, k) => {
     if (!rewardsReadyMap.has(k)) rewardsReadyMap.set(k, { customer: v.customer, items: [] });
     rewardsReadyMap.get(k).items.push(...v.items);
+  });
+  const ledgerRollup = computeLoyaltyLedgerRollup();
+  ledgerRollup.readyRows.forEach((row) => {
+    const k = row.customer.id;
+    if (!rewardsReadyMap.has(k)) rewardsReadyMap.set(k, { customer: row.customer, items: [] });
+    row.ledger
+      .filter((e) => ["ready", "pending_choice", "selected", "manual", "review_needed"].includes(e.status))
+      .forEach((e) => {
+        rewardsReadyMap.get(k).items.push({ type: "loyalty_ledger", title: e.milestoneLabel, detail: loyaltyLedgerStatusDisplay(e).text });
+      });
   });
 
   return {
@@ -4630,6 +4826,26 @@ function computeHomeInsights() {
     rewardsReady: [...rewardsReadyMap.values()],
     returningVip,
     activeLongTermRiders,
+    // Owner review/approval pending on the shared cloud-synced V2 ledger — see
+    // computeLoyaltyLedgerRollup(). Deliberately NOT DB.data.needsReview (that stays the
+    // Manager Sync identity/rental-boundary conflict list, still fully reachable from the
+    // customer profile page and the Manager Sync results screen; it's local-per-device by
+    // design and out of scope for this cloud sync — see renderNeedsReview()).
+    needsReviewRows: ledgerRollup.reviewRows,
+  };
+}
+
+// V2 ledger-based per-customer rollup — reuses the exact same status groupings as
+// buildLoyaltyExportRows() (the Full Loyalty Report's already-correct, already-cloud-synced
+// source of truth) so the Customer Loyalty home dashboard's Rewards Ready / Needs Review
+// counts can never silently drift from what the Loyalty Reports screen shows for the same
+// data. Purely a read over DB.data.loyaltyLedger — never touches customers/rentals/vehicles/
+// needsReview (identity), never mutates the ledger itself.
+function computeLoyaltyLedgerRollup() {
+  const rows = buildLoyaltyExportRows();
+  return {
+    readyRows: rows.filter((r) => r.readyCount > 0),
+    reviewRows: rows.filter((r) => r.needsReview),
   };
 }
 
@@ -4658,9 +4874,39 @@ function renderInsightCard(id, title, items, renderRow, emptyLabel, iconName) {
   `;
 }
 
+// Small status line for the Customer Loyalty home screen — "Cloud synced ✓ / Last updated: …",
+// "Unsaved changes", or "Offline / cached loyalty state", per the cross-device sync spec.
+// Mirrors vehicleSyncStatusLine() exactly but reads loyalty*-prefixed state/meta only.
+function loyaltySyncStatusLine() {
+  if (state.loyaltySaveStatus === "error") return { text: "⚠ Unsaved changes — cloud sync failed", cls: "err" };
+  if (state.loyaltySaveStatus === "saving") return { text: "Saving to cloud…", cls: "muted" };
+  if (state.loyaltySyncStatus === "loading") return { text: "Syncing…", cls: "muted" };
+  if (state.loyaltySyncStatus === "offline") return { text: "Offline / cached loyalty state", cls: "err" };
+  if (state.loyaltySyncStatus === "synced") {
+    const ts = fmtDateTimeLabel(DB.data.meta.loyaltyCloudSync.lastSyncedAt);
+    return { text: "Cloud synced ✓" + (ts ? " · Last updated: " + ts : ""), cls: "ok" };
+  }
+  return { text: "Not yet synced", cls: "muted" };
+}
+
+function renderLoyaltySyncBanner() {
+  const line = loyaltySyncStatusLine();
+  const color = line.cls === "err" ? "#c0392b" : line.cls === "ok" ? "#2e7d32" : "var(--text-secondary)";
+  const conflictCount = state.loyaltyConflicts.length;
+  return `
+    <div class="card" style="margin-bottom:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <span style="font-weight:600;font-size:13px;color:${color};">${escapeHtml(line.text)}</span>
+        <button class="btn btn-outline btn-sm" id="loyalty-refresh-cloud" ${state.loyaltySyncStatus === "loading" ? "disabled" : ""}>Refresh Loyalty from Cloud</button>
+      </div>
+      ${state.loyaltySaveStatus === "error" && state.loyaltySaveError ? `<p style="margin-top:6px;font-size:12.5px;color:#c0392b;">${escapeHtml(state.loyaltySaveError)}</p>` : ""}
+      ${conflictCount ? `<div class="alert-strip amber" data-goto="loyalty-conflicts" style="margin-top:10px;cursor:pointer;"><span class="dot dot-amber"></span>${conflictCount} reward update${conflictCount === 1 ? "" : "s"} changed on another device too — tap to review</div>` : ""}
+    </div>
+  `;
+}
+
 function renderCustomersHome() {
   const q = state.search.trim().toLowerCase();
-  const pendingReviewCount = DB.data.needsReview.filter((r) => !r.resolved).length;
 
   // A customer can also be found by a bike they've rented (original historical name or its
   // standardized category, e.g. "Click Red" or "125cc") — not just name/phone/passport.
@@ -4735,6 +4981,7 @@ function renderCustomersHome() {
   }
 
   const insights = computeHomeInsights();
+  const pendingReviewCount = insights.needsReviewRows.length;
   return `
     <div class="brand-dark-header">
       ${topBar}
@@ -4752,10 +4999,11 @@ function renderCustomersHome() {
       </div>
     </div>
     <div class="screen-body" style="margin-top:-14px;">
+      ${renderLoyaltySyncBanner()}
       <div class="status-card-row">
         ${renderStatusCard("rewards-ready", "gift", "Rewards Ready", insights.rewardsReady.length, insights.rewardsReady.length === 1 ? "1 customer has a reward available" : `${insights.rewardsReady.length} customers have rewards available`)}
         ${renderStatusCard("active-riders", "helmet", "Active Riders", insights.activeLongTermRiders.length, insights.activeLongTermRiders.length === 1 ? "1 rider currently active" : `${insights.activeLongTermRiders.length} riders currently active`)}
-        ${renderStatusCard("needs-review", "clipSearch", "Needs Review", pendingReviewCount, pendingReviewCount === 1 ? "1 record needs review" : `${pendingReviewCount} records need review`)}
+        ${renderStatusCard("loyalty-needs-review", "clipSearch", "Needs Review", pendingReviewCount, pendingReviewCount === 1 ? "1 reward needs owner review" : `${pendingReviewCount} rewards need owner review`)}
       </div>
 
       <div class="quick-actions-panel">
@@ -4859,6 +5107,118 @@ function renderActiveRidersScreen() {
       `).join("")}</div>`}
     </div>
   `;
+}
+
+// Ledger-based "Needs Review" detail screen — what the home dashboard's repointed Needs
+// Review tile links to (see renderCustomersHome). Lists every customer with an
+// owner_appreciation_review milestone (currently "Exceptional Loyalty", 365+ Lifetime Paid
+// Days) still awaiting owner review/approval, sourced from the same shared, cloud-synced
+// DB.data.loyaltyLedger the Loyalty Reports screen already uses. Distinct from, and never
+// touches, renderNeedsReview() (Manager Sync's identity/rental-boundary conflict screen) —
+// that stays reachable from the customer profile page exactly as before.
+function renderLoyaltyNeedsReviewScreen() {
+  const rollup = computeLoyaltyLedgerRollup();
+  const list = rollup.reviewRows.slice().sort((a, b) =>
+    cleanCustomerDisplayName(a.customer.name).localeCompare(cleanCustomerDisplayName(b.customer.name))
+  );
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="customers">‹ Customer Loyalty</button>
+      <h1 class="screen-title" style="margin-top:8px;">Needs Review</h1>
+      <p class="screen-sub">${list.length} reward${list.length === 1 ? "" : "s"} awaiting owner review/approval</p>
+    </header>
+    <div class="screen-body">
+      ${list.length === 0 ? `
+        <div class="empty"><div class="empty-icon">✓</div><h3>All caught up</h3><p>No loyalty reward is currently waiting on owner review.</p></div>
+      ` : `<div class="cust-row-list">${list.map((row) => `
+        <div class="cust-row" data-goto="customer" data-id="${row.customer.id}">
+          <div class="cust-row-main">
+            <div class="cust-row-name">${escapeHtml(cleanCustomerDisplayName(row.customer.name))}</div>
+            ${row.ledger.filter((e) => e.status === "review_needed").map((e) => `
+              <div class="cust-row-reward">
+                ${boldIcon("gift", "row")}
+                <span class="cust-row-reward-type">${escapeHtml(e.milestoneLabel)}</span>
+                <span class="cust-row-reward-detail"> · ${escapeHtml(loyaltyLedgerStatusDisplay(e).text)}</span>
+              </div>
+            `).join("")}
+          </div>
+          <span class="cust-row-chevron">${ICONS.chevronRight}</span>
+        </div>
+      `).join("")}</div>`}
+      <p class="muted" style="margin-top:14px;font-size:12px;">Historical record confirmations from Manager Sync (uncertain rental dates, possible duplicate customers) live on the customer's own profile, not here — this screen is only for loyalty rewards awaiting owner review.</p>
+    </div>
+  `;
+}
+
+// Cross-device sync conflict resolution — reached from the amber banner in
+// renderLoyaltySyncBanner() whenever syncLoyaltyLedgerToCloud/syncRewardsToCloud detect that a
+// specific ledger entry or reward was changed on this device AND on another device before
+// either side had synced with the other. Never auto-resolved: the owner picks a side here.
+function renderLoyaltyConflictsScreen() {
+  const conflicts = state.loyaltyConflicts;
+  function summarize(kind, entry) {
+    if (!entry) return "—";
+    if (kind === "ledger") return `${entry.milestoneLabel || entry.entitlementId} — ${loyaltyLedgerStatusDisplay(entry).text}${entry.ownerNote ? " · Note: " + entry.ownerNote : ""}`;
+    return `${REWARD_LABELS[entry.type] || entry.type} — ${entry.given ? "Given " + fmtDate(entry.dateGiven) : entry.reserved ? "Reserved" : "Ready"}`;
+  }
+  function customerNameFor(c) {
+    const custId = c.kind === "ledger" ? (c.local && c.local.customerCanonicalId) : (c.local && c.local.customerId);
+    const cust = DB.data.customers.find((x) => x.id === custId);
+    return cust ? cleanCustomerDisplayName(cust.name) : "Unknown customer";
+  }
+  return `
+    <header class="screen-header">
+      <button class="back-btn" data-goto="customers">‹ Customer Loyalty</button>
+      <h1 class="screen-title" style="margin-top:8px;">Reward Sync Conflicts</h1>
+      <p class="screen-sub">${conflicts.length} update${conflicts.length === 1 ? "" : "s"} changed on this device AND on another device before either side synced. Pick which version to keep.</p>
+    </header>
+    <div class="screen-body">
+      ${conflicts.length === 0 ? `<div class="empty"><div class="empty-icon">✓</div><h3>No conflicts</h3><p>Nothing needs review right now.</p></div>` : conflicts.map((c, i) => `
+        <div class="card" style="margin-bottom:12px;">
+          <div style="font-weight:700;margin-bottom:6px;">${escapeHtml(customerNameFor(c))}</div>
+          <div class="muted" style="font-size:12.5px;margin-bottom:8px;">${c.kind === "ledger" ? "Loyalty Ledger entry" : "Legacy reward"} — detected ${escapeHtml(fmtDateTimeLabel(c.detectedAt) || "")}</div>
+          <div style="font-size:13px;margin-bottom:4px;"><b>This device:</b> ${escapeHtml(summarize(c.kind, c.local))}</div>
+          <div style="font-size:13px;margin-bottom:10px;"><b>Other device (cloud):</b> ${escapeHtml(summarize(c.kind, c.remote))}</div>
+          <div class="btn-row">
+            <button class="btn btn-orange btn-sm" data-action="resolve-loyalty-conflict" data-index="${i}" data-decision="local">Keep This Device's Version</button>
+            <button class="btn btn-outline btn-sm" data-action="resolve-loyalty-conflict" data-index="${i}" data-decision="remote">Use Cloud Version</button>
+          </div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+// Applies the owner's decision for one flagged sync conflict — "local" keeps this device's
+// edit and pushes it over the cloud copy; "remote" discards this device's conflicting edit and
+// adopts the cloud copy instead. Either way the resolution itself is a normal, non-conflicting
+// re-sync (the owner's explicit choice supersedes the old pre-edit-copy comparison), and an
+// audit record documents which side was kept, per the CONFLICT SAFETY + AUDIT requirements.
+function resolveLoyaltyConflict(index, decision) {
+  const c = state.loyaltyConflicts[index];
+  if (!c) return;
+  const chosen = decision === "remote" ? c.remote : c.local;
+  const discarded = decision === "remote" ? c.local : c.remote;
+  if (c.kind === "ledger") {
+    const idx = DB.data.loyaltyLedger.findIndex((e) => e.id === c.id);
+    if (idx >= 0) DB.data.loyaltyLedger[idx] = chosen; else DB.data.loyaltyLedger.push(chosen);
+    DB.save();
+    appendAuditRecord(chosen.customerCanonicalId, "correction_of_status",
+      [{ field: "conflictResolution", previousValue: discarded, newValue: chosen }],
+      "owner", "Resolved cross-device sync conflict — kept the " + (decision === "remote" ? "cloud" : "device") + " version", chosen.entitlementId);
+    syncLoyaltyLedgerToCloud();
+  } else {
+    const idx = DB.data.rewards.findIndex((r) => r.id === c.id);
+    if (idx >= 0) DB.data.rewards[idx] = chosen; else DB.data.rewards.push(chosen);
+    DB.save();
+    appendAuditRecord(chosen.customerId, "correction_of_status",
+      [{ field: "conflictResolution", previousValue: discarded, newValue: chosen }],
+      "owner", "Resolved cross-device sync conflict — kept the " + (decision === "remote" ? "cloud" : "device") + " version");
+    syncRewardsToCloud();
+  }
+  state.loyaltyConflicts = state.loyaltyConflicts.filter((_, i) => i !== index);
+  render();
+  toast("Conflict resolved");
 }
 
 /* ---------------------------------------------------------------------- */
@@ -8203,11 +8563,17 @@ function otherRewardsCurrentlyReady(customer, excludeKey) {
 // rather than a Profile/History/Reports disagreement.
 function withAtomicRewardUpdate(fn) {
   const snapshot = JSON.stringify(DB.data.rewards);
+  const before = JSON.parse(snapshot);
+  const beforeById = {};
+  before.forEach((r) => { beforeById[r.id] = r; });
   try {
     fn();
-    stampUpdatedRewards(JSON.parse(snapshot));
+    stampUpdatedRewards(before);
     DB.save();
-    syncRewardsToCloud();
+    const dirtyIds = DB.data.rewards
+      .filter((r) => JSON.stringify(Object.assign({}, beforeById[r.id], { updatedAt: undefined })) !== JSON.stringify(Object.assign({}, r, { updatedAt: undefined })))
+      .map((r) => r.id);
+    syncRewardsToCloud({ ids: dirtyIds, baseById: beforeById });
     return true;
   } catch (err) {
     DB.data.rewards = JSON.parse(snapshot);
@@ -8233,49 +8599,83 @@ function stampUpdatedRewards(before) {
   });
 }
 
-// Fire-and-forget push of the full local rewards array to the shared Drive-backed store (see
+// Push of the full local rewards array to the shared Drive-backed store (see
 // api/loyalty-rewards.js), so a Give Gift / Reserve / Accept / Decline / edit made on this
-// device becomes visible on every other device. Never blocks the UI and never throws into the
-// caller — a failed push just leaves this device's local save (already durable via DB.save())
-// temporarily ahead of the cloud; the next successful reward action, or the next page load's
-// pull, reconciles it.
-function syncRewardsToCloud() {
-  fetch(LOYALTY_REWARDS_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ rewards: DB.data.rewards }),
-  }).catch((err) => {
-    console.warn("Reward cloud sync failed (will retry on next reward action):", err);
-  });
-}
-
-// One-time pull-and-merge, run on app load: brings in any reward given on a different device
-// since this browser last synced. Union by id; per id, whichever side has the newer
-// updatedAt wins — a record with no updatedAt at all (written before this sync existed)
-// always loses to one that's been touched since, but is still kept, never dropped, if the
-// other side doesn't have it at all. Never overwrites a genuinely newer local edit just
-// because the network happened to answer first.
-function pullRewardsFromCloud() {
+// device becomes visible on every other device. `dirty` (optional) is the { ids, baseById }
+// produced by withAtomicRewardUpdate for the specific action that just ran — when present,
+// this pulls the current cloud copy FIRST and checks whether any of THIS action's own touched
+// rewards were ALSO changed on another device since this device's pre-edit copy (a genuine
+// conflict — see syncLoyaltyLedgerToCloud, which this mirrors exactly). A conflicting id is
+// left exactly as this device has it — NOT pushed — and recorded in state.loyaltyConflicts;
+// every other, non-conflicting change still saves normally in the same call. Never blocks the
+// UI — a failed push just leaves this device's local save (already durable via DB.save())
+// temporarily ahead of the cloud, surfaced via state.loyaltySaveStatus rather than silently.
+function syncRewardsToCloud(dirty) {
+  state.loyaltySaveStatus = "saving";
+  state.loyaltySaveError = null;
+  render();
   fetch(LOYALTY_REWARDS_API_URL)
     .then((r) => (r.ok ? r.json() : null))
     .then((data) => {
-      if (!data || !Array.isArray(data.rewards)) return;
-      const localById = {};
-      DB.data.rewards.forEach((r) => { localById[r.id] = r; });
-      const merged = DB.data.rewards.slice();
-      const mergedIndexById = {};
-      merged.forEach((r, i) => { mergedIndexById[r.id] = i; });
-      let changed = false;
-      data.rewards.forEach((remote) => {
-        const local = localById[remote.id];
-        if (!local) {
-          merged.push(remote);
-          changed = true;
-        } else if ((remote.updatedAt || "") > (local.updatedAt || "")) {
-          merged[mergedIndexById[remote.id]] = remote;
-          changed = true;
+      const remoteArr = (data && Array.isArray(data.rewards)) ? data.rewards : null;
+      if (remoteArr && dirty && dirty.ids && dirty.ids.length) {
+        const remoteById = {};
+        remoteArr.forEach((r) => { remoteById[r.id] = r; });
+        const newConflicts = [];
+        dirty.ids.forEach((id) => {
+          const base = dirty.baseById[id]; // undefined = this reward is brand new locally — can't conflict
+          const remote = remoteById[id];
+          if (base && remote && (remote.updatedAt || "") > (base.updatedAt || "") && !sameContentIgnoringUpdatedAt(remote, DB.data.rewards.find((r) => r.id === id))) {
+            newConflicts.push({ kind: "rewards", id, local: DB.data.rewards.find((r) => r.id === id), remote, detectedAt: new Date().toISOString() });
+          }
+        });
+        if (newConflicts.length) {
+          state.loyaltyConflicts = state.loyaltyConflicts.filter((c) => !newConflicts.some((n) => n.kind === c.kind && n.id === c.id)).concat(newConflicts);
+          state.loyaltySaveStatus = "error";
+          state.loyaltySaveError = newConflicts.length + " reward update" + (newConflicts.length === 1 ? "" : "s") + " conflicted with a change made on another device — review before continuing.";
+          render();
+          return "conflict";
         }
-      });
+      }
+      if (remoteArr) {
+        const { merged, changed } = mergeByIdNewestWins(DB.data.rewards, remoteArr);
+        if (changed) { DB.data.rewards = merged; DB.save(); }
+      }
+      return fetch(LOYALTY_REWARDS_API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rewards: DB.data.rewards }),
+      }).then((r) => { if (!r.ok) throw new Error("Save failed: " + r.status); });
+    })
+    .then((result) => {
+      if (result === "conflict") return;
+      state.loyaltySaveStatus = "idle";
+      state.loyaltySaveError = null;
+      DB.data.meta.loyaltyCloudSync.lastSyncedAt = new Date().toISOString();
+      DB.save();
+      render();
+    })
+    .catch((err) => {
+      console.warn("Reward cloud sync failed (will retry on next reward action):", err);
+      state.loyaltySaveStatus = "error";
+      state.loyaltySaveError = "Saved on this device — cloud sync failed, will retry.";
+      render();
+    });
+}
+
+// Pull-and-merge: brings in any reward given on a different device since this browser last
+// synced. Union by id; per id, whichever side has the newer updatedAt wins — a record with no
+// updatedAt at all (written before this sync existed) always loses to one that's been touched
+// since, but is still kept, never dropped, if the other side doesn't have it at all. Called at
+// app load, whenever Customer Loyalty is opened if stale (see navigate()), and by "Refresh
+// Loyalty from Cloud" (see refreshLoyaltyFromCloud). Returns a promise so callers can wait for
+// it and detect failure via state.loyaltyPullErrors.rewards.
+function pullRewardsFromCloud() {
+  return fetch(LOYALTY_REWARDS_API_URL)
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error("status " + r.status))))
+    .then((data) => {
+      if (!data || !Array.isArray(data.rewards)) { state.loyaltyPullErrors.rewards = false; return; }
+      const { merged, changed } = mergeByIdNewestWins(DB.data.rewards, data.rewards);
       if (changed) {
         DB.data.rewards = merged;
         DB.save();
@@ -8284,9 +8684,11 @@ function pullRewardsFromCloud() {
         // whichever pair of devices happened to sync most recently.
         syncRewardsToCloud();
       }
+      state.loyaltyPullErrors.rewards = false;
     })
     .catch((err) => {
       console.warn("Reward cloud pull failed (staying on local data):", err);
+      state.loyaltyPullErrors.rewards = true;
     });
 }
 
@@ -8957,6 +9359,8 @@ function render() {
     case "customers": html = renderCustomersHome(); break;
     case "customer": html = renderCustomerDetail(); break;
     case "needs-review": html = renderNeedsReview(); break;
+    case "loyalty-needs-review": html = renderLoyaltyNeedsReviewScreen(); break;
+    case "loyalty-conflicts": html = renderLoyaltyConflictsScreen(); break;
     case "rewards-ready": html = renderRewardsReadyScreen(); break;
     case "active-riders": html = renderActiveRidersScreen(); break;
     case "reward-history": html = renderRewardHistoryScreen(); break;
@@ -9025,6 +9429,13 @@ function wireScreenEvents() {
         el.classList.remove("is-expanded");
       }
     });
+  });
+
+  const loyaltyRefreshBtn = document.getElementById("loyalty-refresh-cloud");
+  if (loyaltyRefreshBtn) loyaltyRefreshBtn.addEventListener("click", () => refreshLoyaltyFromCloud());
+
+  document.querySelectorAll('[data-action="resolve-loyalty-conflict"]').forEach((el) => {
+    el.addEventListener("click", () => resolveLoyaltyConflict(Number(el.dataset.index), el.dataset.decision));
   });
 
   const searchInput = document.getElementById("customer-search");
@@ -9881,8 +10292,6 @@ document.getElementById("gear-btn").addEventListener("click", () => navigate("se
 
 DB.load();
 navigate("home");
-pullRewardsFromCloud();
-pullLoyaltyLedgerFromCloud();
-pullLoyaltyAuditLogFromCloud();
+refreshLoyaltyFromCloud();
 
 })();
